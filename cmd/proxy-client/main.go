@@ -41,15 +41,17 @@ type session struct {
 	peer   *net.UDPAddr
 	remote string
 	token  string
-	lanes  []*lane
+	up     []*lane
+	down   []*lane
 	next   atomic.Uint64
 	closed chan struct{}
 	stats  *clientStats
+	posts  chan struct{}
 }
 
 func main() {
 	var listen, remote, token, connectIP, metricsOut string
-	var lanesN, polls int
+	var lanesN, polls, maxInflightPosts int
 	var timeout, metricsInterval time.Duration
 	flag.StringVar(&listen, "listen", "127.0.0.1:15353", "local UDP listen address")
 	flag.StringVar(&remote, "remote", "https://relay.example.com:2083/", "relay server URL")
@@ -57,6 +59,7 @@ func main() {
 	flag.StringVar(&connectIP, "connect-ip", "", "optional Cloudflare edge IP to connect to instead of DNS")
 	flag.IntVar(&lanesN, "lanes", 4, "HTTP/3 uplink lanes")
 	flag.IntVar(&polls, "down-polls", 2, "downlink long-poll workers")
+	flag.IntVar(&maxInflightPosts, "max-inflight-posts", 32, "maximum in-flight POST requests per session")
 	flag.DurationVar(&timeout, "http-timeout", 15*time.Second, "HTTP request timeout")
 	flag.DurationVar(&metricsInterval, "metrics-interval", 1*time.Second, "metrics snapshot interval")
 	flag.StringVar(&metricsOut, "metrics-out", "", "optional JSONL metrics output path")
@@ -73,7 +76,7 @@ func main() {
 	defer udp.Close()
 
 	stats := &clientStats{started: time.Now()}
-	state := &clientState{remote: remote, token: token, connectIP: connectIP, lanesN: lanesN, polls: polls, timeout: timeout, udp: udp, sessions: map[string]*session{}, stats: stats}
+	state := &clientState{remote: remote, token: token, connectIP: connectIP, lanesN: lanesN, polls: polls, maxInflightPosts: maxInflightPosts, timeout: timeout, udp: udp, sessions: map[string]*session{}, stats: stats}
 	if metricsOut != "" {
 		go state.writeMetrics(metricsOut, metricsInterval)
 	}
@@ -91,16 +94,17 @@ func main() {
 }
 
 type clientState struct {
-	remote    string
-	token     string
-	connectIP string
-	lanesN    int
-	polls     int
-	timeout   time.Duration
-	udp       *net.UDPConn
-	mu        sync.Mutex
-	sessions  map[string]*session
-	stats     *clientStats
+	remote           string
+	token            string
+	connectIP        string
+	lanesN           int
+	polls            int
+	maxInflightPosts int
+	timeout          time.Duration
+	udp              *net.UDPConn
+	mu               sync.Mutex
+	sessions         map[string]*session
+	stats            *clientStats
 }
 
 type clientStats struct {
@@ -122,17 +126,27 @@ func (c *clientState) getSession(peer *net.UDPAddr) *session {
 		return sess
 	}
 	id := randomID()
-	sess := &session{id: id, peer: peer, remote: c.remote, token: c.token, closed: make(chan struct{}), stats: c.stats}
+	if c.maxInflightPosts < 1 {
+		c.maxInflightPosts = 1
+	}
+	sess := &session{id: id, peer: peer, remote: c.remote, token: c.token, closed: make(chan struct{}), stats: c.stats, posts: make(chan struct{}, c.maxInflightPosts)}
 	for i := 0; i < c.lanesN; i++ {
 		hc, closeFn, err := relay.NewHTTP3ClientWithOptions(relay.HTTP3ClientOptions{URL: c.remote, Timeout: c.timeout, ConnectIP: c.connectIP})
 		if err != nil {
 			log.Fatal(err)
 		}
 		c.stats.transports.Add(1)
-		sess.lanes = append(sess.lanes, &lane{index: i, client: hc, close: closeFn})
+		sess.up = append(sess.up, &lane{index: i, client: hc, close: closeFn})
 	}
 	for i := 0; i < c.polls; i++ {
-		go sess.pollLoop(c)
+		hc, closeFn, err := relay.NewHTTP3ClientWithOptions(relay.HTTP3ClientOptions{URL: c.remote, Timeout: c.timeout, ConnectIP: c.connectIP})
+		if err != nil {
+			log.Fatal(err)
+		}
+		c.stats.transports.Add(1)
+		ln := &lane{index: i, client: hc, close: closeFn}
+		sess.down = append(sess.down, ln)
+		go sess.pollLoop(c, ln)
 	}
 	c.sessions[key] = sess
 	c.stats.sessions.Add(1)
@@ -141,6 +155,9 @@ func (c *clientState) getSession(peer *net.UDPAddr) *session {
 }
 
 func (s *session) send(payload []byte) {
+	s.posts <- struct{}{}
+	defer func() { <-s.posts }()
+
 	id := s.next.Add(1)
 	body, err := relay.EncodeFrames([]relay.Frame{{PacketID: id, Payload: payload}})
 	if err != nil {
@@ -182,9 +199,9 @@ func (s *session) send(payload []byte) {
 }
 
 func (s *session) pickLane() *lane {
-	best := s.lanes[0]
+	best := s.up[0]
 	bestVal := best.inflight.Load()
-	for _, l := range s.lanes[1:] {
+	for _, l := range s.up[1:] {
 		if v := l.inflight.Load(); v < bestVal {
 			best, bestVal = l, v
 		}
@@ -192,7 +209,7 @@ func (s *session) pickLane() *lane {
 	return best
 }
 
-func (s *session) pollLoop(c *clientState) {
+func (s *session) pollLoop(c *clientState, ln *lane) {
 	for {
 		select {
 		case <-s.closed:
@@ -205,7 +222,6 @@ func (s *session) pollLoop(c *clientState) {
 			return
 		}
 		setHeaders(req, c.token, s.id)
-		ln := s.lanes[0]
 		ln.requests.Add(1)
 		ln.gets.Add(1)
 		resp, err := ln.client.Do(req)
@@ -273,15 +289,36 @@ func (c *clientState) snapshot() map[string]any {
 	var lanes []map[string]any
 	var inflightBytes, inflightRequests int64
 	for _, sess := range sessions {
-		for _, ln := range sess.lanes {
+		for _, ln := range sess.up {
 			b := ln.inflight.Load()
 			r := ln.requests.Load()
 			inflightBytes += b
 			inflightRequests += r
 			lanes = append(lanes, map[string]any{
 				"session":           sess.id,
+				"direction":         "up",
 				"lane":              ln.index,
 				"inflight_bytes":    b,
+				"inflight_requests": r,
+				"post_started":      ln.posts.Load(),
+				"post_ok":           ln.postOK.Load(),
+				"post_errors":       ln.postErr.Load(),
+				"post_timeouts":     ln.postTO.Load(),
+				"get_started":       ln.gets.Load(),
+				"get_ok":            ln.getOK.Load(),
+				"get_empty":         ln.getEmpty.Load(),
+				"get_errors":        ln.getErr.Load(),
+				"get_timeouts":      ln.getTO.Load(),
+			})
+		}
+		for _, ln := range sess.down {
+			r := ln.requests.Load()
+			inflightRequests += r
+			lanes = append(lanes, map[string]any{
+				"session":           sess.id,
+				"direction":         "down",
+				"lane":              ln.index,
+				"inflight_bytes":    int64(0),
 				"inflight_requests": r,
 				"post_started":      ln.posts.Load(),
 				"post_ok":           ln.postOK.Load(),
