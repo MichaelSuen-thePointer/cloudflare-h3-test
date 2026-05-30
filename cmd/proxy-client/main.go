@@ -47,19 +47,23 @@ type session struct {
 	closed chan struct{}
 	stats  *clientStats
 	posts  chan struct{}
+	sendQ  chan []byte
 }
 
 func main() {
 	var listen, remote, token, connectIP, metricsOut string
-	var lanesN, polls, maxInflightPosts int
-	var timeout, metricsInterval time.Duration
+	var lanesN, polls, maxInflightPosts, batchSize, sendQueue int
+	var timeout, metricsInterval, batchDelay time.Duration
 	flag.StringVar(&listen, "listen", "127.0.0.1:15353", "local UDP listen address")
 	flag.StringVar(&remote, "remote", "https://relay.example.com:2083/", "relay server URL")
 	flag.StringVar(&token, "token", "change-me-token", "shared relay token")
 	flag.StringVar(&connectIP, "connect-ip", "", "optional Cloudflare edge IP to connect to instead of DNS")
 	flag.IntVar(&lanesN, "lanes", 4, "HTTP/3 uplink lanes")
 	flag.IntVar(&polls, "down-polls", 2, "downlink long-poll workers")
-	flag.IntVar(&maxInflightPosts, "max-inflight-posts", 32, "maximum in-flight POST requests per session")
+	flag.IntVar(&maxInflightPosts, "max-inflight-posts", 24, "maximum in-flight POST requests per session")
+	flag.IntVar(&batchSize, "batch-size", 4, "maximum UDP packets per POST")
+	flag.DurationVar(&batchDelay, "batch-delay", time.Millisecond, "maximum time to wait for a partially filled POST batch")
+	flag.IntVar(&sendQueue, "send-queue", 4096, "per-session UDP packet queue before POST batching")
 	flag.DurationVar(&timeout, "http-timeout", 15*time.Second, "HTTP request timeout")
 	flag.DurationVar(&metricsInterval, "metrics-interval", 1*time.Second, "metrics snapshot interval")
 	flag.StringVar(&metricsOut, "metrics-out", "", "optional JSONL metrics output path")
@@ -76,7 +80,7 @@ func main() {
 	defer udp.Close()
 
 	stats := &clientStats{started: time.Now()}
-	state := &clientState{remote: remote, token: token, connectIP: connectIP, lanesN: lanesN, polls: polls, maxInflightPosts: maxInflightPosts, timeout: timeout, udp: udp, sessions: map[string]*session{}, stats: stats}
+	state := &clientState{remote: remote, token: token, connectIP: connectIP, lanesN: lanesN, polls: polls, maxInflightPosts: maxInflightPosts, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, udp: udp, sessions: map[string]*session{}, stats: stats}
 	if metricsOut != "" {
 		go state.writeMetrics(metricsOut, metricsInterval)
 	}
@@ -89,7 +93,7 @@ func main() {
 		}
 		payload := append([]byte(nil), buf[:n]...)
 		sess := state.getSession(peer)
-		go sess.send(payload)
+		sess.enqueue(payload)
 	}
 }
 
@@ -100,6 +104,9 @@ type clientState struct {
 	lanesN           int
 	polls            int
 	maxInflightPosts int
+	batchSize        int
+	batchDelay       time.Duration
+	sendQueue        int
 	timeout          time.Duration
 	udp              *net.UDPConn
 	mu               sync.Mutex
@@ -129,7 +136,13 @@ func (c *clientState) getSession(peer *net.UDPAddr) *session {
 	if c.maxInflightPosts < 1 {
 		c.maxInflightPosts = 1
 	}
-	sess := &session{id: id, peer: peer, remote: c.remote, token: c.token, closed: make(chan struct{}), stats: c.stats, posts: make(chan struct{}, c.maxInflightPosts)}
+	if c.batchSize < 1 {
+		c.batchSize = 1
+	}
+	if c.sendQueue < 1 {
+		c.sendQueue = 1
+	}
+	sess := &session{id: id, peer: peer, remote: c.remote, token: c.token, closed: make(chan struct{}), stats: c.stats, posts: make(chan struct{}, c.maxInflightPosts), sendQ: make(chan []byte, c.sendQueue)}
 	for i := 0; i < c.lanesN; i++ {
 		hc, closeFn, err := relay.NewHTTP3ClientWithOptions(relay.HTTP3ClientOptions{URL: c.remote, Timeout: c.timeout, ConnectIP: c.connectIP})
 		if err != nil {
@@ -148,18 +161,55 @@ func (c *clientState) getSession(peer *net.UDPAddr) *session {
 		sess.down = append(sess.down, ln)
 		go sess.pollLoop(c, ln)
 	}
+	go sess.sendLoop(c.batchSize, c.batchDelay)
 	c.sessions[key] = sess
 	c.stats.sessions.Add(1)
 	log.Printf("new session id=%s peer=%s", id, key)
 	return sess
 }
 
-func (s *session) send(payload []byte) {
+func (s *session) enqueue(payload []byte) {
+	select {
+	case s.sendQ <- payload:
+	default:
+		<-s.sendQ
+		s.sendQ <- payload
+	}
+}
+
+func (s *session) sendLoop(batchSize int, batchDelay time.Duration) {
+	for {
+		select {
+		case <-s.closed:
+			return
+		case first := <-s.sendQ:
+			batch := []relay.Frame{{PacketID: s.next.Add(1), Payload: first}}
+			timer := time.NewTimer(batchDelay)
+		collect:
+			for len(batch) < batchSize {
+				select {
+				case payload := <-s.sendQ:
+					batch = append(batch, relay.Frame{PacketID: s.next.Add(1), Payload: payload})
+				case <-timer.C:
+					break collect
+				}
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			go s.sendBatch(batch)
+		}
+	}
+}
+
+func (s *session) sendBatch(frames []relay.Frame) {
 	s.posts <- struct{}{}
 	defer func() { <-s.posts }()
 
-	id := s.next.Add(1)
-	body, err := relay.EncodeFrames([]relay.Frame{{PacketID: id, Payload: payload}})
+	body, err := relay.EncodeFrames(frames)
 	if err != nil {
 		log.Print(err)
 		return
@@ -168,8 +218,12 @@ func (s *session) send(payload []byte) {
 	ln.inflight.Add(int64(len(body)))
 	ln.requests.Add(1)
 	ln.posts.Add(1)
-	s.stats.udpInPackets.Add(1)
-	s.stats.udpInBytes.Add(int64(len(payload)))
+	var payloadBytes int64
+	for _, f := range frames {
+		payloadBytes += int64(len(f.Payload))
+	}
+	s.stats.udpInPackets.Add(int64(len(frames)))
+	s.stats.udpInBytes.Add(payloadBytes)
 	defer ln.inflight.Add(-int64(len(body)))
 	defer ln.requests.Add(-1)
 	req, err := http.NewRequest(http.MethodPost, s.remote, bytes.NewReader(body))
@@ -179,7 +233,7 @@ func (s *session) send(payload []byte) {
 	}
 	setHeaders(req, s.token, s.id)
 	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("X-Relay-Packet-Id", strconv.FormatUint(id, 10))
+	req.Header.Set("X-Relay-Packet-Id", strconv.FormatUint(frames[0].PacketID, 10))
 	resp, err := ln.client.Do(req)
 	if err != nil {
 		ln.postErr.Add(1)
