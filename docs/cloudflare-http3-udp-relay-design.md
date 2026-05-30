@@ -853,6 +853,80 @@ Cloudflare 5xx/524 does not increase materially
 
 If average RTT improves but p99 latency or reorder depth becomes much worse, it may hurt inner QUIC/game/video traffic despite looking better in simple averages.
 
+### Hard Gates
+
+Use hard gates for metrics that directly represent user-visible success or real protocol failure:
+
+```text
+goodput:
+  must improve in at least one target stage or improve max observed goodput
+
+RTT:
+  p95/p99 at compared target stages must not regress more than 5%
+
+loss:
+  loss rate must not regress materially; zero-loss baseline should remain zero unless a test explicitly allows loss
+
+duplicate:
+  duplicate rate must remain near zero
+
+POST timeout/error:
+  (post_timeouts + post_errors) / post_started <= 5%
+
+GET timeout/error:
+  (get_timeouts + get_errors) / get_started <= 5%
+
+server queue drop:
+  queue_drops / udp_down_packets <= 5%
+
+HTTP/server status:
+  Cloudflare 5xx/524 and origin 5xx must not increase materially
+```
+
+Do not compare timeout or drop raw counts against a historical best of `0`. Compare rates instead.
+
+### Soft Gates
+
+Use soft gates for internal symptoms and diagnosis. They should influence candidate ranking, but should not fail an otherwise better run by a strict relative 5% rule:
+
+```text
+server queue depth:
+  observe max and p95 queue_depth / queue_capacity
+  treat sustained >70% as warning
+  treat sustained >85% as high risk
+  raw queue_depth alone is not a hard gate when queue_drops remain zero
+
+reorder rate:
+  observe and prefer lower values
+  do not hard-fail solely on reorder_rate for UDP transparent relay
+  multi-lane HTTP/3 naturally reorders packets
+
+client inflight requests/bytes:
+  observe pressure and memory risk
+  prefer lower values when goodput and RTT are similar
+
+GET empty rate:
+  observe long-poll efficiency
+  high values indicate request pressure or poor poll timing, not direct packet loss
+```
+
+Better future reorder metrics:
+
+```text
+reorder_depth
+max_reorder_gap
+gap_recovery_time_ms
+late_packet_rtt_p95
+```
+
+Better future queue metric:
+
+```text
+queue_wait_ms p50/p95/p99
+```
+
+`queue_wait_ms` is more useful than raw depth because it measures how long payloads wait before long-poll delivery.
+
 ## 26. Open Questions To Validate
 
 These need implementation and measurement:
