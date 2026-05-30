@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -18,9 +20,20 @@ import (
 )
 
 type lane struct {
+	index    int
 	client   *http.Client
 	close    func() error
 	inflight atomic.Int64
+	requests atomic.Int64
+	posts    atomic.Int64
+	postOK   atomic.Int64
+	postErr  atomic.Int64
+	postTO   atomic.Int64
+	gets     atomic.Int64
+	getOK    atomic.Int64
+	getEmpty atomic.Int64
+	getErr   atomic.Int64
+	getTO    atomic.Int64
 }
 
 type session struct {
@@ -31,12 +44,13 @@ type session struct {
 	lanes  []*lane
 	next   atomic.Uint64
 	closed chan struct{}
+	stats  *clientStats
 }
 
 func main() {
-	var listen, remote, token, connectIP string
+	var listen, remote, token, connectIP, metricsOut string
 	var lanesN, polls int
-	var timeout time.Duration
+	var timeout, metricsInterval time.Duration
 	flag.StringVar(&listen, "listen", "127.0.0.1:15353", "local UDP listen address")
 	flag.StringVar(&remote, "remote", "https://relay.example.com:2083/", "relay server URL")
 	flag.StringVar(&token, "token", "change-me-token", "shared relay token")
@@ -44,6 +58,8 @@ func main() {
 	flag.IntVar(&lanesN, "lanes", 4, "HTTP/3 uplink lanes")
 	flag.IntVar(&polls, "down-polls", 2, "downlink long-poll workers")
 	flag.DurationVar(&timeout, "http-timeout", 15*time.Second, "HTTP request timeout")
+	flag.DurationVar(&metricsInterval, "metrics-interval", 1*time.Second, "metrics snapshot interval")
+	flag.StringVar(&metricsOut, "metrics-out", "", "optional JSONL metrics output path")
 	flag.Parse()
 
 	addr, err := net.ResolveUDPAddr("udp", listen)
@@ -56,7 +72,11 @@ func main() {
 	}
 	defer udp.Close()
 
-	state := &clientState{remote: remote, token: token, connectIP: connectIP, lanesN: lanesN, polls: polls, timeout: timeout, udp: udp, sessions: map[string]*session{}}
+	stats := &clientStats{started: time.Now()}
+	state := &clientState{remote: remote, token: token, connectIP: connectIP, lanesN: lanesN, polls: polls, timeout: timeout, udp: udp, sessions: map[string]*session{}, stats: stats}
+	if metricsOut != "" {
+		go state.writeMetrics(metricsOut, metricsInterval)
+	}
 	log.Printf("proxy-client udp listen=%s remote=%s connect_ip=%s lanes=%d down_polls=%d", listen, remote, connectIP, lanesN, polls)
 	buf := make([]byte, 65535)
 	for {
@@ -80,6 +100,18 @@ type clientState struct {
 	udp       *net.UDPConn
 	mu        sync.Mutex
 	sessions  map[string]*session
+	stats     *clientStats
+}
+
+type clientStats struct {
+	started       time.Time
+	sessions      atomic.Int64
+	udpInPackets  atomic.Int64
+	udpInBytes    atomic.Int64
+	udpOutPackets atomic.Int64
+	udpOutBytes   atomic.Int64
+	transports    atomic.Int64
+	reconnects    atomic.Int64
 }
 
 func (c *clientState) getSession(peer *net.UDPAddr) *session {
@@ -90,18 +122,20 @@ func (c *clientState) getSession(peer *net.UDPAddr) *session {
 		return sess
 	}
 	id := randomID()
-	sess := &session{id: id, peer: peer, remote: c.remote, token: c.token, closed: make(chan struct{})}
+	sess := &session{id: id, peer: peer, remote: c.remote, token: c.token, closed: make(chan struct{}), stats: c.stats}
 	for i := 0; i < c.lanesN; i++ {
 		hc, closeFn, err := relay.NewHTTP3ClientWithOptions(relay.HTTP3ClientOptions{URL: c.remote, Timeout: c.timeout, ConnectIP: c.connectIP})
 		if err != nil {
 			log.Fatal(err)
 		}
-		sess.lanes = append(sess.lanes, &lane{client: hc, close: closeFn})
+		c.stats.transports.Add(1)
+		sess.lanes = append(sess.lanes, &lane{index: i, client: hc, close: closeFn})
 	}
 	for i := 0; i < c.polls; i++ {
 		go sess.pollLoop(c)
 	}
 	c.sessions[key] = sess
+	c.stats.sessions.Add(1)
 	log.Printf("new session id=%s peer=%s", id, key)
 	return sess
 }
@@ -115,7 +149,12 @@ func (s *session) send(payload []byte) {
 	}
 	ln := s.pickLane()
 	ln.inflight.Add(int64(len(body)))
+	ln.requests.Add(1)
+	ln.posts.Add(1)
+	s.stats.udpInPackets.Add(1)
+	s.stats.udpInBytes.Add(int64(len(payload)))
 	defer ln.inflight.Add(-int64(len(body)))
+	defer ln.requests.Add(-1)
 	req, err := http.NewRequest(http.MethodPost, s.remote, bytes.NewReader(body))
 	if err != nil {
 		log.Print(err)
@@ -126,12 +165,18 @@ func (s *session) send(payload []byte) {
 	req.Header.Set("X-Relay-Packet-Id", strconv.FormatUint(id, 10))
 	resp, err := ln.client.Do(req)
 	if err != nil {
+		ln.postErr.Add(1)
+		if isTimeout(err) {
+			ln.postTO.Add(1)
+		}
 		log.Printf("post failed: %v", err)
 		return
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
+	if resp.StatusCode == http.StatusNoContent {
+		ln.postOK.Add(1)
+	} else {
 		log.Printf("post status=%d", resp.StatusCode)
 	}
 }
@@ -160,8 +205,16 @@ func (s *session) pollLoop(c *clientState) {
 			return
 		}
 		setHeaders(req, c.token, s.id)
-		resp, err := s.lanes[0].client.Do(req)
+		ln := s.lanes[0]
+		ln.requests.Add(1)
+		ln.gets.Add(1)
+		resp, err := ln.client.Do(req)
+		ln.requests.Add(-1)
 		if err != nil {
+			ln.getErr.Add(1)
+			if isTimeout(err) {
+				ln.getTO.Add(1)
+			}
 			log.Printf("poll failed: %v", err)
 			time.Sleep(200 * time.Millisecond)
 			continue
@@ -169,6 +222,7 @@ func (s *session) pollLoop(c *clientState) {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusNoContent {
+			ln.getEmpty.Add(1)
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
@@ -176,15 +230,94 @@ func (s *session) pollLoop(c *clientState) {
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
+		ln.getOK.Add(1)
 		frames, err := relay.DecodeFrames(body)
 		if err != nil {
 			log.Printf("poll decode: %v", err)
 			continue
 		}
 		for _, f := range frames {
-			_, _ = c.udp.WriteToUDP(f.Payload, s.peer)
+			if n, err := c.udp.WriteToUDP(f.Payload, s.peer); err == nil {
+				c.stats.udpOutPackets.Add(1)
+				c.stats.udpOutBytes.Add(int64(n))
+			}
 		}
 	}
+}
+
+func (c *clientState) writeMetrics(path string, interval time.Duration) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Printf("metrics open failed: %v", err)
+		return
+	}
+	defer f.Close()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	enc := json.NewEncoder(f)
+	for range ticker.C {
+		if err := enc.Encode(c.snapshot()); err != nil {
+			log.Printf("metrics write failed: %v", err)
+			return
+		}
+	}
+}
+
+func (c *clientState) snapshot() map[string]any {
+	c.mu.Lock()
+	sessions := make([]*session, 0, len(c.sessions))
+	for _, sess := range c.sessions {
+		sessions = append(sessions, sess)
+	}
+	c.mu.Unlock()
+	var lanes []map[string]any
+	var inflightBytes, inflightRequests int64
+	for _, sess := range sessions {
+		for _, ln := range sess.lanes {
+			b := ln.inflight.Load()
+			r := ln.requests.Load()
+			inflightBytes += b
+			inflightRequests += r
+			lanes = append(lanes, map[string]any{
+				"session":           sess.id,
+				"lane":              ln.index,
+				"inflight_bytes":    b,
+				"inflight_requests": r,
+				"post_started":      ln.posts.Load(),
+				"post_ok":           ln.postOK.Load(),
+				"post_errors":       ln.postErr.Load(),
+				"post_timeouts":     ln.postTO.Load(),
+				"get_started":       ln.gets.Load(),
+				"get_ok":            ln.getOK.Load(),
+				"get_empty":         ln.getEmpty.Load(),
+				"get_errors":        ln.getErr.Load(),
+				"get_timeouts":      ln.getTO.Load(),
+			})
+		}
+	}
+	return map[string]any{
+		"event":             "proxy-client-metrics",
+		"ts":                time.Now().Format(time.RFC3339Nano),
+		"uptime_sec":        time.Since(c.stats.started).Seconds(),
+		"active_sessions":   len(sessions),
+		"created_sessions":  c.stats.sessions.Load(),
+		"transports":        c.stats.transports.Load(),
+		"reconnects":        c.stats.reconnects.Load(),
+		"udp_in_packets":    c.stats.udpInPackets.Load(),
+		"udp_in_bytes":      c.stats.udpInBytes.Load(),
+		"udp_out_packets":   c.stats.udpOutPackets.Load(),
+		"udp_out_bytes":     c.stats.udpOutBytes.Load(),
+		"inflight_bytes":    inflightBytes,
+		"inflight_requests": inflightRequests,
+		"lanes":             lanes,
+	}
+}
+
+func isTimeout(err error) bool {
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		return true
+	}
+	return false
 }
 
 func setHeaders(req *http.Request, token, sessionID string) {
