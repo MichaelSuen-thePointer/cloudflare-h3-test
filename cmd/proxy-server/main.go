@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -69,9 +70,6 @@ func main() {
 	flag.BoolVar(&benchEcho, "bench-echo", false, "echo frames in proxy server instead of UDP upstream")
 	flag.DurationVar(&idle, "idle", 120*time.Second, "session idle timeout")
 	flag.Parse()
-	if cert == "" || key == "" {
-		log.Fatal("-cert and -key are required")
-	}
 	addr, err := net.ResolveUDPAddr("udp", upstream)
 	if err != nil {
 		log.Fatal(err)
@@ -82,6 +80,12 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handle)
 	log.Printf("proxy-server listen=%s upstream=%s require_h3=%v bench_echo=%v", listen, upstream, requireH3, benchEcho)
+	if cert == "" && key == "" {
+		log.Fatal(http.ListenAndServe(listen, mux))
+	}
+	if cert == "" || key == "" {
+		log.Fatal("-cert and -key must be provided together")
+	}
 	log.Fatal(http.ListenAndServeTLS(listen, cert, key, mux))
 }
 
@@ -92,15 +96,19 @@ func (s *server) handle(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if s.requireH3 && r.Header.Get("X-Client-HTTP-Version") != "HTTP/3" {
-		s.countStatus(http.StatusNotFound)
-		http.NotFound(w, r)
-		return
-	}
 	id := r.Header.Get("X-Relay-Session")
 	if id == "" || len(id) > 128 {
 		s.countStatus(http.StatusBadRequest)
 		http.Error(w, "bad session", http.StatusBadRequest)
+		return
+	}
+	if isWebSocketUpgrade(r) {
+		s.handleWebSocket(w, r, id)
+		return
+	}
+	if s.requireH3 && r.Header.Get("X-Client-HTTP-Version") != "HTTP/3" {
+		s.countStatus(http.StatusNotFound)
+		http.NotFound(w, r)
 		return
 	}
 	switch r.Method {
@@ -115,6 +123,88 @@ func (s *server) handle(w http.ResponseWriter, r *http.Request) {
 	default:
 		s.countStatus(http.StatusNotFound)
 		http.NotFound(w, r)
+	}
+}
+
+func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request, id string) {
+	sess, err := s.getSession(id)
+	if err != nil {
+		s.countStatus(http.StatusBadGateway)
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	ws, err := relay.AcceptWebSocket(w, r)
+	if err != nil {
+		log.Printf("websocket accept failed: %v", err)
+		return
+	}
+	defer ws.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case f := <-sess.queue:
+				frames := []relay.Frame{f}
+			drain:
+				for len(frames) < 64 {
+					select {
+					case f := <-sess.queue:
+						frames = append(frames, f)
+					default:
+						break drain
+					}
+				}
+				body, err := relay.EncodeFrames(frames)
+				if err != nil {
+					log.Printf("websocket encode: %v", err)
+					return
+				}
+				if err := ws.WriteBinary(body); err != nil {
+					log.Printf("websocket write failed: %v", err)
+					return
+				}
+			case <-r.Context().Done():
+				return
+			}
+		}
+	}()
+	for {
+		body, err := ws.ReadBinary()
+		if err != nil {
+			return
+		}
+		frames, err := relay.DecodeFrames(body)
+		if err != nil {
+			log.Printf("websocket decode: %v", err)
+			continue
+		}
+		sess.touch()
+		if s.benchEcho {
+			for _, f := range frames {
+				select {
+				case sess.queue <- f:
+				default:
+					s.stats.queueDrops.Add(1)
+					<-sess.queue
+					sess.queue <- f
+				}
+			}
+			continue
+		}
+		for _, f := range frames {
+			if _, err := sess.udp.Write(f.Payload); err != nil {
+				log.Printf("websocket udp write failed: %v", err)
+				return
+			}
+			s.stats.udpUpPackets.Add(1)
+			s.stats.udpUpBytes.Add(int64(len(f.Payload)))
+		}
+		select {
+		case <-done:
+			return
+		default:
+		}
 	}
 }
 
@@ -333,6 +423,18 @@ func (s *server) countStatus(status int) {
 	case http.StatusInternalServerError:
 		s.stats.status500.Add(1)
 	}
+}
+
+func isWebSocketUpgrade(r *http.Request) bool {
+	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		return false
+	}
+	for _, part := range strings.Split(r.Header.Get("Connection"), ",") {
+		if strings.EqualFold(strings.TrimSpace(part), "upgrade") {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *session) touch() { s.lastActive = time.Now() }
