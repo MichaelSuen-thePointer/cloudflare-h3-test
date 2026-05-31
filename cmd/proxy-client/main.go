@@ -79,7 +79,7 @@ func main() {
 	flag.StringVar(&transport, "transport", "ws", "relay transport: ws or h3")
 	flag.IntVar(&lanesN, "lanes", 4, "HTTP/3 uplink lanes")
 	flag.IntVar(&wsLanesN, "ws-lanes", 1, "WebSocket lanes")
-	flag.BoolVar(&wsLanesAuto, "ws-lanes-auto", true, "automatically add WebSocket lanes when UDP queue builds up")
+	flag.BoolVar(&wsLanesAuto, "ws-lanes-auto", false, "automatically add WebSocket lanes when UDP queue builds up")
 	flag.IntVar(&wsLanesMax, "ws-lanes-max", 4, "maximum WebSocket lanes when auto lane scaling is enabled")
 	flag.IntVar(&wsLanesUpgradeQueue, "ws-lanes-upgrade-queue", 64, "queued UDP packets needed before auto WebSocket lane scaling")
 	flag.IntVar(&polls, "down-polls", 2, "downlink long-poll workers")
