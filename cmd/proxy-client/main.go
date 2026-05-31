@@ -37,12 +37,24 @@ type lane struct {
 	getTO    atomic.Int64
 }
 
+type wsLane struct {
+	index    int
+	conn     *relay.WebSocketConn
+	inflight atomic.Int64
+	requests atomic.Int64
+	posts    atomic.Int64
+	postOK   atomic.Int64
+	postErr  atomic.Int64
+}
+
 type session struct {
 	id     string
 	peer   *net.UDPAddr
 	remote string
 	token  string
-	ws     *relay.WebSocketConn
+	ws     []*wsLane
+	wsMode bool
+	ready  chan struct{}
 	up     []*lane
 	down   []*lane
 	next   atomic.Uint64
@@ -54,7 +66,7 @@ type session struct {
 
 func main() {
 	var listen, remote, token, connectIP, metricsOut, transport string
-	var lanesN, polls, maxInflightPosts, batchSize, sendQueue int
+	var lanesN, wsLanesN, polls, maxInflightPosts, batchSize, sendQueue int
 	var timeout, metricsInterval, batchDelay time.Duration
 	flag.StringVar(&listen, "listen", "127.0.0.1:15353", "local UDP listen address")
 	flag.StringVar(&remote, "remote", "https://relay.example.com:2083/", "relay server URL")
@@ -62,6 +74,7 @@ func main() {
 	flag.StringVar(&connectIP, "connect-ip", "", "optional Cloudflare edge IP to connect to instead of DNS")
 	flag.StringVar(&transport, "transport", "ws", "relay transport: ws or h3")
 	flag.IntVar(&lanesN, "lanes", 4, "HTTP/3 uplink lanes")
+	flag.IntVar(&wsLanesN, "ws-lanes", 1, "WebSocket lanes")
 	flag.IntVar(&polls, "down-polls", 2, "downlink long-poll workers")
 	flag.IntVar(&maxInflightPosts, "max-inflight-posts", 20, "maximum in-flight POST requests per session")
 	flag.IntVar(&batchSize, "batch-size", 3, "maximum UDP packets per POST")
@@ -83,11 +96,11 @@ func main() {
 	defer udp.Close()
 
 	stats := &clientStats{started: time.Now()}
-	state := &clientState{remote: remote, token: token, connectIP: connectIP, transport: transport, lanesN: lanesN, polls: polls, maxInflightPosts: maxInflightPosts, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, udp: udp, sessions: map[string]*session{}, stats: stats}
+	state := &clientState{remote: remote, token: token, connectIP: connectIP, transport: transport, lanesN: lanesN, wsLanesN: wsLanesN, polls: polls, maxInflightPosts: maxInflightPosts, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, udp: udp, sessions: map[string]*session{}, stats: stats}
 	if metricsOut != "" {
 		go state.writeMetrics(metricsOut, metricsInterval)
 	}
-	log.Printf("proxy-client udp listen=%s remote=%s connect_ip=%s lanes=%d down_polls=%d", listen, remote, connectIP, lanesN, polls)
+	log.Printf("proxy-client udp listen=%s remote=%s connect_ip=%s lanes=%d ws_lanes=%d down_polls=%d", listen, remote, connectIP, lanesN, wsLanesN, polls)
 	buf := make([]byte, 65535)
 	for {
 		n, peer, err := udp.ReadFromUDP(buf)
@@ -106,6 +119,7 @@ type clientState struct {
 	connectIP        string
 	transport        string
 	lanesN           int
+	wsLanesN         int
 	polls            int
 	maxInflightPosts int
 	batchSize        int
@@ -143,25 +157,30 @@ func (c *clientState) getSession(peer *net.UDPAddr) *session {
 	if c.batchSize < 1 {
 		c.batchSize = 1
 	}
+	if c.wsLanesN < 1 {
+		c.wsLanesN = 1
+	}
 	if c.sendQueue < 1 {
 		c.sendQueue = 1
 	}
-	sess := &session{id: id, peer: peer, remote: c.remote, token: c.token, closed: make(chan struct{}), stats: c.stats, posts: make(chan struct{}, c.maxInflightPosts), sendQ: make(chan []byte, c.sendQueue)}
+	sess := &session{id: id, peer: peer, remote: c.remote, token: c.token, closed: make(chan struct{}), ready: make(chan struct{}), stats: c.stats, posts: make(chan struct{}, c.maxInflightPosts), sendQ: make(chan []byte, c.sendQueue)}
 	if c.transport == "ws" {
-		ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
-		defer cancel()
-		ws, err := relay.DialWebSocket(ctx, c.remote, c.connectIP, c.token, id, c.timeout)
-		if err != nil {
-			log.Fatal(err)
-		}
-		c.stats.transports.Add(1)
-		sess.ws = ws
-		go sess.wsReadLoop(c)
-		go sess.sendLoop(c.batchSize, c.batchDelay)
+		sess.wsMode = true
 		c.sessions[key] = sess
 		c.stats.sessions.Add(1)
-		log.Printf("new websocket session id=%s peer=%s", id, key)
+		go sess.sendLoop(c.batchSize, c.batchDelay)
+		if c.wsLanesN > 1 {
+			go c.connectWebSocketLanes(sess, key)
+			log.Printf("new websocket session id=%s peer=%s lanes=%d connecting=true", id, key, c.wsLanesN)
+			return sess
+		}
+		c.connectWebSocketLanes(sess, key)
+		log.Printf("new websocket session id=%s peer=%s lanes=%d", id, key, len(sess.ws))
 		return sess
+	}
+	close(sess.ready)
+	if c.lanesN < 1 {
+		c.lanesN = 1
 	}
 	for i := 0; i < c.lanesN; i++ {
 		hc, closeFn, err := relay.NewHTTP3ClientWithOptions(relay.HTTP3ClientOptions{URL: c.remote, Timeout: c.timeout, ConnectIP: c.connectIP})
@@ -186,6 +205,59 @@ func (c *clientState) getSession(peer *net.UDPAddr) *session {
 	c.stats.sessions.Add(1)
 	log.Printf("new session id=%s peer=%s", id, key)
 	return sess
+}
+
+func (c *clientState) connectWebSocketLanes(sess *session, key string) {
+	defer close(sess.ready)
+	if c.wsLanesN < 1 {
+		c.wsLanesN = 1
+	}
+	if c.wsLanesN == 1 {
+		ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+		defer cancel()
+		ws, err := relay.DialWebSocket(ctx, c.remote, c.connectIP, c.token, sess.id, c.timeout)
+		if err != nil {
+			log.Fatal(err)
+		}
+		ln := &wsLane{index: 0, conn: ws}
+		c.stats.transports.Add(1)
+		sess.ws = append(sess.ws, ln)
+		go sess.wsReadLoop(c, ln)
+		return
+	}
+	{
+		wsLanes := make([]*wsLane, c.wsLanesN)
+		errCh := make(chan error, c.wsLanesN)
+		for i := 0; i < c.wsLanesN; i++ {
+			go func(i int) {
+				ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+				defer cancel()
+				ws, err := relay.DialWebSocket(ctx, c.remote, c.connectIP, c.token, sess.id, c.timeout)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				wsLanes[i] = &wsLane{index: i, conn: ws}
+				errCh <- nil
+			}(i)
+		}
+		for i := 0; i < c.wsLanesN; i++ {
+			if err := <-errCh; err != nil {
+				for _, ln := range wsLanes {
+					if ln != nil {
+						_ = ln.conn.Close()
+					}
+				}
+				log.Fatal(err)
+			}
+		}
+		for _, ln := range wsLanes {
+			c.stats.transports.Add(1)
+			sess.ws = append(sess.ws, ln)
+			go sess.wsReadLoop(c, ln)
+		}
+		log.Printf("new websocket session id=%s peer=%s lanes=%d", sess.id, key, len(sess.ws))
+	}
 }
 
 func (s *session) enqueue(payload []byte) {
@@ -220,7 +292,7 @@ func (s *session) sendLoop(batchSize int, batchDelay time.Duration) {
 				default:
 				}
 			}
-			if s.ws != nil {
+			if len(s.ws) == 1 {
 				s.sendBatch(batch)
 			} else {
 				go s.sendBatch(batch)
@@ -230,6 +302,9 @@ func (s *session) sendLoop(batchSize int, batchDelay time.Duration) {
 }
 
 func (s *session) sendBatch(frames []relay.Frame) {
+	if s.wsMode {
+		<-s.ready
+	}
 	s.posts <- struct{}{}
 	defer func() { <-s.posts }()
 
@@ -238,16 +313,25 @@ func (s *session) sendBatch(frames []relay.Frame) {
 		log.Print(err)
 		return
 	}
-	if s.ws != nil {
+	if len(s.ws) > 0 {
+		ln := s.pickWSLane()
+		ln.inflight.Add(int64(len(body)))
+		ln.requests.Add(1)
+		ln.posts.Add(1)
 		var payloadBytes int64
 		for _, f := range frames {
 			payloadBytes += int64(len(f.Payload))
 		}
 		s.stats.udpInPackets.Add(int64(len(frames)))
 		s.stats.udpInBytes.Add(payloadBytes)
-		if err := s.ws.WriteBinary(body); err != nil {
+		defer ln.inflight.Add(-int64(len(body)))
+		defer ln.requests.Add(-1)
+		if err := ln.conn.WriteBinary(body); err != nil {
+			ln.postErr.Add(1)
 			log.Printf("websocket write failed: %v", err)
+			return
 		}
+		ln.postOK.Add(1)
 		return
 	}
 	ln := s.pickLane()
@@ -288,9 +372,9 @@ func (s *session) sendBatch(frames []relay.Frame) {
 	}
 }
 
-func (s *session) wsReadLoop(c *clientState) {
+func (s *session) wsReadLoop(c *clientState, ln *wsLane) {
 	for {
-		body, err := s.ws.ReadBinary()
+		body, err := ln.conn.ReadBinary()
 		if err != nil {
 			log.Printf("websocket read failed: %v", err)
 			return
@@ -307,6 +391,17 @@ func (s *session) wsReadLoop(c *clientState) {
 			}
 		}
 	}
+}
+
+func (s *session) pickWSLane() *wsLane {
+	best := s.ws[0]
+	bestVal := best.inflight.Load()
+	for _, l := range s.ws[1:] {
+		if v := l.inflight.Load(); v < bestVal {
+			best, bestVal = l, v
+		}
+	}
+	return best
 }
 
 func (s *session) pickLane() *lane {
@@ -400,6 +495,28 @@ func (c *clientState) snapshot() map[string]any {
 	var lanes []map[string]any
 	var inflightBytes, inflightRequests int64
 	for _, sess := range sessions {
+		for _, ln := range sess.ws {
+			b := ln.inflight.Load()
+			r := ln.requests.Load()
+			inflightBytes += b
+			inflightRequests += r
+			lanes = append(lanes, map[string]any{
+				"session":           sess.id,
+				"direction":         "ws",
+				"lane":              ln.index,
+				"inflight_bytes":    b,
+				"inflight_requests": r,
+				"post_started":      ln.posts.Load(),
+				"post_ok":           ln.postOK.Load(),
+				"post_errors":       ln.postErr.Load(),
+				"post_timeouts":     int64(0),
+				"get_started":       int64(0),
+				"get_ok":            int64(0),
+				"get_empty":         int64(0),
+				"get_errors":        int64(0),
+				"get_timeouts":      int64(0),
+			})
+		}
 		for _, ln := range sess.up {
 			b := ln.inflight.Load()
 			r := ln.requests.Load()

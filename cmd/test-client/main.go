@@ -46,6 +46,7 @@ type report struct {
 	LossThreshold      float64       `json:"loss_threshold"`
 	P95ThresholdMS     float64       `json:"p95_threshold_ms"`
 	ReorderThreshold   float64       `json:"reorder_threshold"`
+	AllowReorder       bool          `json:"allow_reorder"`
 	Stages             []stageResult `json:"stages"`
 	BestSustainable    *stageResult  `json:"best_sustainable,omitempty"`
 	MaxObservedGoodput *stageResult  `json:"max_observed_goodput,omitempty"`
@@ -68,6 +69,7 @@ func main() {
 	var remote, out, mode, ratesCSV string
 	var packets, size, pps int
 	var wait, duration time.Duration
+	var allowReorder bool
 	var maxMBps, startMBps, lossThreshold, p95Threshold, reorderThreshold float64
 	flag.StringVar(&mode, "mode", "single", "single or sweep")
 	flag.StringVar(&remote, "remote", "127.0.0.1:15353", "UDP proxy-client address")
@@ -82,6 +84,7 @@ func main() {
 	flag.Float64Var(&lossThreshold, "loss-threshold", 0.01, "sustainable max loss rate")
 	flag.Float64Var(&p95Threshold, "p95-threshold-ms", 5000, "sustainable max p95 RTT in ms")
 	flag.Float64Var(&reorderThreshold, "reorder-threshold", 0.05, "sustainable max reorder rate")
+	flag.BoolVar(&allowReorder, "allow-reorder", false, "record reorder rate but do not fail sustainable gate")
 	flag.StringVar(&out, "out", "", "optional JSON report path")
 	flag.Parse()
 
@@ -98,7 +101,7 @@ func main() {
 	started := time.Now()
 	rep := report{
 		Mode: mode, Remote: remote, MaxMBps: maxMBps,
-		LossThreshold: lossThreshold, P95ThresholdMS: p95Threshold, ReorderThreshold: reorderThreshold,
+		LossThreshold: lossThreshold, P95ThresholdMS: p95Threshold, ReorderThreshold: reorderThreshold, AllowReorder: allowReorder,
 		Started: started.Format(time.RFC3339),
 	}
 	switch mode {
@@ -107,7 +110,7 @@ func main() {
 		if pps > 0 {
 			targetMBps = float64(pps*size) / 1_000_000
 		}
-		st := runStage(conn, addr, packets, size, pps, targetMBps, wait, lossThreshold, p95Threshold, reorderThreshold)
+		st := runStage(conn, addr, packets, size, pps, targetMBps, wait, lossThreshold, p95Threshold, reorderThreshold, allowReorder)
 		rep.Stages = []stageResult{st}
 		if st.Sustainable {
 			rep.BestSustainable = &rep.Stages[0]
@@ -123,7 +126,7 @@ func main() {
 				stagePackets = 1
 			}
 			stagePPS := int(math.Ceil(float64(stagePackets) / duration.Seconds()))
-			st := runStage(conn, addr, stagePackets, size, stagePPS, mbps, wait, lossThreshold, p95Threshold, reorderThreshold)
+			st := runStage(conn, addr, stagePackets, size, stagePPS, mbps, wait, lossThreshold, p95Threshold, reorderThreshold, allowReorder)
 			st.DurationSec = duration.Seconds()
 			rep.Stages = append(rep.Stages, st)
 			if st.Sustainable {
@@ -174,7 +177,7 @@ func maxZeroLoss(stages []stageResult) *stageResult {
 	return &stages[best]
 }
 
-func runStage(conn *net.UDPConn, addr *net.UDPAddr, packets, size, pps int, targetMBps float64, wait time.Duration, lossThreshold, p95Threshold, reorderThreshold float64) stageResult {
+func runStage(conn *net.UDPConn, addr *net.UDPAddr, packets, size, pps int, targetMBps float64, wait time.Duration, lossThreshold, p95Threshold, reorderThreshold float64, allowReorder bool) stageResult {
 	st := stageResult{
 		Remote: addr.String(), TargetMBps: targetMBps, TargetMbps: targetMBps * 8,
 		PayloadSize: size, Sent: packets, Started: time.Now().Format(time.RFC3339),
@@ -241,7 +244,7 @@ func runStage(conn *net.UDPConn, addr *net.UDPAddr, packets, size, pps int, targ
 	elapsed := finished.Sub(started).Seconds()
 	st.GoodputMBps = float64(received*size) / elapsed / 1_000_000
 	st.GoodputMbps = st.GoodputMBps * 8
-	st.Sustainable, st.UnsustainReason = sustainable(st, lossThreshold, p95Threshold, reorderThreshold)
+	st.Sustainable, st.UnsustainReason = sustainable(st, lossThreshold, p95Threshold, reorderThreshold, allowReorder)
 	return st
 }
 
@@ -308,7 +311,7 @@ func parseRates(csv string, start, max float64) ([]float64, error) {
 	return rates, nil
 }
 
-func sustainable(st stageResult, lossThreshold, p95Threshold, reorderThreshold float64) (bool, string) {
+func sustainable(st stageResult, lossThreshold, p95Threshold, reorderThreshold float64, allowReorder bool) (bool, string) {
 	if st.Received == 0 {
 		return false, "no packets received"
 	}
@@ -318,7 +321,7 @@ func sustainable(st stageResult, lossThreshold, p95Threshold, reorderThreshold f
 	if st.RTT.P95MS > p95Threshold {
 		return false, fmt.Sprintf("p95 %.3fms > %.3fms", st.RTT.P95MS, p95Threshold)
 	}
-	if st.ReorderRate > reorderThreshold {
+	if !allowReorder && st.ReorderRate > reorderThreshold {
 		return false, fmt.Sprintf("reorder %.4f > %.4f", st.ReorderRate, reorderThreshold)
 	}
 	return true, ""
