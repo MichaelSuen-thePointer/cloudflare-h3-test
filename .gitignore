@@ -1,4 +1,5 @@
 bin/
+.gocache/
 *.log
 chrome-*-profile/
 *.tmp
