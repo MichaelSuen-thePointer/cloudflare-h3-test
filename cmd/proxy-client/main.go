@@ -64,7 +64,7 @@ func main() {
 	flag.IntVar(&lanesN, "lanes", 4, "HTTP/3 uplink lanes")
 	flag.IntVar(&polls, "down-polls", 2, "downlink long-poll workers")
 	flag.IntVar(&maxInflightPosts, "max-inflight-posts", 20, "maximum in-flight POST requests per session")
-	flag.IntVar(&batchSize, "batch-size", 2, "maximum UDP packets per POST")
+	flag.IntVar(&batchSize, "batch-size", 3, "maximum UDP packets per POST")
 	flag.DurationVar(&batchDelay, "batch-delay", time.Millisecond, "maximum time to wait for a partially filled POST batch")
 	flag.IntVar(&sendQueue, "send-queue", 4096, "per-session UDP packet queue before POST batching")
 	flag.DurationVar(&timeout, "http-timeout", 15*time.Second, "HTTP request timeout")
