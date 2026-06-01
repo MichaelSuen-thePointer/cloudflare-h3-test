@@ -38,13 +38,16 @@ type lane struct {
 }
 
 type wsLane struct {
-	index    int
-	conn     *relay.WebSocketConn
-	inflight atomic.Int64
-	requests atomic.Int64
-	posts    atomic.Int64
-	postOK   atomic.Int64
-	postErr  atomic.Int64
+	index        int
+	conn         *relay.WebSocketConn
+	inflight     atomic.Int64
+	requests     atomic.Int64
+	posts        atomic.Int64
+	postOK       atomic.Int64
+	postErr      atomic.Int64
+	readErr      atomic.Int64
+	closed       atomic.Bool
+	reconnecting atomic.Bool
 }
 
 type session struct {
@@ -381,7 +384,11 @@ func (s *session) sendBatch(frames []relay.Frame) {
 		return
 	}
 	if s.wsCount() > 0 {
-		ln := s.pickWSLane()
+		ln := s.waitForWSLane(s.state.timeout)
+		if ln == nil {
+			log.Printf("websocket lane unavailable")
+			return
+		}
 		ln.inflight.Add(int64(len(body)))
 		ln.requests.Add(1)
 		ln.posts.Add(1)
@@ -395,6 +402,8 @@ func (s *session) sendBatch(frames []relay.Frame) {
 		defer ln.requests.Add(-1)
 		if err := ln.conn.WriteBinary(body); err != nil {
 			ln.postErr.Add(1)
+			ln.closed.Store(true)
+			go s.reconnectWebSocketLane(s.state, ln)
 			log.Printf("websocket write failed: %v", err)
 			return
 		}
@@ -443,6 +452,9 @@ func (s *session) wsReadLoop(c *clientState, ln *wsLane) {
 	for {
 		body, err := ln.conn.ReadBinary()
 		if err != nil {
+			ln.readErr.Add(1)
+			ln.closed.Store(true)
+			go s.reconnectWebSocketLane(c, ln)
 			log.Printf("websocket read failed: %v", err)
 			return
 		}
@@ -460,12 +472,74 @@ func (s *session) wsReadLoop(c *clientState, ln *wsLane) {
 	}
 }
 
+func (s *session) reconnectWebSocketLane(c *clientState, old *wsLane) {
+	if !old.reconnecting.CompareAndSwap(false, true) {
+		return
+	}
+	_ = old.conn.Close()
+	for {
+		select {
+		case <-s.closed:
+			return
+		default:
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+		ws, err := relay.DialWebSocket(ctx, c.remote, c.connectIP, c.token, s.id, c.timeout)
+		cancel()
+		if err != nil {
+			log.Printf("websocket reconnect failed: %v", err)
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		ln := &wsLane{index: old.index, conn: ws}
+		replaced := false
+		s.wsMu.Lock()
+		for i, cur := range s.ws {
+			if cur == old {
+				s.ws[i] = ln
+				replaced = true
+				break
+			}
+		}
+		s.wsMu.Unlock()
+		if !replaced {
+			_ = ws.Close()
+			return
+		}
+		c.stats.transports.Add(1)
+		c.stats.reconnects.Add(1)
+		go s.wsReadLoop(c, ln)
+		log.Printf("websocket session id=%s lane=%d reconnected", s.id, old.index)
+		return
+	}
+}
+
+func (s *session) waitForWSLane(timeout time.Duration) *wsLane {
+	deadline := time.Now().Add(timeout)
+	for {
+		if ln := s.pickWSLane(); ln != nil {
+			return ln
+		}
+		if time.Now().After(deadline) {
+			return nil
+		}
+		select {
+		case <-s.closed:
+			return nil
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 func (s *session) pickWSLane() *wsLane {
 	s.wsMu.Lock()
 	defer s.wsMu.Unlock()
-	best := s.ws[0]
-	bestVal := best.inflight.Load()
-	for _, l := range s.ws[1:] {
+	var best *wsLane
+	bestVal := int64(1<<63 - 1)
+	for _, l := range s.ws {
+		if l.closed.Load() {
+			continue
+		}
 		if v := l.inflight.Load(); v < bestVal {
 			best, bestVal = l, v
 		}
@@ -585,7 +659,7 @@ func (c *clientState) snapshot() map[string]any {
 				"get_started":       int64(0),
 				"get_ok":            int64(0),
 				"get_empty":         int64(0),
-				"get_errors":        int64(0),
+				"get_errors":        ln.readErr.Load(),
 				"get_timeouts":      int64(0),
 			})
 		}
