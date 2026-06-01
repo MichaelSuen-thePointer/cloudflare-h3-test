@@ -11,7 +11,9 @@ import (
 
 func main() {
 	var listen string
+	var udpBuffer int
 	flag.StringVar(&listen, "listen", "127.0.0.1:19090", "UDP listen address")
+	flag.IntVar(&udpBuffer, "udp-buffer", 4<<20, "UDP socket read/write buffer bytes")
 	flag.Parse()
 	addr, err := net.ResolveUDPAddr("udp", listen)
 	if err != nil {
@@ -22,6 +24,10 @@ func main() {
 		log.Fatal(err)
 	}
 	defer conn.Close()
+	if udpBuffer > 0 {
+		_ = conn.SetReadBuffer(udpBuffer)
+		_ = conn.SetWriteBuffer(udpBuffer)
+	}
 	var packets, bytes atomic.Uint64
 	go func() {
 		t := time.NewTicker(10 * time.Second)

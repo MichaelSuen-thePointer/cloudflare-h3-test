@@ -31,6 +31,7 @@ type server struct {
 	upstream  *net.UDPAddr
 	benchEcho bool
 	idle      time.Duration
+	udpBuffer int
 	mu        sync.Mutex
 	sessions  map[string]*session
 	stats     serverStats
@@ -53,12 +54,17 @@ type serverStats struct {
 	udpDownPackets atomic.Int64
 	udpDownBytes   atomic.Int64
 	queueDrops     atomic.Int64
+	queueWaitMaxUS atomic.Int64
+	queueWaitCount atomic.Int64
+	wsWriteMaxUS   atomic.Int64
+	wsWriteCount   atomic.Int64
 	sessionsMade   atomic.Int64
 	sessionsClosed atomic.Int64
 }
 
 func main() {
 	var listen, cert, key, token, upstream string
+	var udpBuffer int
 	var requireH3, benchEcho bool
 	var idle time.Duration
 	flag.StringVar(&listen, "listen", ":2083", "TLS listen address")
@@ -69,12 +75,13 @@ func main() {
 	flag.BoolVar(&requireH3, "require-h3", true, "require X-Client-HTTP-Version: HTTP/3")
 	flag.BoolVar(&benchEcho, "bench-echo", false, "echo frames in proxy server instead of UDP upstream")
 	flag.DurationVar(&idle, "idle", 120*time.Second, "session idle timeout")
+	flag.IntVar(&udpBuffer, "udp-buffer", 4<<20, "UDP socket read/write buffer bytes")
 	flag.Parse()
 	addr, err := net.ResolveUDPAddr("udp", upstream)
 	if err != nil {
 		log.Fatal(err)
 	}
-	s := &server{token: token, requireH3: requireH3, upstream: addr, benchEcho: benchEcho, idle: idle, sessions: map[string]*session{}}
+	s := &server{token: token, requireH3: requireH3, upstream: addr, benchEcho: benchEcho, idle: idle, udpBuffer: udpBuffer, sessions: map[string]*session{}}
 	go s.cleanupLoop()
 	go s.metricsLoop()
 	mux := http.NewServeMux()
@@ -145,11 +152,13 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request, id stri
 		for {
 			select {
 			case f := <-sess.queue:
+				s.stats.observeQueueWait(f)
 				frames := []relay.Frame{f}
 			drain:
 				for len(frames) < 64 {
 					select {
 					case f := <-sess.queue:
+						s.stats.observeQueueWait(f)
 						frames = append(frames, f)
 					default:
 						break drain
@@ -160,10 +169,12 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request, id stri
 					log.Printf("websocket encode: %v", err)
 					return
 				}
+				started := time.Now()
 				if err := ws.WriteBinary(body); err != nil {
 					log.Printf("websocket write failed: %v", err)
 					return
 				}
+				s.stats.observeWSWrite(time.Since(started))
 			case <-r.Context().Done():
 				return
 			}
@@ -182,6 +193,7 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request, id stri
 		sess.touch()
 		if s.benchEcho {
 			for _, f := range frames {
+				f.QueuedAt = time.Now()
 				select {
 				case sess.queue <- f:
 				default:
@@ -230,6 +242,7 @@ func (s *server) handlePost(w http.ResponseWriter, r *http.Request, id string) {
 	sess.touch()
 	if s.benchEcho {
 		for _, f := range frames {
+			f.QueuedAt = time.Now()
 			select {
 			case sess.queue <- f:
 			default:
@@ -267,11 +280,13 @@ func (s *server) handleGet(w http.ResponseWriter, r *http.Request, id string) {
 	var frames []relay.Frame
 	select {
 	case f := <-sess.queue:
+		s.stats.observeQueueWait(f)
 		frames = append(frames, f)
 	drain:
 		for len(frames) < 64 {
 			select {
 			case f := <-sess.queue:
+				s.stats.observeQueueWait(f)
 				frames = append(frames, f)
 			default:
 				break drain
@@ -302,6 +317,10 @@ func (s *server) getSession(id string) (*session, error) {
 	udp, err := net.DialUDP("udp", nil, s.upstream)
 	if err != nil {
 		return nil, err
+	}
+	if s.udpBuffer > 0 {
+		_ = udp.SetReadBuffer(s.udpBuffer)
+		_ = udp.SetWriteBuffer(s.udpBuffer)
 	}
 	sess := &session{id: id, udp: udp, queue: make(chan relay.Frame, 1024), lastActive: time.Now()}
 	s.sessions[id] = sess
@@ -366,31 +385,57 @@ func (s *server) metricsLoop() {
 		}
 		s.mu.Unlock()
 		b, _ := json.Marshal(map[string]any{
-			"event":            "proxy-server-metrics",
-			"ts":               time.Now().Format(time.RFC3339Nano),
-			"active_sessions":  active,
-			"sessions_created": s.stats.sessionsMade.Load(),
-			"sessions_closed":  s.stats.sessionsClosed.Load(),
-			"requests":         s.stats.requests.Load(),
-			"post_requests":    s.stats.postRequests.Load(),
-			"get_requests":     s.stats.getRequests.Load(),
-			"delete_requests":  s.stats.deleteRequests.Load(),
-			"status_200":       s.stats.status200.Load(),
-			"status_204":       s.stats.status204.Load(),
-			"status_400":       s.stats.status400.Load(),
-			"status_404":       s.stats.status404.Load(),
-			"status_410":       s.stats.status410.Load(),
-			"status_500":       s.stats.status500.Load(),
-			"status_502":       s.stats.status502.Load(),
-			"udp_up_packets":   s.stats.udpUpPackets.Load(),
-			"udp_up_bytes":     s.stats.udpUpBytes.Load(),
-			"udp_down_packets": s.stats.udpDownPackets.Load(),
-			"udp_down_bytes":   s.stats.udpDownBytes.Load(),
-			"queue_depth":      queueDepth,
-			"queue_capacity":   queueCapacity,
-			"queue_drops":      s.stats.queueDrops.Load(),
+			"event":             "proxy-server-metrics",
+			"ts":                time.Now().Format(time.RFC3339Nano),
+			"active_sessions":   active,
+			"sessions_created":  s.stats.sessionsMade.Load(),
+			"sessions_closed":   s.stats.sessionsClosed.Load(),
+			"requests":          s.stats.requests.Load(),
+			"post_requests":     s.stats.postRequests.Load(),
+			"get_requests":      s.stats.getRequests.Load(),
+			"delete_requests":   s.stats.deleteRequests.Load(),
+			"status_200":        s.stats.status200.Load(),
+			"status_204":        s.stats.status204.Load(),
+			"status_400":        s.stats.status400.Load(),
+			"status_404":        s.stats.status404.Load(),
+			"status_410":        s.stats.status410.Load(),
+			"status_500":        s.stats.status500.Load(),
+			"status_502":        s.stats.status502.Load(),
+			"udp_up_packets":    s.stats.udpUpPackets.Load(),
+			"udp_up_bytes":      s.stats.udpUpBytes.Load(),
+			"udp_down_packets":  s.stats.udpDownPackets.Load(),
+			"udp_down_bytes":    s.stats.udpDownBytes.Load(),
+			"queue_depth":       queueDepth,
+			"queue_capacity":    queueCapacity,
+			"queue_drops":       s.stats.queueDrops.Load(),
+			"queue_wait_max_ms": float64(s.stats.queueWaitMaxUS.Load()) / 1000,
+			"queue_wait_count":  s.stats.queueWaitCount.Load(),
+			"ws_write_max_ms":   float64(s.stats.wsWriteMaxUS.Load()) / 1000,
+			"ws_write_count":    s.stats.wsWriteCount.Load(),
 		})
 		log.Print(string(b))
+	}
+}
+
+func (s *serverStats) observeQueueWait(f relay.Frame) {
+	if f.QueuedAt.IsZero() {
+		return
+	}
+	s.queueWaitCount.Add(1)
+	updateMax(&s.queueWaitMaxUS, time.Since(f.QueuedAt).Microseconds())
+}
+
+func (s *serverStats) observeWSWrite(d time.Duration) {
+	s.wsWriteCount.Add(1)
+	updateMax(&s.wsWriteMaxUS, d.Microseconds())
+}
+
+func updateMax(target *atomic.Int64, value int64) {
+	for {
+		old := target.Load()
+		if value <= old || target.CompareAndSwap(old, value) {
+			return
+		}
 	}
 }
 
@@ -456,7 +501,7 @@ func (s *session) readLoop(parent *server) {
 		}
 		s.touch()
 		payload := append([]byte(nil), buf[:n]...)
-		f := relay.Frame{Payload: payload}
+		f := relay.Frame{Payload: payload, QueuedAt: time.Now()}
 		select {
 		case s.queue <- f:
 		default:

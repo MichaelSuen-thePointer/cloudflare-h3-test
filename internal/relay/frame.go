@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 )
 
 var Magic = [4]byte{'H', '3', 'U', 'R'}
@@ -15,6 +16,7 @@ const Version byte = 1
 type Frame struct {
 	PacketID uint64
 	Payload  []byte
+	QueuedAt time.Time
 }
 
 func EncodeFrames(frames []Frame) ([]byte, error) {
