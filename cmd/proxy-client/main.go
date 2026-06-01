@@ -68,6 +68,7 @@ type session struct {
 	stats     *clientStats
 	posts     chan struct{}
 	sendQ     chan []byte
+	wsNext    atomic.Uint64
 }
 
 func main() {
@@ -152,6 +153,7 @@ type clientStats struct {
 	udpInBytes    atomic.Int64
 	udpOutPackets atomic.Int64
 	udpOutBytes   atomic.Int64
+	queueDrops    atomic.Int64
 	transports    atomic.Int64
 	reconnects    atomic.Int64
 }
@@ -285,6 +287,7 @@ func (s *session) enqueue(payload []byte) {
 	select {
 	case s.sendQ <- payload:
 	default:
+		s.stats.queueDrops.Add(1)
 		<-s.sendQ
 		s.sendQ <- payload
 	}
@@ -534,17 +537,17 @@ func (s *session) waitForWSLane(timeout time.Duration) *wsLane {
 func (s *session) pickWSLane() *wsLane {
 	s.wsMu.Lock()
 	defer s.wsMu.Unlock()
-	var best *wsLane
-	bestVal := int64(1<<63 - 1)
-	for _, l := range s.ws {
-		if l.closed.Load() {
-			continue
-		}
-		if v := l.inflight.Load(); v < bestVal {
-			best, bestVal = l, v
+	if len(s.ws) == 0 {
+		return nil
+	}
+	start := int(s.wsNext.Add(1)-1) % len(s.ws)
+	for i := 0; i < len(s.ws); i++ {
+		ln := s.ws[(start+i)%len(s.ws)]
+		if !ln.closed.Load() {
+			return ln
 		}
 	}
-	return best
+	return nil
 }
 
 func (s *session) pickLane() *lane {
@@ -637,7 +640,10 @@ func (c *clientState) snapshot() map[string]any {
 	c.mu.Unlock()
 	var lanes []map[string]any
 	var inflightBytes, inflightRequests int64
+	var sendQueueDepth, sendQueueCapacity int
 	for _, sess := range sessions {
+		sendQueueDepth += len(sess.sendQ)
+		sendQueueCapacity += cap(sess.sendQ)
 		sess.wsMu.Lock()
 		wsLanes := append([]*wsLane(nil), sess.ws...)
 		sess.wsMu.Unlock()
@@ -707,20 +713,23 @@ func (c *clientState) snapshot() map[string]any {
 		}
 	}
 	return map[string]any{
-		"event":             "proxy-client-metrics",
-		"ts":                time.Now().Format(time.RFC3339Nano),
-		"uptime_sec":        time.Since(c.stats.started).Seconds(),
-		"active_sessions":   len(sessions),
-		"created_sessions":  c.stats.sessions.Load(),
-		"transports":        c.stats.transports.Load(),
-		"reconnects":        c.stats.reconnects.Load(),
-		"udp_in_packets":    c.stats.udpInPackets.Load(),
-		"udp_in_bytes":      c.stats.udpInBytes.Load(),
-		"udp_out_packets":   c.stats.udpOutPackets.Load(),
-		"udp_out_bytes":     c.stats.udpOutBytes.Load(),
-		"inflight_bytes":    inflightBytes,
-		"inflight_requests": inflightRequests,
-		"lanes":             lanes,
+		"event":               "proxy-client-metrics",
+		"ts":                  time.Now().Format(time.RFC3339Nano),
+		"uptime_sec":          time.Since(c.stats.started).Seconds(),
+		"active_sessions":     len(sessions),
+		"created_sessions":    c.stats.sessions.Load(),
+		"transports":          c.stats.transports.Load(),
+		"reconnects":          c.stats.reconnects.Load(),
+		"udp_in_packets":      c.stats.udpInPackets.Load(),
+		"udp_in_bytes":        c.stats.udpInBytes.Load(),
+		"udp_out_packets":     c.stats.udpOutPackets.Load(),
+		"udp_out_bytes":       c.stats.udpOutBytes.Load(),
+		"send_queue_depth":    sendQueueDepth,
+		"send_queue_capacity": sendQueueCapacity,
+		"send_queue_drops":    c.stats.queueDrops.Load(),
+		"inflight_bytes":      inflightBytes,
+		"inflight_requests":   inflightRequests,
+		"lanes":               lanes,
 	}
 }
 
