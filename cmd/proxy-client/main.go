@@ -541,13 +541,20 @@ func (s *session) pickWSLane() *wsLane {
 		return nil
 	}
 	start := int(s.wsNext.Add(1)-1) % len(s.ws)
+	var best *wsLane
+	var bestInflight int64
 	for i := 0; i < len(s.ws); i++ {
 		ln := s.ws[(start+i)%len(s.ws)]
-		if !ln.closed.Load() {
-			return ln
+		if ln.closed.Load() {
+			continue
+		}
+		inflight := ln.inflight.Load()
+		if best == nil || inflight < bestInflight {
+			best = ln
+			bestInflight = inflight
 		}
 	}
-	return nil
+	return best
 }
 
 func (s *session) pickLane() *lane {
