@@ -301,9 +301,6 @@ func (s *session) sendLoop(batchSize int, batchDelay time.Duration) {
 		case first := <-s.sendQ:
 			s.maybeScaleWebSocketLanes()
 			currentBatchSize := batchSize
-			if s.wsMode && s.wsCount() > 1 {
-				currentBatchSize = 1
-			}
 			batch := []relay.Frame{{PacketID: s.next.Add(1), Payload: first}}
 			timer := time.NewTimer(batchDelay)
 		collect:
