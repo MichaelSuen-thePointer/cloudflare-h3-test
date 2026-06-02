@@ -66,6 +66,7 @@ type session struct {
 	next      atomic.Uint64
 	closed    chan struct{}
 	stats     *clientStats
+	metrics   bool
 	posts     chan struct{}
 	sendQ     chan []byte
 	wsNext    atomic.Uint64
@@ -74,7 +75,7 @@ type session struct {
 func main() {
 	var listen, remote, token, connectIP, metricsOut, transport string
 	var lanesN, wsLanesN, wsLanesMax, wsLanesUpgradeQueue, polls, maxInflightPosts, batchSize, sendQueue int
-	var wsLanesAuto bool
+	var wsLanesAuto, metrics bool
 	var timeout, metricsInterval, batchDelay time.Duration
 	flag.StringVar(&listen, "listen", "127.0.0.1:15353", "local UDP listen address")
 	flag.StringVar(&remote, "remote", "https://relay.example.com:2083/", "relay server URL")
@@ -92,6 +93,7 @@ func main() {
 	flag.DurationVar(&batchDelay, "batch-delay", time.Millisecond, "maximum time to wait for a partially filled POST batch")
 	flag.IntVar(&sendQueue, "send-queue", 4096, "per-session UDP packet queue before POST batching")
 	flag.DurationVar(&timeout, "http-timeout", 15*time.Second, "HTTP request timeout")
+	flag.BoolVar(&metrics, "metrics", false, "enable in-memory metrics counters")
 	flag.DurationVar(&metricsInterval, "metrics-interval", 1*time.Second, "metrics snapshot interval")
 	flag.StringVar(&metricsOut, "metrics-out", "", "optional JSONL metrics output path")
 	flag.Parse()
@@ -106,8 +108,9 @@ func main() {
 	}
 	defer udp.Close()
 
+	metrics = metrics || metricsOut != ""
 	stats := &clientStats{started: time.Now()}
-	state := &clientState{remote: remote, token: token, connectIP: connectIP, transport: transport, lanesN: lanesN, wsLanesN: wsLanesN, wsLanesAuto: wsLanesAuto, wsLanesMax: wsLanesMax, wsLanesUpgradeQueue: wsLanesUpgradeQueue, polls: polls, maxInflightPosts: maxInflightPosts, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, udp: udp, sessions: map[string]*session{}, stats: stats}
+	state := &clientState{remote: remote, token: token, connectIP: connectIP, transport: transport, lanesN: lanesN, wsLanesN: wsLanesN, wsLanesAuto: wsLanesAuto, wsLanesMax: wsLanesMax, wsLanesUpgradeQueue: wsLanesUpgradeQueue, polls: polls, maxInflightPosts: maxInflightPosts, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, udp: udp, sessions: map[string]*session{}, stats: stats, metrics: metrics}
 	if metricsOut != "" {
 		go state.writeMetrics(metricsOut, metricsInterval)
 	}
@@ -144,6 +147,7 @@ type clientState struct {
 	mu                  sync.Mutex
 	sessions            map[string]*session
 	stats               *clientStats
+	metrics             bool
 }
 
 type clientStats struct {
@@ -156,6 +160,148 @@ type clientStats struct {
 	queueDrops    atomic.Int64
 	transports    atomic.Int64
 	reconnects    atomic.Int64
+}
+
+func (c *clientState) countSession() {
+	if c.metrics {
+		c.stats.sessions.Add(1)
+	}
+}
+
+func (c *clientState) countTransport() {
+	if c.metrics {
+		c.stats.transports.Add(1)
+	}
+}
+
+func (c *clientState) countReconnect() {
+	if c.metrics {
+		c.stats.reconnects.Add(1)
+	}
+}
+
+func (c *clientState) countUDPOut(n int) {
+	if c.metrics {
+		c.stats.udpOutPackets.Add(1)
+		c.stats.udpOutBytes.Add(int64(n))
+	}
+}
+
+func (s *session) countQueueDrop() {
+	if s.metrics {
+		s.stats.queueDrops.Add(1)
+	}
+}
+
+func (s *session) countUDPIn(packets int, bytes int64) {
+	if s.metrics {
+		s.stats.udpInPackets.Add(int64(packets))
+		s.stats.udpInBytes.Add(bytes)
+	}
+}
+
+func (s *session) countUDPInFrames(frames []relay.Frame) {
+	if !s.metrics {
+		return
+	}
+	var bytes int64
+	for _, f := range frames {
+		bytes += int64(len(f.Payload))
+	}
+	s.countUDPIn(len(frames), bytes)
+}
+
+func (s *session) countWSPostStart(ln *wsLane) {
+	if s.metrics {
+		ln.requests.Add(1)
+		ln.posts.Add(1)
+	}
+}
+
+func (s *session) countWSRequestDone(ln *wsLane) {
+	if s.metrics {
+		ln.requests.Add(-1)
+	}
+}
+
+func (s *session) countWSPostOK(ln *wsLane) {
+	if s.metrics {
+		ln.postOK.Add(1)
+	}
+}
+
+func (s *session) countWSPostError(ln *wsLane) {
+	if s.metrics {
+		ln.postErr.Add(1)
+	}
+}
+
+func (s *session) countWSReadError(ln *wsLane) {
+	if s.metrics {
+		ln.readErr.Add(1)
+	}
+}
+
+func (s *session) countPostStart(ln *lane) {
+	if s.metrics {
+		ln.requests.Add(1)
+		ln.posts.Add(1)
+	}
+}
+
+func (s *session) countRequestDone(ln *lane) {
+	if s.metrics {
+		ln.requests.Add(-1)
+	}
+}
+
+func (s *session) countPostOK(ln *lane) {
+	if s.metrics {
+		ln.postOK.Add(1)
+	}
+}
+
+func (s *session) countPostError(ln *lane) {
+	if s.metrics {
+		ln.postErr.Add(1)
+	}
+}
+
+func (s *session) countPostTimeout(ln *lane) {
+	if s.metrics {
+		ln.postTO.Add(1)
+	}
+}
+
+func (s *session) countGetStart(ln *lane) {
+	if s.metrics {
+		ln.requests.Add(1)
+		ln.gets.Add(1)
+	}
+}
+
+func (s *session) countGetOK(ln *lane) {
+	if s.metrics {
+		ln.getOK.Add(1)
+	}
+}
+
+func (s *session) countGetEmpty(ln *lane) {
+	if s.metrics {
+		ln.getEmpty.Add(1)
+	}
+}
+
+func (s *session) countGetError(ln *lane) {
+	if s.metrics {
+		ln.getErr.Add(1)
+	}
+}
+
+func (s *session) countGetTimeout(ln *lane) {
+	if s.metrics {
+		ln.getTO.Add(1)
+	}
 }
 
 func (c *clientState) getSession(peer *net.UDPAddr) *session {
@@ -184,11 +330,11 @@ func (c *clientState) getSession(peer *net.UDPAddr) *session {
 	if c.sendQueue < 1 {
 		c.sendQueue = 1
 	}
-	sess := &session{id: id, peer: peer, remote: c.remote, token: c.token, state: c, closed: make(chan struct{}), ready: make(chan struct{}), stats: c.stats, posts: make(chan struct{}, c.maxInflightPosts), sendQ: make(chan []byte, c.sendQueue)}
+	sess := &session{id: id, peer: peer, remote: c.remote, token: c.token, state: c, closed: make(chan struct{}), ready: make(chan struct{}), stats: c.stats, metrics: c.metrics, posts: make(chan struct{}, c.maxInflightPosts), sendQ: make(chan []byte, c.sendQueue)}
 	if c.transport == "ws" {
 		sess.wsMode = true
 		c.sessions[key] = sess
-		c.stats.sessions.Add(1)
+		c.countSession()
 		go sess.sendLoop(c.batchSize, c.batchDelay)
 		go sess.wsScaleLoop()
 		if c.wsLanesN > 1 {
@@ -209,7 +355,7 @@ func (c *clientState) getSession(peer *net.UDPAddr) *session {
 		if err != nil {
 			log.Fatal(err)
 		}
-		c.stats.transports.Add(1)
+		c.countTransport()
 		sess.up = append(sess.up, &lane{index: i, client: hc, close: closeFn})
 	}
 	for i := 0; i < c.polls; i++ {
@@ -217,14 +363,14 @@ func (c *clientState) getSession(peer *net.UDPAddr) *session {
 		if err != nil {
 			log.Fatal(err)
 		}
-		c.stats.transports.Add(1)
+		c.countTransport()
 		ln := &lane{index: i, client: hc, close: closeFn}
 		sess.down = append(sess.down, ln)
 		go sess.pollLoop(c, ln)
 	}
 	go sess.sendLoop(c.batchSize, c.batchDelay)
 	c.sessions[key] = sess
-	c.stats.sessions.Add(1)
+	c.countSession()
 	log.Printf("new session id=%s peer=%s", id, key)
 	return sess
 }
@@ -276,7 +422,7 @@ func (c *clientState) ensureWebSocketLanes(sess *session, target int) error {
 	sess.wsMu.Lock()
 	defer sess.wsMu.Unlock()
 	for _, ln := range wsLanes {
-		c.stats.transports.Add(1)
+		c.countTransport()
 		sess.ws = append(sess.ws, ln)
 		go sess.wsReadLoop(c, ln)
 	}
@@ -287,7 +433,7 @@ func (s *session) enqueue(payload []byte) {
 	select {
 	case s.sendQ <- payload:
 	default:
-		s.stats.queueDrops.Add(1)
+		s.countQueueDrop()
 		<-s.sendQ
 		s.sendQ <- payload
 	}
@@ -390,38 +536,26 @@ func (s *session) sendBatch(frames []relay.Frame) {
 			return
 		}
 		ln.inflight.Add(int64(len(body)))
-		ln.requests.Add(1)
-		ln.posts.Add(1)
-		var payloadBytes int64
-		for _, f := range frames {
-			payloadBytes += int64(len(f.Payload))
-		}
-		s.stats.udpInPackets.Add(int64(len(frames)))
-		s.stats.udpInBytes.Add(payloadBytes)
+		s.countWSPostStart(ln)
+		s.countUDPInFrames(frames)
 		defer ln.inflight.Add(-int64(len(body)))
-		defer ln.requests.Add(-1)
+		defer s.countWSRequestDone(ln)
 		if err := ln.conn.WriteBinary(body); err != nil {
-			ln.postErr.Add(1)
+			s.countWSPostError(ln)
 			ln.closed.Store(true)
 			go s.reconnectWebSocketLane(s.state, ln)
 			log.Printf("websocket write failed: %v", err)
 			return
 		}
-		ln.postOK.Add(1)
+		s.countWSPostOK(ln)
 		return
 	}
 	ln := s.pickLane()
 	ln.inflight.Add(int64(len(body)))
-	ln.requests.Add(1)
-	ln.posts.Add(1)
-	var payloadBytes int64
-	for _, f := range frames {
-		payloadBytes += int64(len(f.Payload))
-	}
-	s.stats.udpInPackets.Add(int64(len(frames)))
-	s.stats.udpInBytes.Add(payloadBytes)
+	s.countPostStart(ln)
+	s.countUDPInFrames(frames)
 	defer ln.inflight.Add(-int64(len(body)))
-	defer ln.requests.Add(-1)
+	defer s.countRequestDone(ln)
 	req, err := http.NewRequest(http.MethodPost, s.remote, bytes.NewReader(body))
 	if err != nil {
 		log.Print(err)
@@ -432,9 +566,9 @@ func (s *session) sendBatch(frames []relay.Frame) {
 	req.Header.Set("X-Relay-Packet-Id", strconv.FormatUint(frames[0].PacketID, 10))
 	resp, err := ln.client.Do(req)
 	if err != nil {
-		ln.postErr.Add(1)
+		s.countPostError(ln)
 		if isTimeout(err) {
-			ln.postTO.Add(1)
+			s.countPostTimeout(ln)
 		}
 		log.Printf("post failed: %v", err)
 		return
@@ -442,7 +576,7 @@ func (s *session) sendBatch(frames []relay.Frame) {
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode == http.StatusNoContent {
-		ln.postOK.Add(1)
+		s.countPostOK(ln)
 	} else {
 		log.Printf("post status=%d", resp.StatusCode)
 	}
@@ -452,7 +586,7 @@ func (s *session) wsReadLoop(c *clientState, ln *wsLane) {
 	for {
 		body, err := ln.conn.ReadBinary()
 		if err != nil {
-			ln.readErr.Add(1)
+			s.countWSReadError(ln)
 			ln.closed.Store(true)
 			go s.reconnectWebSocketLane(c, ln)
 			log.Printf("websocket read failed: %v", err)
@@ -465,8 +599,7 @@ func (s *session) wsReadLoop(c *clientState, ln *wsLane) {
 		}
 		for _, f := range frames {
 			if n, err := c.udp.WriteToUDP(f.Payload, s.peer); err == nil {
-				c.stats.udpOutPackets.Add(1)
-				c.stats.udpOutBytes.Add(int64(n))
+				c.countUDPOut(n)
 			}
 		}
 	}
@@ -506,8 +639,8 @@ func (s *session) reconnectWebSocketLane(c *clientState, old *wsLane) {
 			_ = ws.Close()
 			return
 		}
-		c.stats.transports.Add(1)
-		c.stats.reconnects.Add(1)
+		c.countTransport()
+		c.countReconnect()
 		go s.wsReadLoop(c, ln)
 		log.Printf("websocket session id=%s lane=%d reconnected", s.id, old.index)
 		return
@@ -578,14 +711,13 @@ func (s *session) pollLoop(c *clientState, ln *lane) {
 			return
 		}
 		setHeaders(req, c.token, s.id)
-		ln.requests.Add(1)
-		ln.gets.Add(1)
+		s.countGetStart(ln)
 		resp, err := ln.client.Do(req)
-		ln.requests.Add(-1)
+		s.countRequestDone(ln)
 		if err != nil {
-			ln.getErr.Add(1)
+			s.countGetError(ln)
 			if isTimeout(err) {
-				ln.getTO.Add(1)
+				s.countGetTimeout(ln)
 			}
 			log.Printf("poll failed: %v", err)
 			time.Sleep(200 * time.Millisecond)
@@ -594,7 +726,7 @@ func (s *session) pollLoop(c *clientState, ln *lane) {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusNoContent {
-			ln.getEmpty.Add(1)
+			s.countGetEmpty(ln)
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
@@ -602,7 +734,7 @@ func (s *session) pollLoop(c *clientState, ln *lane) {
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
-		ln.getOK.Add(1)
+		s.countGetOK(ln)
 		frames, err := relay.DecodeFrames(body)
 		if err != nil {
 			log.Printf("poll decode: %v", err)
@@ -610,8 +742,7 @@ func (s *session) pollLoop(c *clientState, ln *lane) {
 		}
 		for _, f := range frames {
 			if n, err := c.udp.WriteToUDP(f.Payload, s.peer); err == nil {
-				c.stats.udpOutPackets.Add(1)
-				c.stats.udpOutBytes.Add(int64(n))
+				c.countUDPOut(n)
 			}
 		}
 	}

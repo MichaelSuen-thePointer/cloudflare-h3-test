@@ -181,4 +181,26 @@ See `reports/go-test-quality-report.md` for details.
 -connect-ip 104.17.173.91
 ```
 
+## Native Go Runtime Metrics
+
+Runtime metrics are disabled by default for release-style runs.
+
+`proxy-client` supports:
+
+```text
+-metrics
+-metrics-out test-results/metrics-proxy-client.jsonl
+-metrics-interval 1s
+```
+
+`-metrics-out` also enables metrics so existing benchmark commands keep working.
+
+`proxy-server` supports:
+
+```text
+-metrics
+```
+
+When enabled, `proxy-server` writes periodic `proxy-server-metrics` JSON records to the process log.
+
 The first sweep reached the configured `8 MB/s` target stage, but the current one-packet-per-HTTP3-POST prototype did not sustain high throughput. Maximum observed goodput was about `0.0205 MB/s`, and no stage met the strict loss/latency/reorder sustainability thresholds. See `reports/go-throughput-quality-report.md` and `test-results/go-throughput-sweep-report-preferred-ip.json`.

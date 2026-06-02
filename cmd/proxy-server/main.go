@@ -21,7 +21,7 @@ type session struct {
 	mode       string
 	udp        *net.UDPConn
 	queue      chan relay.Frame
-	lastActive time.Time
+	lastActive atomic.Int64
 	closeOnce  sync.Once
 }
 
@@ -32,6 +32,7 @@ type server struct {
 	benchEcho bool
 	idle      time.Duration
 	udpBuffer int
+	metrics   bool
 	mu        sync.Mutex
 	sessions  map[string]*session
 	stats     serverStats
@@ -65,7 +66,7 @@ type serverStats struct {
 func main() {
 	var listen, cert, key, token, upstream string
 	var udpBuffer int
-	var requireH3, benchEcho bool
+	var requireH3, benchEcho, metrics bool
 	var idle time.Duration
 	flag.StringVar(&listen, "listen", ":2083", "TLS listen address")
 	flag.StringVar(&cert, "cert", "", "TLS certificate")
@@ -74,6 +75,7 @@ func main() {
 	flag.StringVar(&upstream, "upstream", "127.0.0.1:19090", "UDP upstream test/upstream service server")
 	flag.BoolVar(&requireH3, "require-h3", true, "require X-Client-HTTP-Version: HTTP/3")
 	flag.BoolVar(&benchEcho, "bench-echo", false, "echo frames in proxy server instead of UDP upstream")
+	flag.BoolVar(&metrics, "metrics", false, "enable periodic JSON metrics logging")
 	flag.DurationVar(&idle, "idle", 120*time.Second, "session idle timeout")
 	flag.IntVar(&udpBuffer, "udp-buffer", 4<<20, "UDP socket read/write buffer bytes")
 	flag.Parse()
@@ -81,12 +83,14 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	s := &server{token: token, requireH3: requireH3, upstream: addr, benchEcho: benchEcho, idle: idle, udpBuffer: udpBuffer, sessions: map[string]*session{}}
+	s := &server{token: token, requireH3: requireH3, upstream: addr, benchEcho: benchEcho, idle: idle, udpBuffer: udpBuffer, metrics: metrics, sessions: map[string]*session{}}
 	go s.cleanupLoop()
-	go s.metricsLoop()
+	if s.metrics {
+		go s.metricsLoop()
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handle)
-	log.Printf("proxy-server listen=%s upstream=%s require_h3=%v bench_echo=%v", listen, upstream, requireH3, benchEcho)
+	log.Printf("proxy-server listen=%s upstream=%s require_h3=%v bench_echo=%v metrics=%v", listen, upstream, requireH3, benchEcho, metrics)
 	if cert == "" && key == "" {
 		log.Fatal(http.ListenAndServe(listen, mux))
 	}
@@ -152,13 +156,13 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request, id stri
 		for {
 			select {
 			case f := <-sess.queue:
-				s.stats.observeQueueWait(f)
+				s.observeQueueWait(f)
 				frames := []relay.Frame{f}
 			drain:
 				for len(frames) < 64 {
 					select {
 					case f := <-sess.queue:
-						s.stats.observeQueueWait(f)
+						s.observeQueueWait(f)
 						frames = append(frames, f)
 					default:
 						break drain
@@ -169,12 +173,17 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request, id stri
 					log.Printf("websocket encode: %v", err)
 					return
 				}
-				started := time.Now()
-				if err := ws.WriteBinary(body); err != nil {
+				if s.metrics {
+					started := time.Now()
+					if err := ws.WriteBinary(body); err != nil {
+						log.Printf("websocket write failed: %v", err)
+						return
+					}
+					s.observeWSWrite(time.Since(started))
+				} else if err := ws.WriteBinary(body); err != nil {
 					log.Printf("websocket write failed: %v", err)
 					return
 				}
-				s.stats.observeWSWrite(time.Since(started))
 			case <-r.Context().Done():
 				return
 			}
@@ -193,11 +202,11 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request, id stri
 		sess.touch()
 		if s.benchEcho {
 			for _, f := range frames {
-				f.QueuedAt = time.Now()
+				f = s.queueFrame(f)
 				select {
 				case sess.queue <- f:
 				default:
-					s.stats.queueDrops.Add(1)
+					s.countQueueDrop()
 					<-sess.queue
 					sess.queue <- f
 				}
@@ -209,8 +218,7 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request, id stri
 				log.Printf("websocket udp write failed: %v", err)
 				return
 			}
-			s.stats.udpUpPackets.Add(1)
-			s.stats.udpUpBytes.Add(int64(len(f.Payload)))
+			s.countUDPUp(len(f.Payload))
 		}
 		select {
 		case <-done:
@@ -242,11 +250,11 @@ func (s *server) handlePost(w http.ResponseWriter, r *http.Request, id string) {
 	sess.touch()
 	if s.benchEcho {
 		for _, f := range frames {
-			f.QueuedAt = time.Now()
+			f = s.queueFrame(f)
 			select {
 			case sess.queue <- f:
 			default:
-				s.stats.queueDrops.Add(1)
+				s.countQueueDrop()
 				<-sess.queue
 				sess.queue <- f
 			}
@@ -261,8 +269,7 @@ func (s *server) handlePost(w http.ResponseWriter, r *http.Request, id string) {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
-		s.stats.udpUpPackets.Add(1)
-		s.stats.udpUpBytes.Add(int64(len(f.Payload)))
+		s.countUDPUp(len(f.Payload))
 	}
 	s.countStatus(http.StatusNoContent)
 	w.WriteHeader(http.StatusNoContent)
@@ -280,13 +287,13 @@ func (s *server) handleGet(w http.ResponseWriter, r *http.Request, id string) {
 	var frames []relay.Frame
 	select {
 	case f := <-sess.queue:
-		s.stats.observeQueueWait(f)
+		s.observeQueueWait(f)
 		frames = append(frames, f)
 	drain:
 		for len(frames) < 64 {
 			select {
 			case f := <-sess.queue:
-				s.stats.observeQueueWait(f)
+				s.observeQueueWait(f)
 				frames = append(frames, f)
 			default:
 				break drain
@@ -322,9 +329,10 @@ func (s *server) getSession(id string) (*session, error) {
 		_ = udp.SetReadBuffer(s.udpBuffer)
 		_ = udp.SetWriteBuffer(s.udpBuffer)
 	}
-	sess := &session{id: id, udp: udp, queue: make(chan relay.Frame, 1024), lastActive: time.Now()}
+	sess := &session{id: id, udp: udp, queue: make(chan relay.Frame, 1024)}
+	sess.touch()
 	s.sessions[id] = sess
-	s.stats.sessionsMade.Add(1)
+	s.countSessionMade()
 	if !s.benchEcho {
 		go sess.readLoop(s)
 	}
@@ -343,7 +351,7 @@ func (s *server) closeSession(id string) {
 	delete(s.sessions, id)
 	s.mu.Unlock()
 	if sess != nil {
-		s.stats.sessionsClosed.Add(1)
+		s.countSessionClosed()
 		sess.close()
 	}
 }
@@ -356,7 +364,7 @@ func (s *server) cleanupLoop() {
 		var ids []string
 		s.mu.Lock()
 		for id, sess := range s.sessions {
-			if sess.lastActive.Before(cutoff) {
+			if sess.idleBefore(cutoff) {
 				ids = append(ids, id)
 			}
 		}
@@ -417,17 +425,59 @@ func (s *server) metricsLoop() {
 	}
 }
 
-func (s *serverStats) observeQueueWait(f relay.Frame) {
-	if f.QueuedAt.IsZero() {
-		return
+func (s *server) queueFrame(f relay.Frame) relay.Frame {
+	if s.metrics {
+		f.QueuedAt = time.Now()
 	}
-	s.queueWaitCount.Add(1)
-	updateMax(&s.queueWaitMaxUS, time.Since(f.QueuedAt).Microseconds())
+	return f
 }
 
-func (s *serverStats) observeWSWrite(d time.Duration) {
-	s.wsWriteCount.Add(1)
-	updateMax(&s.wsWriteMaxUS, d.Microseconds())
+func (s *server) observeQueueWait(f relay.Frame) {
+	if !s.metrics || f.QueuedAt.IsZero() {
+		return
+	}
+	s.stats.queueWaitCount.Add(1)
+	updateMax(&s.stats.queueWaitMaxUS, time.Since(f.QueuedAt).Microseconds())
+}
+
+func (s *server) observeWSWrite(d time.Duration) {
+	if !s.metrics {
+		return
+	}
+	s.stats.wsWriteCount.Add(1)
+	updateMax(&s.stats.wsWriteMaxUS, d.Microseconds())
+}
+
+func (s *server) countQueueDrop() {
+	if s.metrics {
+		s.stats.queueDrops.Add(1)
+	}
+}
+
+func (s *server) countUDPUp(n int) {
+	if s.metrics {
+		s.stats.udpUpPackets.Add(1)
+		s.stats.udpUpBytes.Add(int64(n))
+	}
+}
+
+func (s *server) countUDPDown(n int) {
+	if s.metrics {
+		s.stats.udpDownPackets.Add(1)
+		s.stats.udpDownBytes.Add(int64(n))
+	}
+}
+
+func (s *server) countSessionMade() {
+	if s.metrics {
+		s.stats.sessionsMade.Add(1)
+	}
+}
+
+func (s *server) countSessionClosed() {
+	if s.metrics {
+		s.stats.sessionsClosed.Add(1)
+	}
 }
 
 func updateMax(target *atomic.Int64, value int64) {
@@ -440,6 +490,9 @@ func updateMax(target *atomic.Int64, value int64) {
 }
 
 func (s *server) countMethod(method string) {
+	if !s.metrics {
+		return
+	}
 	s.stats.requests.Add(1)
 	switch method {
 	case http.MethodPost:
@@ -452,6 +505,9 @@ func (s *server) countMethod(method string) {
 }
 
 func (s *server) countStatus(status int) {
+	if !s.metrics {
+		return
+	}
 	switch status {
 	case http.StatusOK:
 		s.stats.status200.Add(1)
@@ -482,7 +538,11 @@ func isWebSocketUpgrade(r *http.Request) bool {
 	return false
 }
 
-func (s *session) touch() { s.lastActive = time.Now() }
+func (s *session) touch() { s.lastActive.Store(time.Now().UnixNano()) }
+
+func (s *session) idleBefore(cutoff time.Time) bool {
+	return s.lastActive.Load() < cutoff.UnixNano()
+}
 
 func (s *session) close() {
 	s.closeOnce.Do(func() {
@@ -501,15 +561,14 @@ func (s *session) readLoop(parent *server) {
 		}
 		s.touch()
 		payload := append([]byte(nil), buf[:n]...)
-		f := relay.Frame{Payload: payload, QueuedAt: time.Now()}
+		f := parent.queueFrame(relay.Frame{Payload: payload})
 		select {
 		case s.queue <- f:
 		default:
-			parent.stats.queueDrops.Add(1)
+			parent.countQueueDrop()
 			<-s.queue
 			s.queue <- f
 		}
-		parent.stats.udpDownPackets.Add(1)
-		parent.stats.udpDownBytes.Add(int64(n))
+		parent.countUDPDown(n)
 	}
 }
