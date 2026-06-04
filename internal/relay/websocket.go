@@ -21,11 +21,15 @@ import (
 
 const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
+const MaxWebSocketPayloadBytes = 2 << 20
+const DefaultWebSocketWriteTimeout = 15 * time.Second
+
 type WebSocketConn struct {
-	conn   net.Conn
-	reader *bufio.Reader
-	mu     sync.Mutex
-	mask   bool
+	conn         net.Conn
+	reader       *bufio.Reader
+	mu           sync.Mutex
+	mask         bool
+	writeTimeout time.Duration
 }
 
 func DialWebSocket(ctx context.Context, rawURL, connectIP, token, sessionID string, timeout time.Duration) (*WebSocketConn, error) {
@@ -96,7 +100,7 @@ func DialWebSocket(ctx context.Context, rawURL, connectIP, token, sessionID stri
 		conn.Close()
 		return nil, fmt.Errorf("bad websocket accept")
 	}
-	return &WebSocketConn{conn: conn, reader: br, mask: true}, nil
+	return &WebSocketConn{conn: conn, reader: br, mask: true, writeTimeout: normalizeWebSocketWriteTimeout(timeout)}, nil
 }
 
 func AcceptWebSocket(w http.ResponseWriter, r *http.Request) (*WebSocketConn, error) {
@@ -129,7 +133,7 @@ func AcceptWebSocket(w http.ResponseWriter, r *http.Request) (*WebSocketConn, er
 		conn.Close()
 		return nil, err
 	}
-	return &WebSocketConn{conn: conn, reader: rw.Reader, mask: false}, nil
+	return &WebSocketConn{conn: conn, reader: rw.Reader, mask: false, writeTimeout: DefaultWebSocketWriteTimeout}, nil
 }
 
 func (c *WebSocketConn) Close() error {
@@ -139,6 +143,8 @@ func (c *WebSocketConn) Close() error {
 func (c *WebSocketConn) WriteBinary(payload []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.setWriteDeadline()
+	defer c.clearWriteDeadline()
 	var hdr [14]byte
 	hdr[0] = 0x82
 	pos := 2
@@ -204,8 +210,23 @@ func (c *WebSocketConn) readFrame() (byte, []byte, error) {
 	if _, err := io.ReadFull(c.reader, hdr[:]); err != nil {
 		return 0, nil, err
 	}
+	fin := hdr[0]&0x80 != 0
+	if hdr[0]&0x70 != 0 {
+		return 0, nil, errors.New("websocket reserved bits set")
+	}
 	opcode := hdr[0] & 0x0f
+	if !fin {
+		return 0, nil, errors.New("websocket fragmented frames unsupported")
+	}
+	switch opcode {
+	case 0x2, 0x8, 0x9, 0xA:
+	default:
+		return 0, nil, fmt.Errorf("unsupported websocket opcode: %d", opcode)
+	}
 	masked := hdr[1]&0x80 != 0
+	if masked == c.mask {
+		return 0, nil, errors.New("bad websocket mask direction")
+	}
 	n := uint64(hdr[1] & 0x7f)
 	switch n {
 	case 126:
@@ -220,6 +241,12 @@ func (c *WebSocketConn) readFrame() (byte, []byte, error) {
 			return 0, nil, err
 		}
 		n = binary.BigEndian.Uint64(b[:])
+	}
+	if opcode >= 0x8 && n > 125 {
+		return 0, nil, errors.New("websocket control frame too large")
+	}
+	if n > MaxWebSocketPayloadBytes {
+		return 0, nil, fmt.Errorf("websocket payload too large: %d", n)
 	}
 	var key [4]byte
 	if masked {
@@ -242,15 +269,56 @@ func (c *WebSocketConn) readFrame() (byte, []byte, error) {
 func (c *WebSocketConn) writeControl(opcode byte, payload []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.setWriteDeadline()
+	defer c.clearWriteDeadline()
 	if len(payload) > 125 {
 		payload = payload[:125]
 	}
-	hdr := []byte{0x80 | opcode, byte(len(payload))}
+	maskBit := byte(0)
+	if c.mask {
+		maskBit = 0x80
+	}
+	hdr := []byte{0x80 | opcode, maskBit | byte(len(payload))}
+	if c.mask {
+		var key [4]byte
+		if _, err := rand.Read(key[:]); err != nil {
+			return err
+		}
+		hdr = append(hdr, key[:]...)
+		masked := make([]byte, len(payload))
+		for i := range payload {
+			masked[i] = payload[i] ^ key[i%4]
+		}
+		if _, err := c.conn.Write(hdr); err != nil {
+			return err
+		}
+		_, err := c.conn.Write(masked)
+		return err
+	}
 	if _, err := c.conn.Write(hdr); err != nil {
 		return err
 	}
 	_, err := c.conn.Write(payload)
 	return err
+}
+
+func (c *WebSocketConn) setWriteDeadline() {
+	if c.writeTimeout > 0 {
+		_ = c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+	}
+}
+
+func (c *WebSocketConn) clearWriteDeadline() {
+	if c.writeTimeout > 0 {
+		_ = c.conn.SetWriteDeadline(time.Time{})
+	}
+}
+
+func normalizeWebSocketWriteTimeout(timeout time.Duration) time.Duration {
+	if timeout <= 0 {
+		return DefaultWebSocketWriteTimeout
+	}
+	return timeout
 }
 
 func websocketAccept(key string) string {

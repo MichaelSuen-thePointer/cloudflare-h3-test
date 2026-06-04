@@ -51,32 +51,34 @@ type wsLane struct {
 }
 
 type session struct {
-	id        string
-	peer      *net.UDPAddr
-	remote    string
-	token     string
-	state     *clientState
-	ws        []*wsLane
-	wsMode    bool
-	ready     chan struct{}
-	wsMu      sync.Mutex
-	wsScaling atomic.Bool
-	up        []*lane
-	down      []*lane
-	next      atomic.Uint64
-	closed    chan struct{}
-	stats     *clientStats
-	metrics   bool
-	posts     chan struct{}
-	sendQ     chan []byte
-	wsNext    atomic.Uint64
+	id         string
+	peer       *net.UDPAddr
+	remote     string
+	token      string
+	state      *clientState
+	ws         []*wsLane
+	wsMode     bool
+	ready      chan struct{}
+	wsMu       sync.Mutex
+	wsScaling  atomic.Bool
+	up         []*lane
+	down       []*lane
+	next       atomic.Uint64
+	closed     chan struct{}
+	lastActive atomic.Int64
+	closeOnce  sync.Once
+	stats      *clientStats
+	metrics    bool
+	posts      chan struct{}
+	sendQ      chan []byte
+	wsNext     atomic.Uint64
 }
 
 func main() {
 	var listen, remote, token, connectIP, metricsOut, transport string
 	var lanesN, wsLanesN, wsLanesMax, wsLanesUpgradeQueue, polls, maxInflightPosts, batchSize, sendQueue int
 	var wsLanesAuto, metrics bool
-	var timeout, metricsInterval, batchDelay time.Duration
+	var timeout, metricsInterval, batchDelay, idle time.Duration
 	flag.StringVar(&listen, "listen", "127.0.0.1:15353", "local UDP listen address")
 	flag.StringVar(&remote, "remote", "https://relay.example.com:2083/", "relay server URL")
 	flag.StringVar(&token, "token", "change-me-token", "shared relay token")
@@ -93,10 +95,42 @@ func main() {
 	flag.DurationVar(&batchDelay, "batch-delay", time.Millisecond, "maximum time to wait for a partially filled POST batch")
 	flag.IntVar(&sendQueue, "send-queue", 4096, "per-session UDP packet queue before POST batching")
 	flag.DurationVar(&timeout, "http-timeout", 15*time.Second, "HTTP request timeout")
+	flag.DurationVar(&idle, "idle", 120*time.Second, "local UDP session idle timeout")
 	flag.BoolVar(&metrics, "metrics", false, "enable in-memory metrics counters")
 	flag.DurationVar(&metricsInterval, "metrics-interval", 1*time.Second, "metrics snapshot interval")
 	flag.StringVar(&metricsOut, "metrics-out", "", "optional JSONL metrics output path")
 	flag.Parse()
+
+	if transport != "ws" && transport != "h3" {
+		log.Fatalf("invalid -transport %q: expected ws or h3", transport)
+	}
+	if lanesN < 1 {
+		lanesN = 1
+	}
+	if wsLanesN < 1 {
+		wsLanesN = 1
+	}
+	if wsLanesMax < wsLanesN {
+		wsLanesMax = wsLanesN
+	}
+	if wsLanesUpgradeQueue < 1 {
+		wsLanesUpgradeQueue = 1
+	}
+	if maxInflightPosts < 1 {
+		maxInflightPosts = 1
+	}
+	if batchSize < 1 {
+		batchSize = 1
+	}
+	if sendQueue < 1 {
+		sendQueue = 1
+	}
+	if metricsInterval <= 0 {
+		metricsInterval = time.Second
+	}
+	if idle <= 0 {
+		idle = 120 * time.Second
+	}
 
 	addr, err := net.ResolveUDPAddr("udp", listen)
 	if err != nil {
@@ -110,10 +144,11 @@ func main() {
 
 	metrics = metrics || metricsOut != ""
 	stats := &clientStats{started: time.Now()}
-	state := &clientState{remote: remote, token: token, connectIP: connectIP, transport: transport, lanesN: lanesN, wsLanesN: wsLanesN, wsLanesAuto: wsLanesAuto, wsLanesMax: wsLanesMax, wsLanesUpgradeQueue: wsLanesUpgradeQueue, polls: polls, maxInflightPosts: maxInflightPosts, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, udp: udp, sessions: map[string]*session{}, stats: stats, metrics: metrics}
+	state := &clientState{remote: remote, token: token, connectIP: connectIP, transport: transport, lanesN: lanesN, wsLanesN: wsLanesN, wsLanesAuto: wsLanesAuto, wsLanesMax: wsLanesMax, wsLanesUpgradeQueue: wsLanesUpgradeQueue, polls: polls, maxInflightPosts: maxInflightPosts, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, idle: idle, udp: udp, sessions: map[string]*session{}, stats: stats, metrics: metrics}
 	if metricsOut != "" {
 		go state.writeMetrics(metricsOut, metricsInterval)
 	}
+	go state.cleanupLoop()
 	log.Printf("proxy-client udp listen=%s remote=%s connect_ip=%s lanes=%d ws_lanes=%d ws_lanes_auto=%v ws_lanes_max=%d down_polls=%d", listen, remote, connectIP, lanesN, wsLanesN, wsLanesAuto, wsLanesMax, polls)
 	buf := make([]byte, 65535)
 	for {
@@ -143,6 +178,7 @@ type clientState struct {
 	batchDelay          time.Duration
 	sendQueue           int
 	timeout             time.Duration
+	idle                time.Duration
 	udp                 *net.UDPConn
 	mu                  sync.Mutex
 	sessions            map[string]*session
@@ -187,9 +223,9 @@ func (c *clientState) countUDPOut(n int) {
 	}
 }
 
-func (s *session) countQueueDrop() {
-	if s.metrics {
-		s.stats.queueDrops.Add(1)
+func (s *session) countQueueDrops(n int) {
+	if s.metrics && n > 0 {
+		s.stats.queueDrops.Add(int64(n))
 	}
 }
 
@@ -309,28 +345,12 @@ func (c *clientState) getSession(peer *net.UDPAddr) *session {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if sess := c.sessions[key]; sess != nil {
+		sess.touch()
 		return sess
 	}
 	id := randomID()
-	if c.maxInflightPosts < 1 {
-		c.maxInflightPosts = 1
-	}
-	if c.batchSize < 1 {
-		c.batchSize = 1
-	}
-	if c.wsLanesN < 1 {
-		c.wsLanesN = 1
-	}
-	if c.wsLanesMax < c.wsLanesN {
-		c.wsLanesMax = c.wsLanesN
-	}
-	if c.wsLanesUpgradeQueue < 1 {
-		c.wsLanesUpgradeQueue = 1
-	}
-	if c.sendQueue < 1 {
-		c.sendQueue = 1
-	}
 	sess := &session{id: id, peer: peer, remote: c.remote, token: c.token, state: c, closed: make(chan struct{}), ready: make(chan struct{}), stats: c.stats, metrics: c.metrics, posts: make(chan struct{}, c.maxInflightPosts), sendQ: make(chan []byte, c.sendQueue)}
+	sess.touch()
 	if c.transport == "ws" {
 		sess.wsMode = true
 		c.sessions[key] = sess
@@ -347,9 +367,6 @@ func (c *clientState) getSession(peer *net.UDPAddr) *session {
 		return sess
 	}
 	close(sess.ready)
-	if c.lanesN < 1 {
-		c.lanesN = 1
-	}
 	for i := 0; i < c.lanesN; i++ {
 		hc, closeFn, err := relay.NewHTTP3ClientWithOptions(relay.HTTP3ClientOptions{URL: c.remote, Timeout: c.timeout, ConnectIP: c.connectIP})
 		if err != nil {
@@ -373,6 +390,42 @@ func (c *clientState) getSession(peer *net.UDPAddr) *session {
 	c.countSession()
 	log.Printf("new session id=%s peer=%s", id, key)
 	return sess
+}
+
+func (c *clientState) cleanupLoop() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		cutoff := time.Now().Add(-c.idle)
+		var expired []struct {
+			key  string
+			sess *session
+		}
+		c.mu.Lock()
+		for key, sess := range c.sessions {
+			if sess.idleBefore(cutoff) {
+				expired = append(expired, struct {
+					key  string
+					sess *session
+				}{key: key, sess: sess})
+			}
+		}
+		c.mu.Unlock()
+		for _, item := range expired {
+			c.closeSession(item.key, item.sess)
+		}
+	}
+}
+
+func (c *clientState) closeSession(key string, sess *session) {
+	c.mu.Lock()
+	if c.sessions[key] != sess {
+		c.mu.Unlock()
+		return
+	}
+	delete(c.sessions, key)
+	c.mu.Unlock()
+	sess.close()
 }
 
 func (c *clientState) connectWebSocketLanes(sess *session, key string) {
@@ -430,13 +483,8 @@ func (c *clientState) ensureWebSocketLanes(sess *session, target int) error {
 }
 
 func (s *session) enqueue(payload []byte) {
-	select {
-	case s.sendQ <- payload:
-	default:
-		s.countQueueDrop()
-		<-s.sendQ
-		s.sendQ <- payload
-	}
+	s.touch()
+	s.countQueueDrops(relay.EnqueueDropOldest(s.sendQ, payload))
 }
 
 func (s *session) sendLoop(batchSize int, batchDelay time.Duration) {
@@ -517,11 +565,45 @@ func (s *session) wsCount() int {
 	return len(s.ws)
 }
 
+func (s *session) touch() { s.lastActive.Store(time.Now().UnixNano()) }
+
+func (s *session) idleBefore(cutoff time.Time) bool {
+	return s.lastActive.Load() < cutoff.UnixNano()
+}
+
+func (s *session) close() {
+	s.closeOnce.Do(func() {
+		close(s.closed)
+		for _, ln := range s.up {
+			if ln.close != nil {
+				_ = ln.close()
+			}
+		}
+		for _, ln := range s.down {
+			if ln.close != nil {
+				_ = ln.close()
+			}
+		}
+		s.wsMu.Lock()
+		wsLanes := append([]*wsLane(nil), s.ws...)
+		s.wsMu.Unlock()
+		for _, ln := range wsLanes {
+			if ln.conn != nil {
+				_ = ln.conn.Close()
+			}
+		}
+	})
+}
+
 func (s *session) sendBatch(frames []relay.Frame) {
 	if s.wsMode {
 		<-s.ready
 	}
-	s.posts <- struct{}{}
+	select {
+	case <-s.closed:
+		return
+	case s.posts <- struct{}{}:
+	}
 	defer func() { <-s.posts }()
 
 	body, err := relay.EncodeFrames(frames)

@@ -21,6 +21,7 @@ type session struct {
 	mode       string
 	udp        *net.UDPConn
 	queue      chan relay.Frame
+	done       chan struct{}
 	lastActive atomic.Int64
 	closeOnce  sync.Once
 }
@@ -186,6 +187,8 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request, id stri
 				}
 			case <-r.Context().Done():
 				return
+			case <-sess.done:
+				return
 			}
 		}
 	}()
@@ -203,13 +206,7 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request, id stri
 		if s.benchEcho {
 			for _, f := range frames {
 				f = s.queueFrame(f)
-				select {
-				case sess.queue <- f:
-				default:
-					s.countQueueDrop()
-					<-sess.queue
-					sess.queue <- f
-				}
+				s.countQueueDrops(relay.EnqueueDropOldest(sess.queue, f))
 			}
 			continue
 		}
@@ -251,13 +248,7 @@ func (s *server) handlePost(w http.ResponseWriter, r *http.Request, id string) {
 	if s.benchEcho {
 		for _, f := range frames {
 			f = s.queueFrame(f)
-			select {
-			case sess.queue <- f:
-			default:
-				s.countQueueDrop()
-				<-sess.queue
-				sess.queue <- f
-			}
+			s.countQueueDrops(relay.EnqueueDropOldest(sess.queue, f))
 		}
 		s.countStatus(http.StatusNoContent)
 		w.WriteHeader(http.StatusNoContent)
@@ -303,6 +294,10 @@ func (s *server) handleGet(w http.ResponseWriter, r *http.Request, id string) {
 		s.countStatus(http.StatusNoContent)
 		w.WriteHeader(http.StatusNoContent)
 		return
+	case <-sess.done:
+		s.countStatus(http.StatusGone)
+		http.Error(w, "session gone", http.StatusGone)
+		return
 	}
 	body, err := relay.EncodeFrames(frames)
 	if err != nil {
@@ -329,7 +324,7 @@ func (s *server) getSession(id string) (*session, error) {
 		_ = udp.SetReadBuffer(s.udpBuffer)
 		_ = udp.SetWriteBuffer(s.udpBuffer)
 	}
-	sess := &session{id: id, udp: udp, queue: make(chan relay.Frame, 1024)}
+	sess := &session{id: id, udp: udp, queue: make(chan relay.Frame, 1024), done: make(chan struct{})}
 	sess.touch()
 	s.sessions[id] = sess
 	s.countSessionMade()
@@ -448,9 +443,9 @@ func (s *server) observeWSWrite(d time.Duration) {
 	updateMax(&s.stats.wsWriteMaxUS, d.Microseconds())
 }
 
-func (s *server) countQueueDrop() {
-	if s.metrics {
-		s.stats.queueDrops.Add(1)
+func (s *server) countQueueDrops(n int) {
+	if s.metrics && n > 0 {
+		s.stats.queueDrops.Add(int64(n))
 	}
 }
 
@@ -546,6 +541,7 @@ func (s *session) idleBefore(cutoff time.Time) bool {
 
 func (s *session) close() {
 	s.closeOnce.Do(func() {
+		close(s.done)
 		if s.udp != nil {
 			_ = s.udp.Close()
 		}
@@ -562,13 +558,7 @@ func (s *session) readLoop(parent *server) {
 		s.touch()
 		payload := append([]byte(nil), buf[:n]...)
 		f := parent.queueFrame(relay.Frame{Payload: payload})
-		select {
-		case s.queue <- f:
-		default:
-			parent.countQueueDrop()
-			<-s.queue
-			s.queue <- f
-		}
+		parent.countQueueDrops(relay.EnqueueDropOldest(s.queue, f))
 		parent.countUDPDown(n)
 	}
 }
