@@ -62,6 +62,7 @@ type session struct {
 	ready      chan struct{}
 	wsMu       sync.Mutex
 	wsScaling  atomic.Bool
+	wsPending  atomic.Int64
 	up         []*lane
 	down       []*lane
 	next       atomic.Uint64
@@ -84,7 +85,7 @@ var errSessionClosed = errors.New("session closed")
 func main() {
 	var listen, remote, token, connectIP, metricsOut, transport string
 	var lanesN, wsLanesN, wsLanesMax, wsLanesUpgradeQueue, polls, maxInflightPosts, batchSize, sendQueue int
-	var wsLanesAuto, metrics bool
+	var wsLanesAuto, wsLanesIncremental, metrics bool
 	var timeout, metricsInterval, batchDelay, idle time.Duration
 	flag.StringVar(&listen, "listen", "127.0.0.1:15353", "local UDP listen address")
 	flag.StringVar(&remote, "remote", "https://relay.example.com:2083/", "relay server URL")
@@ -94,6 +95,7 @@ func main() {
 	flag.IntVar(&lanesN, "lanes", 4, "HTTP/3 uplink lanes")
 	flag.IntVar(&wsLanesN, "ws-lanes", 12, "WebSocket lanes")
 	flag.BoolVar(&wsLanesAuto, "ws-lanes-auto", false, "automatically add WebSocket lanes when UDP queue builds up")
+	flag.BoolVar(&wsLanesIncremental, "ws-lanes-incremental", false, "start WebSocket sessions with one lane and add lanes when selected lane is busy")
 	flag.IntVar(&wsLanesMax, "ws-lanes-max", 4, "maximum WebSocket lanes when auto lane scaling is enabled")
 	flag.IntVar(&wsLanesUpgradeQueue, "ws-lanes-upgrade-queue", 64, "queued UDP packets needed before auto WebSocket lane scaling")
 	flag.IntVar(&polls, "down-polls", 2, "downlink long-poll workers")
@@ -110,6 +112,9 @@ func main() {
 
 	if transport != "ws" && transport != "h3" {
 		log.Fatalf("invalid -transport %q: expected ws or h3", transport)
+	}
+	if wsLanesIncremental && wsLanesAuto {
+		log.Fatal("-ws-lanes-incremental and -ws-lanes-auto are mutually exclusive")
 	}
 	if lanesN < 1 {
 		lanesN = 1
@@ -151,7 +156,7 @@ func main() {
 
 	metrics = metrics || metricsOut != ""
 	stats := &clientStats{started: time.Now()}
-	state := &clientState{remote: remote, token: token, connectIP: connectIP, transport: transport, lanesN: lanesN, wsLanesN: wsLanesN, wsLanesAuto: wsLanesAuto, wsLanesMax: wsLanesMax, wsLanesUpgradeQueue: wsLanesUpgradeQueue, polls: polls, maxInflightPosts: maxInflightPosts, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, idle: idle, udp: udp, sessions: map[string]*session{}, stats: stats, metrics: metrics}
+	state := &clientState{remote: remote, token: token, connectIP: connectIP, transport: transport, lanesN: lanesN, wsLanesN: wsLanesN, wsLanesAuto: wsLanesAuto, wsLanesIncremental: wsLanesIncremental, wsLanesMax: wsLanesMax, wsLanesUpgradeQueue: wsLanesUpgradeQueue, polls: polls, maxInflightPosts: maxInflightPosts, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, idle: idle, udp: udp, sessions: map[string]*session{}, stats: stats, metrics: metrics}
 	if transport == "ws" {
 		state.wsPool = newWSPool(remote, connectIP, token, wsLanesN, timeout)
 		defer state.wsPool.Close()
@@ -160,7 +165,7 @@ func main() {
 		go state.writeMetrics(metricsOut, metricsInterval)
 	}
 	go state.cleanupLoop()
-	log.Printf("proxy-client udp listen=%s remote=%s connect_ip=%s lanes=%d ws_lanes=%d ws_lanes_auto=%v ws_lanes_max=%d down_polls=%d", listen, remote, connectIP, lanesN, wsLanesN, wsLanesAuto, wsLanesMax, polls)
+	log.Printf("proxy-client udp listen=%s remote=%s connect_ip=%s lanes=%d ws_lanes=%d ws_lanes_auto=%v ws_lanes_incremental=%v ws_lanes_max=%d down_polls=%d", listen, remote, connectIP, lanesN, wsLanesN, wsLanesAuto, wsLanesIncremental, wsLanesMax, polls)
 	buf := make([]byte, 65535)
 	for {
 		n, peer, err := udp.ReadFromUDP(buf)
@@ -181,6 +186,7 @@ type clientState struct {
 	lanesN              int
 	wsLanesN            int
 	wsLanesAuto         bool
+	wsLanesIncremental  bool
 	wsLanesMax          int
 	wsLanesUpgradeQueue int
 	polls               int
@@ -453,7 +459,11 @@ func (c *clientState) acquireWebSocket(ctx context.Context, sessionID string) (*
 
 func (c *clientState) connectWebSocketLanes(sess *session, key string) {
 	defer close(sess.ready)
-	if err := c.ensureWebSocketLanes(sess, c.wsLanesN); err != nil {
+	target := c.wsLanesN
+	if c.wsLanesIncremental {
+		target = 1
+	}
+	if err := c.ensureWebSocketLanes(sess, target); err != nil {
 		if !errors.Is(err, errSessionClosed) {
 			log.Printf("websocket initial connect failed: %v", err)
 			if sess.state != nil {
@@ -544,6 +554,83 @@ func (c *clientState) ensureWebSocketLanes(sess *session, target int) error {
 	return nil
 }
 
+func (s *session) maybeAcquireIncrementalWebSocketLane() {
+	if !s.wsMode || s.state == nil || !s.state.wsLanesIncremental || s.state.wsLanesN <= 1 {
+		return
+	}
+	if !s.reservePendingWebSocketLane(s.state.wsLanesN) {
+		return
+	}
+	if !s.goRun(func() {
+		defer s.wsPending.Add(-1)
+		ctx, cancel := context.WithTimeout(s.ctx, s.state.timeout)
+		defer cancel()
+		ws, err := s.state.acquireWebSocket(ctx, s.id)
+		if err != nil {
+			if !s.isClosed() {
+				log.Printf("websocket incremental lane acquire failed: %v", err)
+			}
+			return
+		}
+		if s.isClosed() {
+			_ = ws.Close()
+			return
+		}
+		var ln *wsLane
+		s.wsMu.Lock()
+		if !s.isClosed() && len(s.ws) < s.state.wsLanesN {
+			ln = &wsLane{index: s.nextWSLaneIndexLocked(), conn: ws}
+			s.ws = append(s.ws, ln)
+		}
+		s.wsMu.Unlock()
+		if ln == nil {
+			_ = ws.Close()
+			return
+		}
+		s.state.countTransport()
+		s.goRun(func() { s.wsReadLoop(s.state, ln) })
+		log.Printf("websocket session id=%s incremental lanes=%d", s.id, s.wsCount())
+	}) {
+		s.wsPending.Add(-1)
+	}
+}
+
+func (s *session) reservePendingWebSocketLane(max int) bool {
+	for {
+		if s.isClosed() {
+			return false
+		}
+		current := s.wsTotalPlanned()
+		if current >= max {
+			return false
+		}
+		pending := s.wsPending.Load()
+		if s.wsPending.CompareAndSwap(pending, pending+1) {
+			if s.wsTotalPlanned() <= max {
+				return true
+			}
+			s.wsPending.Add(-1)
+		}
+	}
+}
+
+func (s *session) wsTotalPlanned() int {
+	s.wsMu.Lock()
+	n := len(s.ws)
+	s.wsMu.Unlock()
+	return n + int(s.wsPending.Load())
+}
+
+func (s *session) nextWSLaneIndexLocked() int {
+	index := 0
+	for _, ln := range s.ws {
+		if ln.index >= index {
+			index = ln.index + 1
+		}
+	}
+	return index
+}
+
 func (s *session) enqueue(payload []byte) {
 	if s.isClosed() {
 		return
@@ -583,13 +670,17 @@ func (s *session) sendLoop(batchSize int, batchDelay time.Duration) {
 				default:
 				}
 			}
-			if s.wsCount() == 1 {
+			if s.shouldSendBatchSync() {
 				s.sendBatch(batch)
 			} else {
 				s.goRun(func() { s.sendBatch(batch) })
 			}
 		}
 	}
+}
+
+func (s *session) shouldSendBatchSync() bool {
+	return s.wsCount() == 1 && (s.state == nil || !s.state.wsLanesIncremental)
 }
 
 func (s *session) maybeScaleWebSocketLanes() {
@@ -638,20 +729,21 @@ func (s *session) wsCount() int {
 	return len(s.ws)
 }
 
-func (s *session) goRun(fn func()) {
+func (s *session) goRun(fn func()) bool {
 	if s.isClosed() {
-		return
+		return false
 	}
 	s.wgMu.Lock()
 	defer s.wgMu.Unlock()
 	if s.isClosed() {
-		return
+		return false
 	}
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
 		fn()
 	}()
+	return true
 }
 
 func (s *session) isClosed() bool {
@@ -747,10 +839,13 @@ func (s *session) sendFrameChunk(frames []relay.Frame) {
 		return
 	}
 	if s.wsCount() > 0 {
-		ln := s.waitForWSLane(s.state.timeout)
+		ln, selectedInflight := s.waitForWSLane(s.state.timeout)
 		if ln == nil {
 			log.Printf("websocket lane unavailable")
 			return
+		}
+		if selectedInflight > 0 {
+			s.maybeAcquireIncrementalWebSocketLane()
 		}
 		ln.inflight.Add(int64(len(body)))
 		s.countWSPostStart(ln)
@@ -896,30 +991,30 @@ func (s *session) reconnectWebSocketLane(c *clientState, old *wsLane) {
 	}
 }
 
-func (s *session) waitForWSLane(timeout time.Duration) *wsLane {
+func (s *session) waitForWSLane(timeout time.Duration) (*wsLane, int64) {
 	deadline := time.Now().Add(timeout)
 	for {
-		if ln := s.pickWSLane(); ln != nil {
-			return ln
+		if ln, inflight := s.pickWSLane(); ln != nil {
+			return ln, inflight
 		}
 		if time.Now().After(deadline) {
-			return nil
+			return nil, 0
 		}
 		select {
 		case <-s.ctx.Done():
-			return nil
+			return nil, 0
 		case <-s.closed:
-			return nil
+			return nil, 0
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
 }
 
-func (s *session) pickWSLane() *wsLane {
+func (s *session) pickWSLane() (*wsLane, int64) {
 	s.wsMu.Lock()
 	defer s.wsMu.Unlock()
 	if len(s.ws) == 0 {
-		return nil
+		return nil, 0
 	}
 	start := int(s.wsNext.Add(1)-1) % len(s.ws)
 	var best *wsLane
@@ -935,7 +1030,7 @@ func (s *session) pickWSLane() *wsLane {
 			bestInflight = inflight
 		}
 	}
-	return best
+	return best, bestInflight
 }
 
 func (s *session) pickLane() *lane {

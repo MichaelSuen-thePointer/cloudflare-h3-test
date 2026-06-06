@@ -127,6 +127,42 @@ func TestInitialWebSocketConnectFailureClosesSession(t *testing.T) {
 	}
 }
 
+func TestInitialIncrementalWebSocketConnectsOneLane(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	serveAttachWebSockets(t, ln, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sess := &session{
+		id:     "test-session",
+		ctx:    ctx,
+		cancel: cancel,
+		closed: make(chan struct{}),
+		ready:  make(chan struct{}),
+		posts:  make(chan struct{}, 1),
+		sendQ:  make(chan []byte, 1),
+	}
+	defer sess.close()
+	c := &clientState{
+		remote:             "http://" + ln.Addr().String() + "/",
+		token:              "example-token",
+		wsLanesN:           3,
+		wsLanesIncremental: true,
+		timeout:            time.Second,
+	}
+	sess.state = c
+
+	c.connectWebSocketLanes(sess, "peer")
+
+	if got := sess.wsCount(); got != 1 {
+		t.Fatalf("wsCount=%d, want 1", got)
+	}
+}
+
 func TestEnsureWebSocketLanesClosesSuccessfulLaneAfterParallelFailure(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -197,6 +233,157 @@ func TestEnsureWebSocketLanesClosesSuccessfulLaneAfterParallelFailure(t *testing
 	}
 }
 
+func TestIncrementalWebSocketLaneAddsLaneWhenSelectedLaneBusy(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	serveAttachWebSockets(t, ln, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sess := &session{
+		id:     "test-session",
+		ctx:    ctx,
+		cancel: cancel,
+		closed: make(chan struct{}),
+		ready:  make(chan struct{}),
+		posts:  make(chan struct{}, 1),
+		sendQ:  make(chan []byte, 1),
+	}
+	c := &clientState{
+		remote:             "http://" + ln.Addr().String() + "/",
+		token:              "example-token",
+		wsLanesN:           2,
+		wsLanesIncremental: true,
+		timeout:            time.Second,
+	}
+	sess.state = c
+	sess.wsMode = true
+	if err := c.ensureWebSocketLanes(sess, 1); err != nil {
+		t.Fatal(err)
+	}
+	defer sess.close()
+	sess.ws[0].inflight.Add(1)
+
+	sess.sendFrameChunk([]relay.Frame{{PacketID: 1, Payload: []byte("hello")}})
+
+	deadline := time.After(time.Second)
+	for {
+		if got := sess.wsCount(); got == 2 {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("wsCount=%d, want 2", sess.wsCount())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestIncrementalWebSocketOneLaneUsesAsyncSend(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sess := &session{
+		id:     "test-session",
+		ctx:    ctx,
+		cancel: cancel,
+		closed: make(chan struct{}),
+		ready:  make(chan struct{}),
+		posts:  make(chan struct{}, 1),
+		sendQ:  make(chan []byte, 1),
+	}
+	defer sess.close()
+	c := &clientState{
+		wsLanesN:           2,
+		wsLanesIncremental: true,
+	}
+	sess.state = c
+	sess.wsMode = true
+	sess.ws = append(sess.ws, &wsLane{index: 0})
+
+	if sess.shouldSendBatchSync() {
+		t.Fatal("incremental websocket session with one lane should dispatch sendBatch asynchronously")
+	}
+}
+
+func TestIncrementalWebSocketLaneAcquireFailureKeepsSession(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sess := &session{
+		id:     "test-session",
+		ctx:    ctx,
+		cancel: cancel,
+		closed: make(chan struct{}),
+		ready:  make(chan struct{}),
+		posts:  make(chan struct{}, 1),
+		sendQ:  make(chan []byte, 1),
+	}
+	defer sess.close()
+	c := &clientState{
+		remote:             "http://" + addr + "/",
+		token:              "example-token",
+		wsLanesN:           2,
+		wsLanesIncremental: true,
+		timeout:            50 * time.Millisecond,
+	}
+	sess.state = c
+	sess.wsMode = true
+	sess.ws = append(sess.ws, &wsLane{index: 0})
+
+	sess.maybeAcquireIncrementalWebSocketLane()
+
+	deadline := time.After(time.Second)
+	for {
+		if sess.wsPending.Load() == 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("incremental websocket acquire did not finish")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if sess.isClosed() {
+		t.Fatal("session closed after incremental acquire failure")
+	}
+	if got := sess.wsCount(); got != 1 {
+		t.Fatalf("wsCount=%d, want 1", got)
+	}
+}
+
+func TestIncrementalWebSocketLaneDoesNotReservePastMax(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sess := &session{
+		id:     "test-session",
+		ctx:    ctx,
+		cancel: cancel,
+		closed: make(chan struct{}),
+		ready:  make(chan struct{}),
+		posts:  make(chan struct{}, 1),
+		sendQ:  make(chan []byte, 1),
+	}
+	defer sess.close()
+	sess.ws = append(sess.ws, &wsLane{index: 0})
+	sess.wsPending.Store(1)
+
+	if sess.reservePendingWebSocketLane(2) {
+		t.Fatal("reserved lane past max")
+	}
+	if got := sess.wsPending.Load(); got != 1 {
+		t.Fatalf("wsPending=%d, want 1", got)
+	}
+}
+
 func TestWebSocketPoolAcquireAttachesSession(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -240,6 +427,31 @@ func TestWebSocketPoolAcquireAttachesSession(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("pool websocket did not attach")
 	}
+}
+
+func serveAttachWebSockets(t *testing.T, ln net.Listener, attached chan<- struct{}) {
+	t.Helper()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				if err := writeWebSocketUpgradeAndAttachAck(conn); err != nil {
+					return
+				}
+				if attached != nil {
+					select {
+					case attached <- struct{}{}:
+					default:
+					}
+				}
+				_, _ = io.Copy(io.Discard, conn)
+			}()
+		}
+	}()
 }
 
 func writeWebSocketUpgradeAndAttachAck(conn net.Conn) error {
