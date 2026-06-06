@@ -21,7 +21,7 @@ const MaxPayloadFramesPerMessage = (MaxMessageBytes - encodedHeaderBytes) / (enc
 
 const encodedHeaderBytes = 7
 const encodedFrameHeaderBytes = 10
-const encodedControlHeaderBytes = 7
+const encodedControlHeaderBytes = 8
 
 type Frame struct {
 	PacketID uint64

@@ -71,6 +71,7 @@ type serverStats struct {
 	wsWriteCount   atomic.Int64
 	sessionsMade   atomic.Int64
 	sessionsClosed atomic.Int64
+	unattachedWS   atomic.Int64
 }
 
 func main() {
@@ -158,7 +159,9 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		log.Printf("websocket accept failed: %v", err)
 		return
 	}
+	s.stats.unattachedWS.Add(1)
 	id, err := readAttachSession(ws)
+	s.stats.unattachedWS.Add(-1)
 	if err != nil {
 		log.Printf("websocket attach failed: %v", err)
 		_ = ws.Close()
@@ -499,6 +502,7 @@ func (s *server) metricsLoop() {
 			"event":             "proxy-server-metrics",
 			"ts":                time.Now().Format(time.RFC3339Nano),
 			"active_sessions":   active,
+			"unattached_ws":     s.stats.unattachedWS.Load(),
 			"sessions_created":  s.stats.sessionsMade.Load(),
 			"sessions_closed":   s.stats.sessionsClosed.Load(),
 			"requests":          s.stats.requests.Load(),

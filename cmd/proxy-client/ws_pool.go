@@ -27,7 +27,9 @@ type wsPool struct {
 	idle   chan pooledWebSocket
 
 	mu      sync.Mutex
+	closing bool
 	dialing int
+	wg      sync.WaitGroup
 }
 
 type pooledWebSocket struct {
@@ -52,7 +54,11 @@ func newWSPool(remote, connectIP, token string, target int, timeout time.Duratio
 }
 
 func (p *wsPool) Close() {
+	p.mu.Lock()
+	p.closing = true
+	p.mu.Unlock()
 	p.cancel()
+	p.wg.Wait()
 	for {
 		select {
 		case item := <-p.idle:
@@ -138,9 +144,14 @@ func (p *wsPool) pingIdle() {
 func (p *wsPool) refill() {
 	for {
 		p.mu.Lock()
+		if p.closing {
+			p.mu.Unlock()
+			return
+		}
 		needDial := len(p.idle)+p.dialing < p.target
 		if needDial {
 			p.dialing++
+			p.wg.Add(1)
 		}
 		p.mu.Unlock()
 		if !needDial {
@@ -155,6 +166,7 @@ func (p *wsPool) dialIdle() {
 		p.mu.Lock()
 		p.dialing--
 		p.mu.Unlock()
+		p.wg.Done()
 	}()
 	ctx, cancel := context.WithTimeout(p.ctx, p.timeout)
 	defer cancel()

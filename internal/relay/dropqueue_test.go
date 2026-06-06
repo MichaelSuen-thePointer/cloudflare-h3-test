@@ -79,3 +79,21 @@ func TestEncodeDecodeControl(t *testing.T) {
 		t.Fatalf("op=%d payload=%q, want attach session-1", op, payload)
 	}
 }
+
+func TestDecodeControlRejectsShortHeader(t *testing.T) {
+	_, _, err := DecodeControl([]byte{'H', '3', 'U', 'C', Version, ControlOpAttach, 0})
+	if err == nil {
+		t.Fatal("DecodeControl succeeded for 7-byte header, want error")
+	}
+}
+
+func TestDecodeControlAcceptsEmptyPayload(t *testing.T) {
+	body := []byte{'H', '3', 'U', 'C', Version, ControlOpAttachOK, 0, 0}
+	op, payload, err := DecodeControl(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op != ControlOpAttachOK || len(payload) != 0 {
+		t.Fatalf("op=%d payload_len=%d, want attach-ok empty", op, len(payload))
+	}
+}
