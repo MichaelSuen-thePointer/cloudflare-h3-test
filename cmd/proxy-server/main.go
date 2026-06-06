@@ -16,6 +16,8 @@ import (
 	"cloudflare-h3-test/internal/relay"
 )
 
+const maxFramesPerDownlinkMessage = relay.MaxPayloadFramesPerMessage
+
 type session struct {
 	id         string
 	mode       string
@@ -23,7 +25,10 @@ type session struct {
 	queue      chan relay.Frame
 	done       chan struct{}
 	lastActive atomic.Int64
+	closed     atomic.Bool
 	closeOnce  sync.Once
+	wsMu       sync.Mutex
+	ws         map[*relay.WebSocketConn]struct{}
 }
 
 type server struct {
@@ -49,6 +54,7 @@ type serverStats struct {
 	status400      atomic.Int64
 	status404      atomic.Int64
 	status410      atomic.Int64
+	status413      atomic.Int64
 	status502      atomic.Int64
 	status500      atomic.Int64
 	udpUpPackets   atomic.Int64
@@ -115,6 +121,11 @@ func (s *server) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if isWebSocketUpgrade(r) {
+		if !validWebSocketUpgrade(r) {
+			s.countStatus(http.StatusBadRequest)
+			http.Error(w, "bad websocket", http.StatusBadRequest)
+			return
+		}
 		s.handleWebSocket(w, r, id)
 		return
 	}
@@ -150,17 +161,31 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request, id stri
 		log.Printf("websocket accept failed: %v", err)
 		return
 	}
+	if !sess.addWebSocket(ws) {
+		_ = ws.Close()
+		return
+	}
+	defer sess.removeWebSocket(ws)
 	defer ws.Close()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for {
+			if sess.isClosed() {
+				return
+			}
 			select {
 			case f := <-sess.queue:
+				if sess.isClosed() {
+					return
+				}
 				s.observeQueueWait(f)
 				frames := []relay.Frame{f}
 			drain:
-				for len(frames) < 64 {
+				for len(frames) < maxFramesPerDownlinkMessage {
+					if sess.isClosed() {
+						return
+					}
 					select {
 					case f := <-sess.queue:
 						s.observeQueueWait(f)
@@ -172,6 +197,9 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request, id stri
 				body, err := relay.EncodeFrames(frames)
 				if err != nil {
 					log.Printf("websocket encode: %v", err)
+					return
+				}
+				if sess.isClosed() {
 					return
 				}
 				if s.metrics {
@@ -202,16 +230,28 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request, id stri
 			log.Printf("websocket decode: %v", err)
 			continue
 		}
+		if sess.isClosed() {
+			return
+		}
 		sess.touch()
 		if s.benchEcho {
 			for _, f := range frames {
+				if sess.isClosed() {
+					return
+				}
 				f = s.queueFrame(f)
 				s.countQueueDrops(relay.EnqueueDropOldest(sess.queue, f))
 			}
 			continue
 		}
 		for _, f := range frames {
+			if sess.isClosed() {
+				return
+			}
 			if _, err := sess.udp.Write(f.Payload); err != nil {
+				if sess.isClosed() {
+					return
+				}
 				log.Printf("websocket udp write failed: %v", err)
 				return
 			}
@@ -226,10 +266,20 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request, id stri
 }
 
 func (s *server) handlePost(w http.ResponseWriter, r *http.Request, id string) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))
+	if r.ContentLength > relay.MaxMessageBytes {
+		s.countStatus(http.StatusRequestEntityTooLarge)
+		http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, relay.MaxMessageBytes+1))
 	if err != nil {
 		s.countStatus(http.StatusBadRequest)
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(body) > relay.MaxMessageBytes {
+		s.countStatus(http.StatusRequestEntityTooLarge)
+		http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 	frames, err := relay.DecodeFrames(body)
@@ -244,9 +294,19 @@ func (s *server) handlePost(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
+	if sess.isClosed() {
+		s.countStatus(http.StatusGone)
+		http.Error(w, "session gone", http.StatusGone)
+		return
+	}
 	sess.touch()
 	if s.benchEcho {
 		for _, f := range frames {
+			if sess.isClosed() {
+				s.countStatus(http.StatusGone)
+				http.Error(w, "session gone", http.StatusGone)
+				return
+			}
 			f = s.queueFrame(f)
 			s.countQueueDrops(relay.EnqueueDropOldest(sess.queue, f))
 		}
@@ -255,7 +315,17 @@ func (s *server) handlePost(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	for _, f := range frames {
+		if sess.isClosed() {
+			s.countStatus(http.StatusGone)
+			http.Error(w, "session gone", http.StatusGone)
+			return
+		}
 		if _, err := sess.udp.Write(f.Payload); err != nil {
+			if sess.isClosed() {
+				s.countStatus(http.StatusGone)
+				http.Error(w, "session gone", http.StatusGone)
+				return
+			}
 			s.countStatus(http.StatusBadGateway)
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
@@ -273,15 +343,30 @@ func (s *server) handleGet(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, "session gone", http.StatusGone)
 		return
 	}
+	if sess.isClosed() {
+		s.countStatus(http.StatusGone)
+		http.Error(w, "session gone", http.StatusGone)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
 	var frames []relay.Frame
 	select {
 	case f := <-sess.queue:
+		if sess.isClosed() {
+			s.countStatus(http.StatusGone)
+			http.Error(w, "session gone", http.StatusGone)
+			return
+		}
 		s.observeQueueWait(f)
 		frames = append(frames, f)
 	drain:
-		for len(frames) < 64 {
+		for len(frames) < maxFramesPerDownlinkMessage {
+			if sess.isClosed() {
+				s.countStatus(http.StatusGone)
+				http.Error(w, "session gone", http.StatusGone)
+				return
+			}
 			select {
 			case f := <-sess.queue:
 				s.observeQueueWait(f)
@@ -305,6 +390,11 @@ func (s *server) handleGet(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if sess.isClosed() {
+		s.countStatus(http.StatusGone)
+		http.Error(w, "session gone", http.StatusGone)
+		return
+	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	s.countStatus(http.StatusOK)
 	_, _ = w.Write(body)
@@ -324,7 +414,7 @@ func (s *server) getSession(id string) (*session, error) {
 		_ = udp.SetReadBuffer(s.udpBuffer)
 		_ = udp.SetWriteBuffer(s.udpBuffer)
 	}
-	sess := &session{id: id, udp: udp, queue: make(chan relay.Frame, 1024), done: make(chan struct{})}
+	sess := &session{id: id, udp: udp, queue: make(chan relay.Frame, 1024), done: make(chan struct{}), ws: make(map[*relay.WebSocketConn]struct{})}
 	sess.touch()
 	s.sessions[id] = sess
 	s.countSessionMade()
@@ -402,6 +492,7 @@ func (s *server) metricsLoop() {
 			"status_400":        s.stats.status400.Load(),
 			"status_404":        s.stats.status404.Load(),
 			"status_410":        s.stats.status410.Load(),
+			"status_413":        s.stats.status413.Load(),
 			"status_500":        s.stats.status500.Load(),
 			"status_502":        s.stats.status502.Load(),
 			"udp_up_packets":    s.stats.udpUpPackets.Load(),
@@ -514,6 +605,8 @@ func (s *server) countStatus(status int) {
 		s.stats.status404.Add(1)
 	case http.StatusGone:
 		s.stats.status410.Add(1)
+	case http.StatusRequestEntityTooLarge:
+		s.stats.status413.Add(1)
 	case http.StatusBadGateway:
 		s.stats.status502.Add(1)
 	case http.StatusInternalServerError:
@@ -533,6 +626,10 @@ func isWebSocketUpgrade(r *http.Request) bool {
 	return false
 }
 
+func validWebSocketUpgrade(r *http.Request) bool {
+	return r.Header.Get("Sec-WebSocket-Key") != "" && r.Header.Get("Sec-WebSocket-Version") == "13"
+}
+
 func (s *session) touch() { s.lastActive.Store(time.Now().UnixNano()) }
 
 func (s *session) idleBefore(cutoff time.Time) bool {
@@ -541,11 +638,51 @@ func (s *session) idleBefore(cutoff time.Time) bool {
 
 func (s *session) close() {
 	s.closeOnce.Do(func() {
+		s.closed.Store(true)
 		close(s.done)
-		if s.udp != nil {
-			_ = s.udp.Close()
+		s.wsMu.Lock()
+		websockets := make([]*relay.WebSocketConn, 0, len(s.ws))
+		for ws := range s.ws {
+			websockets = append(websockets, ws)
+		}
+		s.wsMu.Unlock()
+		for _, ws := range websockets {
+			_ = ws.Close()
+		}
+		for {
+			select {
+			case <-s.queue:
+			default:
+				if s.udp != nil {
+					_ = s.udp.Close()
+				}
+				return
+			}
 		}
 	})
+}
+
+func (s *session) isClosed() bool {
+	return s.closed.Load()
+}
+
+func (s *session) addWebSocket(ws *relay.WebSocketConn) bool {
+	if s.isClosed() {
+		return false
+	}
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+	if s.isClosed() {
+		return false
+	}
+	s.ws[ws] = struct{}{}
+	return true
+}
+
+func (s *session) removeWebSocket(ws *relay.WebSocketConn) {
+	s.wsMu.Lock()
+	delete(s.ws, ws)
+	s.wsMu.Unlock()
 }
 
 func (s *session) readLoop(parent *server) {
@@ -553,6 +690,9 @@ func (s *session) readLoop(parent *server) {
 	for {
 		n, err := s.udp.Read(buf)
 		if err != nil {
+			return
+		}
+		if s.isClosed() {
 			return
 		}
 		s.touch()

@@ -21,7 +21,7 @@ import (
 
 const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-const MaxWebSocketPayloadBytes = 2 << 20
+const MaxWebSocketPayloadBytes = MaxMessageBytes
 const DefaultWebSocketWriteTimeout = 15 * time.Second
 
 type WebSocketConn struct {
@@ -61,6 +61,14 @@ func DialWebSocket(ctx context.Context, rawURL, connectIP, token, sessionID stri
 		}
 		conn = tlsConn
 	}
+	stopCancelDeadline := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+	})
+	defer func() {
+		if stopCancelDeadline() {
+			_ = conn.SetDeadline(time.Time{})
+		}
+	}()
 	path := u.RequestURI()
 	if path == "" {
 		path = "/"
@@ -141,6 +149,9 @@ func (c *WebSocketConn) Close() error {
 }
 
 func (c *WebSocketConn) WriteBinary(payload []byte) error {
+	if len(payload) > MaxWebSocketPayloadBytes {
+		return fmt.Errorf("websocket payload too large: %d > %d", len(payload), MaxWebSocketPayloadBytes)
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.setWriteDeadline()

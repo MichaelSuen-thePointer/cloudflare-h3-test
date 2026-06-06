@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"io"
 	"log"
@@ -64,15 +65,21 @@ type session struct {
 	up         []*lane
 	down       []*lane
 	next       atomic.Uint64
+	ctx        context.Context
+	cancel     context.CancelFunc
 	closed     chan struct{}
 	lastActive atomic.Int64
 	closeOnce  sync.Once
+	wgMu       sync.Mutex
+	wg         sync.WaitGroup
 	stats      *clientStats
 	metrics    bool
 	posts      chan struct{}
 	sendQ      chan []byte
 	wsNext     atomic.Uint64
 }
+
+var errSessionClosed = errors.New("session closed")
 
 func main() {
 	var listen, remote, token, connectIP, metricsOut, transport string
@@ -349,21 +356,17 @@ func (c *clientState) getSession(peer *net.UDPAddr) *session {
 		return sess
 	}
 	id := randomID()
-	sess := &session{id: id, peer: peer, remote: c.remote, token: c.token, state: c, closed: make(chan struct{}), ready: make(chan struct{}), stats: c.stats, metrics: c.metrics, posts: make(chan struct{}, c.maxInflightPosts), sendQ: make(chan []byte, c.sendQueue)}
+	ctx, cancel := context.WithCancel(context.Background())
+	sess := &session{id: id, peer: peer, remote: c.remote, token: c.token, state: c, ctx: ctx, cancel: cancel, closed: make(chan struct{}), ready: make(chan struct{}), stats: c.stats, metrics: c.metrics, posts: make(chan struct{}, c.maxInflightPosts), sendQ: make(chan []byte, c.sendQueue)}
 	sess.touch()
 	if c.transport == "ws" {
 		sess.wsMode = true
 		c.sessions[key] = sess
 		c.countSession()
-		go sess.sendLoop(c.batchSize, c.batchDelay)
-		go sess.wsScaleLoop()
-		if c.wsLanesN > 1 {
-			go c.connectWebSocketLanes(sess, key)
-			log.Printf("new websocket session id=%s peer=%s lanes=%d connecting=true", id, key, c.wsLanesN)
-			return sess
-		}
-		c.connectWebSocketLanes(sess, key)
-		log.Printf("new websocket session id=%s peer=%s lanes=%d", id, key, sess.wsCount())
+		sess.goRun(func() { sess.sendLoop(c.batchSize, c.batchDelay) })
+		sess.goRun(func() { sess.wsScaleLoop() })
+		sess.goRun(func() { c.connectWebSocketLanes(sess, key) })
+		log.Printf("new websocket session id=%s peer=%s lanes=%d connecting=true", id, key, c.wsLanesN)
 		return sess
 	}
 	close(sess.ready)
@@ -383,9 +386,9 @@ func (c *clientState) getSession(peer *net.UDPAddr) *session {
 		c.countTransport()
 		ln := &lane{index: i, client: hc, close: closeFn}
 		sess.down = append(sess.down, ln)
-		go sess.pollLoop(c, ln)
+		sess.goRun(func() { sess.pollLoop(c, ln) })
 	}
-	go sess.sendLoop(c.batchSize, c.batchDelay)
+	sess.goRun(func() { sess.sendLoop(c.batchSize, c.batchDelay) })
 	c.sessions[key] = sess
 	c.countSession()
 	log.Printf("new session id=%s peer=%s", id, key)
@@ -431,12 +434,23 @@ func (c *clientState) closeSession(key string, sess *session) {
 func (c *clientState) connectWebSocketLanes(sess *session, key string) {
 	defer close(sess.ready)
 	if err := c.ensureWebSocketLanes(sess, c.wsLanesN); err != nil {
-		log.Fatal(err)
+		if !errors.Is(err, errSessionClosed) {
+			log.Printf("websocket initial connect failed: %v", err)
+			if sess.state != nil {
+				go sess.state.closeSession(key, sess)
+			} else {
+				sess.close()
+			}
+		}
+		return
 	}
 	log.Printf("new websocket session id=%s peer=%s lanes=%d", sess.id, key, sess.wsCount())
 }
 
 func (c *clientState) ensureWebSocketLanes(sess *session, target int) error {
+	if sess.isClosed() {
+		return errSessionClosed
+	}
 	sess.wsMu.Lock()
 	current := len(sess.ws)
 	if target <= current {
@@ -450,39 +464,70 @@ func (c *clientState) ensureWebSocketLanes(sess *session, target int) error {
 	for i := range wsLanes {
 		index := current + i
 		go func(pos, index int) {
-			ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+			if sess.isClosed() {
+				errCh <- errSessionClosed
+				return
+			}
+			ctx, cancel := context.WithTimeout(sess.ctx, c.timeout)
 			defer cancel()
 			ws, err := relay.DialWebSocket(ctx, c.remote, c.connectIP, c.token, sess.id, c.timeout)
 			if err != nil {
+				if sess.isClosed() {
+					errCh <- errSessionClosed
+					return
+				}
 				errCh <- err
+				return
+			}
+			if sess.isClosed() {
+				_ = ws.Close()
+				errCh <- errSessionClosed
 				return
 			}
 			wsLanes[pos] = &wsLane{index: index, conn: ws}
 			errCh <- nil
 		}(i, index)
 	}
+	var firstErr error
 	for range wsLanes {
 		if err := <-errCh; err != nil {
-			for _, ln := range wsLanes {
-				if ln != nil {
-					_ = ln.conn.Close()
-				}
+			if firstErr == nil || errors.Is(firstErr, errSessionClosed) {
+				firstErr = err
 			}
-			return err
 		}
+	}
+	if firstErr != nil {
+		for _, ln := range wsLanes {
+			if ln != nil {
+				_ = ln.conn.Close()
+			}
+		}
+		return firstErr
 	}
 
 	sess.wsMu.Lock()
 	defer sess.wsMu.Unlock()
+	if sess.isClosed() {
+		for _, ln := range wsLanes {
+			if ln != nil {
+				_ = ln.conn.Close()
+			}
+		}
+		return errSessionClosed
+	}
 	for _, ln := range wsLanes {
+		ln := ln
 		c.countTransport()
 		sess.ws = append(sess.ws, ln)
-		go sess.wsReadLoop(c, ln)
+		sess.goRun(func() { sess.wsReadLoop(c, ln) })
 	}
 	return nil
 }
 
 func (s *session) enqueue(payload []byte) {
+	if s.isClosed() {
+		return
+	}
 	s.touch()
 	s.countQueueDrops(relay.EnqueueDropOldest(s.sendQ, payload))
 }
@@ -490,6 +535,8 @@ func (s *session) enqueue(payload []byte) {
 func (s *session) sendLoop(batchSize int, batchDelay time.Duration) {
 	for {
 		select {
+		case <-s.ctx.Done():
+			return
 		case <-s.closed:
 			return
 		case first := <-s.sendQ:
@@ -500,6 +547,10 @@ func (s *session) sendLoop(batchSize int, batchDelay time.Duration) {
 		collect:
 			for len(batch) < currentBatchSize {
 				select {
+				case <-s.ctx.Done():
+					return
+				case <-s.closed:
+					return
 				case payload := <-s.sendQ:
 					batch = append(batch, relay.Frame{PacketID: s.next.Add(1), Payload: payload})
 				case <-timer.C:
@@ -515,7 +566,7 @@ func (s *session) sendLoop(batchSize int, batchDelay time.Duration) {
 			if s.wsCount() == 1 {
 				s.sendBatch(batch)
 			} else {
-				go s.sendBatch(batch)
+				s.goRun(func() { s.sendBatch(batch) })
 			}
 		}
 	}
@@ -536,14 +587,14 @@ func (s *session) maybeScaleWebSocketLanes() {
 	if !s.wsScaling.CompareAndSwap(false, true) {
 		return
 	}
-	go func() {
+	s.goRun(func() {
 		defer s.wsScaling.Store(false)
 		if err := s.state.ensureWebSocketLanes(s, s.state.wsLanesMax); err != nil {
 			log.Printf("websocket lane scale failed: %v", err)
 			return
 		}
 		log.Printf("websocket session id=%s scaled lanes=%d", s.id, s.wsCount())
-	}()
+	})
 }
 
 func (s *session) wsScaleLoop() {
@@ -551,6 +602,8 @@ func (s *session) wsScaleLoop() {
 	defer ticker.Stop()
 	for {
 		select {
+		case <-s.ctx.Done():
+			return
 		case <-s.closed:
 			return
 		case <-ticker.C:
@@ -565,6 +618,31 @@ func (s *session) wsCount() int {
 	return len(s.ws)
 }
 
+func (s *session) goRun(fn func()) {
+	if s.isClosed() {
+		return
+	}
+	s.wgMu.Lock()
+	defer s.wgMu.Unlock()
+	if s.isClosed() {
+		return
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		fn()
+	}()
+}
+
+func (s *session) isClosed() bool {
+	select {
+	case <-s.closed:
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *session) touch() { s.lastActive.Store(time.Now().UnixNano()) }
 
 func (s *session) idleBefore(cutoff time.Time) bool {
@@ -574,6 +652,9 @@ func (s *session) idleBefore(cutoff time.Time) bool {
 func (s *session) close() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
+		if s.cancel != nil {
+			s.cancel()
+		}
 		for _, ln := range s.up {
 			if ln.close != nil {
 				_ = ln.close()
@@ -592,20 +673,54 @@ func (s *session) close() {
 				_ = ln.conn.Close()
 			}
 		}
+		s.wgMu.Lock()
+		s.wgMu.Unlock()
+		done := make(chan struct{})
+		go func() {
+			s.wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			log.Printf("session id=%s close timed out waiting for goroutines", s.id)
+		}
 	})
 }
 
 func (s *session) sendBatch(frames []relay.Frame) {
 	if s.wsMode {
-		<-s.ready
+		select {
+		case <-s.ready:
+		case <-s.ctx.Done():
+			return
+		case <-s.closed:
+			return
+		}
 	}
 	select {
+	case <-s.ctx.Done():
+		return
 	case <-s.closed:
 		return
 	case s.posts <- struct{}{}:
 	}
 	defer func() { <-s.posts }()
 
+	chunks, err := relay.SplitFramesByEncodedLimit(frames, relay.MaxMessageBytes)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+	for _, chunk := range chunks {
+		s.sendFrameChunk(chunk)
+	}
+}
+
+func (s *session) sendFrameChunk(frames []relay.Frame) {
+	if s.isClosed() {
+		return
+	}
 	body, err := relay.EncodeFrames(frames)
 	if err != nil {
 		log.Print(err)
@@ -625,11 +740,15 @@ func (s *session) sendBatch(frames []relay.Frame) {
 		if err := ln.conn.WriteBinary(body); err != nil {
 			s.countWSPostError(ln)
 			ln.closed.Store(true)
-			go s.reconnectWebSocketLane(s.state, ln)
+			s.goRun(func() { s.reconnectWebSocketLane(s.state, ln) })
 			log.Printf("websocket write failed: %v", err)
 			return
 		}
 		s.countWSPostOK(ln)
+		return
+	}
+	if s.wsMode {
+		log.Printf("websocket lane unavailable")
 		return
 	}
 	ln := s.pickLane()
@@ -638,7 +757,9 @@ func (s *session) sendBatch(frames []relay.Frame) {
 	s.countUDPInFrames(frames)
 	defer ln.inflight.Add(-int64(len(body)))
 	defer s.countRequestDone(ln)
-	req, err := http.NewRequest(http.MethodPost, s.remote, bytes.NewReader(body))
+	ctx, cancel := context.WithTimeout(s.ctx, s.state.timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.remote, bytes.NewReader(body))
 	if err != nil {
 		log.Print(err)
 		return
@@ -648,6 +769,7 @@ func (s *session) sendBatch(frames []relay.Frame) {
 	req.Header.Set("X-Relay-Packet-Id", strconv.FormatUint(frames[0].PacketID, 10))
 	resp, err := ln.client.Do(req)
 	if err != nil {
+		cancel()
 		s.countPostError(ln)
 		if isTimeout(err) {
 			s.countPostTimeout(ln)
@@ -657,6 +779,7 @@ func (s *session) sendBatch(frames []relay.Frame) {
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
+	cancel()
 	if resp.StatusCode == http.StatusNoContent {
 		s.countPostOK(ln)
 	} else {
@@ -666,11 +789,17 @@ func (s *session) sendBatch(frames []relay.Frame) {
 
 func (s *session) wsReadLoop(c *clientState, ln *wsLane) {
 	for {
+		if s.isClosed() {
+			return
+		}
 		body, err := ln.conn.ReadBinary()
 		if err != nil {
+			if s.isClosed() {
+				return
+			}
 			s.countWSReadError(ln)
 			ln.closed.Store(true)
-			go s.reconnectWebSocketLane(c, ln)
+			s.goRun(func() { s.reconnectWebSocketLane(c, ln) })
 			log.Printf("websocket read failed: %v", err)
 			return
 		}
@@ -679,6 +808,7 @@ func (s *session) wsReadLoop(c *clientState, ln *wsLane) {
 			log.Printf("websocket decode: %v", err)
 			continue
 		}
+		s.touch()
 		for _, f := range frames {
 			if n, err := c.udp.WriteToUDP(f.Payload, s.peer); err == nil {
 				c.countUDPOut(n)
@@ -694,26 +824,43 @@ func (s *session) reconnectWebSocketLane(c *clientState, old *wsLane) {
 	_ = old.conn.Close()
 	for {
 		select {
+		case <-s.ctx.Done():
+			return
 		case <-s.closed:
 			return
 		default:
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+		ctx, cancel := context.WithTimeout(s.ctx, c.timeout)
 		ws, err := relay.DialWebSocket(ctx, c.remote, c.connectIP, c.token, s.id, c.timeout)
 		cancel()
 		if err != nil {
+			if s.isClosed() {
+				return
+			}
 			log.Printf("websocket reconnect failed: %v", err)
-			time.Sleep(200 * time.Millisecond)
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-s.closed:
+				return
+			case <-time.After(200 * time.Millisecond):
+			}
 			continue
+		}
+		if s.isClosed() {
+			_ = ws.Close()
+			return
 		}
 		ln := &wsLane{index: old.index, conn: ws}
 		replaced := false
 		s.wsMu.Lock()
-		for i, cur := range s.ws {
-			if cur == old {
-				s.ws[i] = ln
-				replaced = true
-				break
+		if !s.isClosed() {
+			for i, cur := range s.ws {
+				if cur == old {
+					s.ws[i] = ln
+					replaced = true
+					break
+				}
 			}
 		}
 		s.wsMu.Unlock()
@@ -723,7 +870,7 @@ func (s *session) reconnectWebSocketLane(c *clientState, old *wsLane) {
 		}
 		c.countTransport()
 		c.countReconnect()
-		go s.wsReadLoop(c, ln)
+		s.goRun(func() { s.wsReadLoop(c, ln) })
 		log.Printf("websocket session id=%s lane=%d reconnected", s.id, old.index)
 		return
 	}
@@ -739,6 +886,8 @@ func (s *session) waitForWSLane(timeout time.Duration) *wsLane {
 			return nil
 		}
 		select {
+		case <-s.ctx.Done():
+			return nil
 		case <-s.closed:
 			return nil
 		case <-time.After(10 * time.Millisecond):
@@ -783,12 +932,16 @@ func (s *session) pickLane() *lane {
 func (s *session) pollLoop(c *clientState, ln *lane) {
 	for {
 		select {
+		case <-s.ctx.Done():
+			return
 		case <-s.closed:
 			return
 		default:
 		}
-		req, err := http.NewRequest(http.MethodGet, c.remote, nil)
+		ctx, cancel := context.WithTimeout(s.ctx, c.timeout)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.remote, nil)
 		if err != nil {
+			cancel()
 			log.Print(err)
 			return
 		}
@@ -797,23 +950,37 @@ func (s *session) pollLoop(c *clientState, ln *lane) {
 		resp, err := ln.client.Do(req)
 		s.countRequestDone(ln)
 		if err != nil {
+			cancel()
 			s.countGetError(ln)
 			if isTimeout(err) {
 				s.countGetTimeout(ln)
 			}
 			log.Printf("poll failed: %v", err)
-			time.Sleep(200 * time.Millisecond)
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-s.closed:
+				return
+			case <-time.After(200 * time.Millisecond):
+			}
 			continue
 		}
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		cancel()
 		if resp.StatusCode == http.StatusNoContent {
 			s.countGetEmpty(ln)
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
 			log.Printf("poll status=%d", resp.StatusCode)
-			time.Sleep(200 * time.Millisecond)
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-s.closed:
+				return
+			case <-time.After(200 * time.Millisecond):
+			}
 			continue
 		}
 		s.countGetOK(ln)
@@ -822,6 +989,7 @@ func (s *session) pollLoop(c *clientState, ln *lane) {
 			log.Printf("poll decode: %v", err)
 			continue
 		}
+		s.touch()
 		for _, f := range frames {
 			if n, err := c.udp.WriteToUDP(f.Payload, s.peer); err == nil {
 				c.countUDPOut(n)
