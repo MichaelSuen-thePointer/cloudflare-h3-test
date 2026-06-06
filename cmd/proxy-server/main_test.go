@@ -162,3 +162,30 @@ func TestWebSocketAttachBenchEcho(t *testing.T) {
 		t.Fatalf("frames=%v, want payload echo", frames)
 	}
 }
+
+func TestWebSocketPingBeforeAttach(t *testing.T) {
+	upstream, err := net.ResolveUDPAddr("udp", "127.0.0.1:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &server{token: "example-token", upstream: upstream, benchEcho: true, sessions: map[string]*session{}}
+	ts := httptest.NewServer(http.HandlerFunc(s.handle))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ws, err := relay.DialWebSocket(ctx, ts.URL, "", "example-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.Close()
+	if err := ws.Ping(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := relay.AttachWebSocketSession(ctx, ws, "ping-before-attach"); err != nil {
+		t.Fatal(err)
+	}
+	if s.findSession("ping-before-attach") == nil {
+		t.Fatal("session not created after attach")
+	}
+}

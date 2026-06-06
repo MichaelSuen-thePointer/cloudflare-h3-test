@@ -236,9 +236,26 @@ func (c *WebSocketConn) WriteBinary(payload []byte) error {
 	return err
 }
 
+func (c *WebSocketConn) Ping(payload []byte) error {
+	return c.writeControl(0x9, payload)
+}
+
+func (c *WebSocketConn) ReadMessage() (byte, []byte, error) {
+	opcode, payload, err := c.readFrame()
+	if err != nil {
+		return 0, nil, err
+	}
+	if opcode == 0x9 {
+		if err := c.writeControl(0xA, payload); err != nil {
+			return 0, nil, err
+		}
+	}
+	return opcode, payload, nil
+}
+
 func (c *WebSocketConn) ReadBinary() ([]byte, error) {
 	for {
-		opcode, payload, err := c.readFrame()
+		opcode, payload, err := c.ReadMessage()
 		if err != nil {
 			return nil, err
 		}
@@ -247,8 +264,6 @@ func (c *WebSocketConn) ReadBinary() ([]byte, error) {
 			return payload, nil
 		case 0x8:
 			return nil, io.EOF
-		case 0x9:
-			_ = c.writeControl(0xA, payload)
 		}
 	}
 }

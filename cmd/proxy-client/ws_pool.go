@@ -12,7 +12,7 @@ import (
 
 const (
 	wsPoolRefillInterval = 200 * time.Millisecond
-	wsPoolMaxIdleAge     = 2 * time.Second
+	wsPoolPingInterval   = 15 * time.Second
 )
 
 type wsPool struct {
@@ -31,8 +31,7 @@ type wsPool struct {
 }
 
 type pooledWebSocket struct {
-	conn      *relay.WebSocketConn
-	createdAt time.Time
+	conn *relay.WebSocketConn
 }
 
 func newWSPool(remote, connectIP, token string, target int, timeout time.Duration) *wsPool {
@@ -73,10 +72,6 @@ func (p *wsPool) Acquire(ctx context.Context, token, sessionID string) (*relay.W
 			return nil, p.ctx.Err()
 		case item := <-p.idle:
 			p.refill()
-			if time.Since(item.createdAt) > wsPoolMaxIdleAge {
-				_ = item.conn.Close()
-				continue
-			}
 			if err := attachWebSocket(ctx, item.conn, sessionID); err != nil {
 				_ = item.conn.Close()
 				continue
@@ -98,25 +93,29 @@ func (p *wsPool) Acquire(ctx context.Context, token, sessionID string) (*relay.W
 }
 
 func (p *wsPool) run() {
-	ticker := time.NewTicker(wsPoolRefillInterval)
-	defer ticker.Stop()
+	refillTicker := time.NewTicker(wsPoolRefillInterval)
+	defer refillTicker.Stop()
+	pingTicker := time.NewTicker(wsPoolPingInterval)
+	defer pingTicker.Stop()
 	for {
 		select {
 		case <-p.ctx.Done():
 			return
-		case <-ticker.C:
-			p.pruneExpired()
+		case <-refillTicker.C:
+			p.refill()
+		case <-pingTicker.C:
+			p.pingIdle()
 			p.refill()
 		}
 	}
 }
 
-func (p *wsPool) pruneExpired() {
+func (p *wsPool) pingIdle() {
 	var keep []pooledWebSocket
 	for {
 		select {
 		case item := <-p.idle:
-			if time.Since(item.createdAt) > wsPoolMaxIdleAge {
+			if err := item.conn.Ping(nil); err != nil {
 				_ = item.conn.Close()
 				continue
 			}
@@ -125,6 +124,8 @@ func (p *wsPool) pruneExpired() {
 			for _, item := range keep {
 				select {
 				case p.idle <- item:
+				case <-p.ctx.Done():
+					_ = item.conn.Close()
 				default:
 					_ = item.conn.Close()
 				}
@@ -164,7 +165,7 @@ func (p *wsPool) dialIdle() {
 		}
 		return
 	}
-	item := pooledWebSocket{conn: ws, createdAt: time.Now()}
+	item := pooledWebSocket{conn: ws}
 	select {
 	case p.idle <- item:
 	case <-p.ctx.Done():

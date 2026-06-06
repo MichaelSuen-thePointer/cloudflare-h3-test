@@ -19,7 +19,6 @@ import (
 
 const (
 	maxFramesPerDownlinkMessage = relay.MaxPayloadFramesPerMessage
-	webSocketAttachTimeout      = 3 * time.Second
 )
 
 type session struct {
@@ -650,24 +649,33 @@ func validWebSocketUpgrade(r *http.Request) bool {
 }
 
 func readAttachSession(ws *relay.WebSocketConn) (string, error) {
-	_ = ws.SetDeadline(time.Now().Add(webSocketAttachTimeout))
-	body, err := ws.ReadBinary()
-	_ = ws.SetDeadline(time.Time{})
-	if err != nil {
-		return "", err
+	for {
+		opcode, body, err := ws.ReadMessage()
+		if err != nil {
+			return "", err
+		}
+		switch opcode {
+		case 0x2:
+			op, payload, err := relay.DecodeControl(body)
+			if err != nil {
+				return "", err
+			}
+			if op != relay.ControlOpAttach {
+				return "", errors.New("bad attach op")
+			}
+			id := string(payload)
+			if id == "" || len(id) > 128 {
+				return "", errors.New("bad attach session")
+			}
+			return id, nil
+		case 0x8:
+			return "", io.EOF
+		case 0x9, 0xA:
+			continue
+		default:
+			return "", errors.New("bad websocket opcode before attach")
+		}
 	}
-	op, payload, err := relay.DecodeControl(body)
-	if err != nil {
-		return "", err
-	}
-	if op != relay.ControlOpAttach {
-		return "", errors.New("bad attach op")
-	}
-	id := string(payload)
-	if id == "" || len(id) > 128 {
-		return "", errors.New("bad attach session")
-	}
-	return id, nil
 }
 
 func (s *session) touch() { s.lastActive.Store(time.Now().UnixNano()) }
