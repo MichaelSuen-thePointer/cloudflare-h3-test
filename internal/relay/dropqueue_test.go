@@ -65,3 +65,17 @@ func TestMaxPayloadFramesPerMessageFitsLimit(t *testing.T) {
 		t.Fatalf("encoded len=%d fits limit=%d after extra max frame", n, MaxMessageBytes)
 	}
 }
+
+func TestEncodeDecodeControl(t *testing.T) {
+	body, err := EncodeAttach("session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, payload, err := DecodeControl(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op != ControlOpAttach || string(payload) != "session-1" {
+		t.Fatalf("op=%d payload=%q, want attach session-1", op, payload)
+	}
+}

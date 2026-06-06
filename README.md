@@ -16,12 +16,14 @@ This workspace contains a prototype for the HTTP/3-over-Cloudflare UDP relay des
 
 ## Request Model
 
-All relay requests use:
+HTTP/3 relay requests use:
 
 ```text
 X-Relay-Token: <shared-token>
 X-Relay-Session: <session-id>
 ```
+
+WebSocket relay connections use `X-Relay-Token` during upgrade, then attach a session with the first WebSocket binary control frame. WebSocket upgrades no longer accept `X-Relay-Session` as the session binding.
 
 UDP uplink:
 

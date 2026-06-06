@@ -32,7 +32,7 @@ type WebSocketConn struct {
 	writeTimeout time.Duration
 }
 
-func DialWebSocket(ctx context.Context, rawURL, connectIP, token, sessionID string, timeout time.Duration) (*WebSocketConn, error) {
+func DialWebSocket(ctx context.Context, rawURL, connectIP, token string, timeout time.Duration) (*WebSocketConn, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, err
@@ -87,7 +87,6 @@ func DialWebSocket(ctx context.Context, rawURL, connectIP, token, sessionID stri
 	req.WriteString("Sec-WebSocket-Version: 13\r\n")
 	req.WriteString("Sec-WebSocket-Key: " + key + "\r\n")
 	req.WriteString("X-Relay-Token: " + token + "\r\n")
-	req.WriteString("X-Relay-Session: " + sessionID + "\r\n")
 	req.WriteString("\r\n")
 	if _, err := io.WriteString(conn, req.String()); err != nil {
 		conn.Close()
@@ -109,6 +108,40 @@ func DialWebSocket(ctx context.Context, rawURL, connectIP, token, sessionID stri
 		return nil, fmt.Errorf("bad websocket accept")
 	}
 	return &WebSocketConn{conn: conn, reader: br, mask: true, writeTimeout: normalizeWebSocketWriteTimeout(timeout)}, nil
+}
+
+func AttachWebSocketSession(ctx context.Context, ws *WebSocketConn, sessionID string) error {
+	body, err := EncodeAttach(sessionID)
+	if err != nil {
+		return err
+	}
+	stopCancelDeadline := context.AfterFunc(ctx, func() {
+		_ = ws.SetDeadline(time.Now())
+	})
+	defer func() {
+		if stopCancelDeadline() {
+			_ = ws.SetDeadline(time.Time{})
+		}
+	}()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = ws.SetDeadline(deadline)
+		defer ws.SetDeadline(time.Time{})
+	}
+	if err := ws.WriteBinary(body); err != nil {
+		return err
+	}
+	ack, err := ws.ReadBinary()
+	if err != nil {
+		return err
+	}
+	op, payload, err := DecodeControl(ack)
+	if err != nil {
+		return err
+	}
+	if op != ControlOpAttachOK || len(payload) != 0 {
+		return fmt.Errorf("bad attach ack")
+	}
+	return nil
 }
 
 func AcceptWebSocket(w http.ResponseWriter, r *http.Request) (*WebSocketConn, error) {
@@ -146,6 +179,10 @@ func AcceptWebSocket(w http.ResponseWriter, r *http.Request) (*WebSocketConn, er
 
 func (c *WebSocketConn) Close() error {
 	return c.conn.Close()
+}
+
+func (c *WebSocketConn) SetDeadline(t time.Time) error {
+	return c.conn.SetDeadline(t)
 }
 
 func (c *WebSocketConn) WriteBinary(payload []byte) error {

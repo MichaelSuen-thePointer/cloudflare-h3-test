@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"io"
 	"log"
@@ -16,7 +17,10 @@ import (
 	"cloudflare-h3-test/internal/relay"
 )
 
-const maxFramesPerDownlinkMessage = relay.MaxPayloadFramesPerMessage
+const (
+	maxFramesPerDownlinkMessage = relay.MaxPayloadFramesPerMessage
+	webSocketAttachTimeout      = 3 * time.Second
+)
 
 type session struct {
 	id         string
@@ -114,19 +118,19 @@ func (s *server) handle(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	id := r.Header.Get("X-Relay-Session")
-	if id == "" || len(id) > 128 {
-		s.countStatus(http.StatusBadRequest)
-		http.Error(w, "bad session", http.StatusBadRequest)
-		return
-	}
 	if isWebSocketUpgrade(r) {
 		if !validWebSocketUpgrade(r) {
 			s.countStatus(http.StatusBadRequest)
 			http.Error(w, "bad websocket", http.StatusBadRequest)
 			return
 		}
-		s.handleWebSocket(w, r, id)
+		s.handleWebSocket(w, r)
+		return
+	}
+	id := r.Header.Get("X-Relay-Session")
+	if id == "" || len(id) > 128 {
+		s.countStatus(http.StatusBadRequest)
+		http.Error(w, "bad session", http.StatusBadRequest)
 		return
 	}
 	if s.requireH3 && r.Header.Get("X-Client-HTTP-Version") != "HTTP/3" {
@@ -149,19 +153,34 @@ func (s *server) handle(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request, id string) {
-	sess, err := s.getSession(id)
-	if err != nil {
-		s.countStatus(http.StatusBadGateway)
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
+func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	ws, err := relay.AcceptWebSocket(w, r)
 	if err != nil {
 		log.Printf("websocket accept failed: %v", err)
 		return
 	}
+	id, err := readAttachSession(ws)
+	if err != nil {
+		log.Printf("websocket attach failed: %v", err)
+		_ = ws.Close()
+		return
+	}
+	sess, err := s.getSession(id)
+	if err != nil {
+		log.Printf("websocket session failed: %v", err)
+		_ = ws.Close()
+		return
+	}
 	if !sess.addWebSocket(ws) {
+		_ = ws.Close()
+		return
+	}
+	ack, err := relay.EncodeControl(relay.ControlOpAttachOK, nil)
+	if err != nil {
+		_ = ws.Close()
+		return
+	}
+	if err := ws.WriteBinary(ack); err != nil {
 		_ = ws.Close()
 		return
 	}
@@ -628,6 +647,27 @@ func isWebSocketUpgrade(r *http.Request) bool {
 
 func validWebSocketUpgrade(r *http.Request) bool {
 	return r.Header.Get("Sec-WebSocket-Key") != "" && r.Header.Get("Sec-WebSocket-Version") == "13"
+}
+
+func readAttachSession(ws *relay.WebSocketConn) (string, error) {
+	_ = ws.SetDeadline(time.Now().Add(webSocketAttachTimeout))
+	body, err := ws.ReadBinary()
+	_ = ws.SetDeadline(time.Time{})
+	if err != nil {
+		return "", err
+	}
+	op, payload, err := relay.DecodeControl(body)
+	if err != nil {
+		return "", err
+	}
+	if op != relay.ControlOpAttach {
+		return "", errors.New("bad attach op")
+	}
+	id := string(payload)
+	if id == "" || len(id) > 128 {
+		return "", errors.New("bad attach session")
+	}
+	return id, nil
 }
 
 func (s *session) touch() { s.lastActive.Store(time.Now().UnixNano()) }

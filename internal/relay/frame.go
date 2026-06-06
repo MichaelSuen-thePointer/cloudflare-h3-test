@@ -10,14 +10,18 @@ import (
 )
 
 var Magic = [4]byte{'H', '3', 'U', 'R'}
+var ControlMagic = [4]byte{'H', '3', 'U', 'C'}
 
 const Version byte = 1
+const ControlOpAttach byte = 1
+const ControlOpAttachOK byte = 2
 const MaxMessageBytes = 2 << 20
 const MaxFramePayloadBytes = 65535
 const MaxPayloadFramesPerMessage = (MaxMessageBytes - encodedHeaderBytes) / (encodedFrameHeaderBytes + MaxFramePayloadBytes)
 
 const encodedHeaderBytes = 7
 const encodedFrameHeaderBytes = 10
+const encodedControlHeaderBytes = 7
 
 type Frame struct {
 	PacketID uint64
@@ -127,4 +131,58 @@ func DecodeFrames(data []byte) ([]Frame, error) {
 		return nil, errors.New("trailing frame bytes")
 	}
 	return frames, nil
+}
+
+func EncodeControl(op byte, payload []byte) ([]byte, error) {
+	if len(payload) > 65535 {
+		return nil, fmt.Errorf("control payload too large: %d", len(payload))
+	}
+	var b bytes.Buffer
+	b.Write(ControlMagic[:])
+	b.WriteByte(Version)
+	b.WriteByte(op)
+	_ = binary.Write(&b, binary.BigEndian, uint16(len(payload)))
+	b.Write(payload)
+	return b.Bytes(), nil
+}
+
+func DecodeControl(data []byte) (byte, []byte, error) {
+	if len(data) < encodedControlHeaderBytes {
+		return 0, nil, io.ErrUnexpectedEOF
+	}
+	r := bytes.NewReader(data)
+	var magic [4]byte
+	if _, err := io.ReadFull(r, magic[:]); err != nil {
+		return 0, nil, err
+	}
+	if magic != ControlMagic {
+		return 0, nil, errors.New("bad control magic")
+	}
+	version, err := r.ReadByte()
+	if err != nil {
+		return 0, nil, err
+	}
+	if version != Version {
+		return 0, nil, fmt.Errorf("bad control version: %d", version)
+	}
+	op, err := r.ReadByte()
+	if err != nil {
+		return 0, nil, err
+	}
+	var n uint16
+	if err := binary.Read(r, binary.BigEndian, &n); err != nil {
+		return 0, nil, err
+	}
+	payload := make([]byte, int(n))
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return 0, nil, err
+	}
+	if r.Len() != 0 {
+		return 0, nil, errors.New("trailing control bytes")
+	}
+	return op, payload, nil
+}
+
+func EncodeAttach(sessionID string) ([]byte, error) {
+	return EncodeControl(ControlOpAttach, []byte(sessionID))
 }

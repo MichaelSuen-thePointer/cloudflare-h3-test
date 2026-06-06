@@ -2,9 +2,12 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"cloudflare-h3-test/internal/relay"
 )
@@ -91,5 +94,71 @@ func TestBadWebSocketUpgradeDoesNotCreateSession(t *testing.T) {
 	}
 	if got := len(s.sessions); got != 0 {
 		t.Fatalf("sessions=%d, want 0", got)
+	}
+}
+
+func TestWebSocketBadAttachDoesNotCreateSession(t *testing.T) {
+	s := &server{token: "example-token", benchEcho: true, sessions: map[string]*session{}}
+	ts := httptest.NewServer(http.HandlerFunc(s.handle))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ws, err := relay.DialWebSocket(ctx, ts.URL, "", "example-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad, err := relay.EncodeControl(relay.ControlOpAttachOK, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = ws.WriteBinary(bad)
+	_, _ = ws.ReadBinary()
+	_ = ws.Close()
+
+	s.mu.Lock()
+	got := len(s.sessions)
+	s.mu.Unlock()
+	if got != 0 {
+		t.Fatalf("sessions=%d, want 0", got)
+	}
+}
+
+func TestWebSocketAttachBenchEcho(t *testing.T) {
+	upstream, err := net.ResolveUDPAddr("udp", "127.0.0.1:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &server{token: "example-token", upstream: upstream, benchEcho: true, sessions: map[string]*session{}}
+	ts := httptest.NewServer(http.HandlerFunc(s.handle))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ws, err := relay.DialWebSocket(ctx, ts.URL, "", "example-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.Close()
+	if err := relay.AttachWebSocketSession(ctx, ws, "attached-session"); err != nil {
+		t.Fatal(err)
+	}
+	body, err := relay.EncodeFrames([]relay.Frame{{PacketID: 7, Payload: []byte("payload")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ws.WriteBinary(body); err != nil {
+		t.Fatal(err)
+	}
+	echo, err := ws.ReadBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames, err := relay.DecodeFrames(echo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frames) != 1 || string(frames[0].Payload) != "payload" {
+		t.Fatalf("frames=%v, want payload echo", frames)
 	}
 }

@@ -152,6 +152,10 @@ func main() {
 	metrics = metrics || metricsOut != ""
 	stats := &clientStats{started: time.Now()}
 	state := &clientState{remote: remote, token: token, connectIP: connectIP, transport: transport, lanesN: lanesN, wsLanesN: wsLanesN, wsLanesAuto: wsLanesAuto, wsLanesMax: wsLanesMax, wsLanesUpgradeQueue: wsLanesUpgradeQueue, polls: polls, maxInflightPosts: maxInflightPosts, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, idle: idle, udp: udp, sessions: map[string]*session{}, stats: stats, metrics: metrics}
+	if transport == "ws" {
+		state.wsPool = newWSPool(remote, connectIP, token, wsLanesN, timeout)
+		defer state.wsPool.Close()
+	}
 	if metricsOut != "" {
 		go state.writeMetrics(metricsOut, metricsInterval)
 	}
@@ -189,6 +193,7 @@ type clientState struct {
 	udp                 *net.UDPConn
 	mu                  sync.Mutex
 	sessions            map[string]*session
+	wsPool              *wsPool
 	stats               *clientStats
 	metrics             bool
 }
@@ -431,6 +436,21 @@ func (c *clientState) closeSession(key string, sess *session) {
 	sess.close()
 }
 
+func (c *clientState) acquireWebSocket(ctx context.Context, sessionID string) (*relay.WebSocketConn, error) {
+	if c.wsPool != nil {
+		return c.wsPool.Acquire(ctx, c.token, sessionID)
+	}
+	ws, err := relay.DialWebSocket(ctx, c.remote, c.connectIP, c.token, c.timeout)
+	if err != nil {
+		return nil, err
+	}
+	if err := relay.AttachWebSocketSession(ctx, ws, sessionID); err != nil {
+		_ = ws.Close()
+		return nil, err
+	}
+	return ws, nil
+}
+
 func (c *clientState) connectWebSocketLanes(sess *session, key string) {
 	defer close(sess.ready)
 	if err := c.ensureWebSocketLanes(sess, c.wsLanesN); err != nil {
@@ -470,7 +490,7 @@ func (c *clientState) ensureWebSocketLanes(sess *session, target int) error {
 			}
 			ctx, cancel := context.WithTimeout(sess.ctx, c.timeout)
 			defer cancel()
-			ws, err := relay.DialWebSocket(ctx, c.remote, c.connectIP, c.token, sess.id, c.timeout)
+			ws, err := c.acquireWebSocket(ctx, sess.id)
 			if err != nil {
 				if sess.isClosed() {
 					errCh <- errSessionClosed
@@ -831,7 +851,7 @@ func (s *session) reconnectWebSocketLane(c *clientState, old *wsLane) {
 		default:
 		}
 		ctx, cancel := context.WithTimeout(s.ctx, c.timeout)
-		ws, err := relay.DialWebSocket(ctx, c.remote, c.connectIP, c.token, s.id, c.timeout)
+		ws, err := c.acquireWebSocket(ctx, s.id)
 		cancel()
 		if err != nil {
 			if s.isClosed() {
