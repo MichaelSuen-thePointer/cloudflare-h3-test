@@ -8,16 +8,20 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	PluginEnv "cloudflare-h3-test/internal/pluginopts"
 	"cloudflare-h3-test/internal/relay"
 )
 
@@ -109,6 +113,16 @@ func main() {
 	flag.DurationVar(&metricsInterval, "metrics-interval", 1*time.Second, "metrics snapshot interval")
 	flag.StringVar(&metricsOut, "metrics-out", "", "optional JSONL metrics output path")
 	flag.Parse()
+
+	sipEnv, err := PluginEnv.LoadFromEnv()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if sipEnv.Enabled {
+		if err := applyClientPluginEnv(sipEnv, &listen, &remote, &token, &connectIP, &transport, &lanesN, &wsLanesN, &wsLanesMax, &wsLanesUpgradeQueue, &polls, &maxInflightPosts, &batchSize, &sendQueue, &wsLanesAuto, &wsLanesIncremental, &metrics, &timeout, &metricsInterval, &batchDelay, &idle, &metricsOut); err != nil {
+			log.Fatal(err)
+		}
+	}
 
 	if transport != "ws" && transport != "h3" {
 		log.Fatalf("invalid -transport %q: expected ws or h3", transport)
@@ -1243,6 +1257,147 @@ func isTimeout(err error) bool {
 func setHeaders(req *http.Request, token, sessionID string) {
 	req.Header.Set("X-Relay-Token", token)
 	req.Header.Set("X-Relay-Session", sessionID)
+}
+
+func applyClientPluginEnv(env PluginEnv.Env, listen, remote, token, connectIP, transport *string, lanesN, wsLanesN, wsLanesMax, wsLanesUpgradeQueue, polls, maxInflightPosts, batchSize, sendQueue *int, wsLanesAuto, wsLanesIncremental, metrics *bool, timeout, metricsInterval, batchDelay, idle *time.Duration, metricsOut *string) error {
+	opts := env.Options
+	warnUnknownPluginEnvOptions(opts, knownClientPluginEnvOptions)
+
+	*listen = env.LocalAddr()
+	scheme := "https"
+	if v, ok := opts.Get("scheme"); ok {
+		if v != "http" && v != "https" {
+			return fmt.Errorf("invalid PluginEnv option scheme=%q", v)
+		}
+		scheme = v
+	}
+	if v, ok, err := opts.Bool("tls"); err != nil {
+		return err
+	} else if ok {
+		if v {
+			scheme = "https"
+		} else {
+			scheme = "http"
+		}
+	}
+	urlHost := env.RemoteHost
+	if v, ok := opts.Get("host"); ok && v != "" {
+		urlHost = v
+	}
+	path := "/"
+	if v, ok := opts.Get("path"); ok {
+		path = v
+		if path == "" {
+			path = "/"
+		}
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	u := url.URL{Scheme: scheme, Host: net.JoinHostPort(urlHost, env.RemotePort), Path: path}
+	*remote = u.String()
+	if v, ok := opts.Get("connect-ip"); ok {
+		*connectIP = v
+	} else if urlHost != env.RemoteHost {
+		*connectIP = env.RemoteHost
+	} else {
+		*connectIP = ""
+	}
+
+	applyStringOption(opts, "token", token)
+	applyStringOption(opts, "transport", transport)
+	applyStringOption(opts, "metrics-out", metricsOut)
+	if err := applyIntOption(opts, "lanes", lanesN); err != nil {
+		return err
+	}
+	if err := applyIntOption(opts, "ws-lanes", wsLanesN); err != nil {
+		return err
+	}
+	if err := applyIntOption(opts, "ws-lanes-max", wsLanesMax); err != nil {
+		return err
+	}
+	if err := applyIntOption(opts, "ws-lanes-upgrade-queue", wsLanesUpgradeQueue); err != nil {
+		return err
+	}
+	if err := applyIntOption(opts, "down-polls", polls); err != nil {
+		return err
+	}
+	if err := applyIntOption(opts, "max-inflight-posts", maxInflightPosts); err != nil {
+		return err
+	}
+	if err := applyIntOption(opts, "batch-size", batchSize); err != nil {
+		return err
+	}
+	if err := applyIntOption(opts, "send-queue", sendQueue); err != nil {
+		return err
+	}
+	if err := applyBoolOption(opts, "ws-lanes-auto", wsLanesAuto); err != nil {
+		return err
+	}
+	if err := applyBoolOption(opts, "ws-lanes-incremental", wsLanesIncremental); err != nil {
+		return err
+	}
+	if err := applyBoolOption(opts, "metrics", metrics); err != nil {
+		return err
+	}
+	if err := applyDurationOption(opts, "http-timeout", timeout); err != nil {
+		return err
+	}
+	if err := applyDurationOption(opts, "metrics-interval", metricsInterval); err != nil {
+		return err
+	}
+	if err := applyDurationOption(opts, "batch-delay", batchDelay); err != nil {
+		return err
+	}
+	return applyDurationOption(opts, "idle", idle)
+}
+
+func applyStringOption(opts PluginEnv.Options, key string, dst *string) {
+	if v, ok := opts.Get(key); ok {
+		*dst = v
+	}
+}
+
+func applyIntOption(opts PluginEnv.Options, key string, dst *int) error {
+	if v, ok, err := opts.Int(key); err != nil {
+		return err
+	} else if ok {
+		*dst = v
+	}
+	return nil
+}
+
+func applyBoolOption(opts PluginEnv.Options, key string, dst *bool) error {
+	if v, ok, err := opts.Bool(key); err != nil {
+		return err
+	} else if ok {
+		*dst = v
+	}
+	return nil
+}
+
+func applyDurationOption(opts PluginEnv.Options, key string, dst *time.Duration) error {
+	if v, ok, err := opts.Duration(key); err != nil {
+		return err
+	} else if ok {
+		*dst = v
+	}
+	return nil
+}
+
+var knownClientPluginEnvOptions = map[string]struct{}{
+	"scheme": {}, "tls": {}, "host": {}, "path": {}, "connect-ip": {}, "token": {}, "transport": {}, "metrics-out": {},
+	"lanes": {}, "ws-lanes": {}, "ws-lanes-max": {}, "ws-lanes-upgrade-queue": {}, "down-polls": {}, "max-inflight-posts": {}, "batch-size": {}, "send-queue": {},
+	"ws-lanes-auto": {}, "ws-lanes-incremental": {}, "metrics": {},
+	"http-timeout": {}, "metrics-interval": {}, "batch-delay": {}, "idle": {},
+}
+
+func warnUnknownPluginEnvOptions(opts PluginEnv.Options, known map[string]struct{}) {
+	for key := range opts {
+		if _, ok := known[key]; !ok {
+			log.Printf("warning: unknown PluginEnv option %q ignored", key)
+		}
+	}
 }
 
 func randomID() string {

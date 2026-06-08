@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	PluginEnv "cloudflare-h3-test/internal/pluginopts"
 	"cloudflare-h3-test/internal/relay"
 )
 
@@ -426,6 +427,82 @@ func TestWebSocketPoolAcquireAttachesSession(t *testing.T) {
 	case <-attached:
 	case <-time.After(time.Second):
 		t.Fatal("pool websocket did not attach")
+	}
+}
+
+func TestApplyClientPluginEnvMapsAddressesAndOptions(t *testing.T) {
+	opts, err := PluginEnv.ParseOptions("host=relay.example;path=ray;token=example-secret;transport=ws;ws-lanes=8;ws-lanes-incremental;batch-delay=2ms;http-timeout=3s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := PluginEnv.Env{
+		Enabled:    true,
+		RemoteHost: "203.0.113.10",
+		RemotePort: "443",
+		LocalHost:  "127.0.0.1",
+		LocalPort:  "1080",
+		Options:    opts,
+	}
+	listen := ""
+	remote := ""
+	token := ""
+	connectIP := "old"
+	transport := "h3"
+	lanesN := 4
+	wsLanesN := 12
+	wsLanesMax := 12
+	wsLanesUpgradeQueue := 64
+	polls := 2
+	maxInflightPosts := 20
+	batchSize := 3
+	sendQueue := 4096
+	wsLanesAuto := false
+	wsLanesIncremental := false
+	metrics := false
+	timeout := 15 * time.Second
+	metricsInterval := time.Second
+	batchDelay := time.Millisecond
+	idle := 120 * time.Second
+	metricsOut := ""
+
+	err = applyClientPluginEnv(env, &listen, &remote, &token, &connectIP, &transport, &lanesN, &wsLanesN, &wsLanesMax, &wsLanesUpgradeQueue, &polls, &maxInflightPosts, &batchSize, &sendQueue, &wsLanesAuto, &wsLanesIncremental, &metrics, &timeout, &metricsInterval, &batchDelay, &idle, &metricsOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listen != "127.0.0.1:1080" {
+		t.Fatalf("listen=%q, want 127.0.0.1:1080", listen)
+	}
+	if remote != "https://relay.example:443/ray" {
+		t.Fatalf("remote=%q, want https://relay.example:443/ray", remote)
+	}
+	if connectIP != "203.0.113.10" {
+		t.Fatalf("connectIP=%q, want 203.0.113.10", connectIP)
+	}
+	if token != "example-secret" || transport != "ws" || wsLanesN != 8 || !wsLanesIncremental || batchDelay != 2*time.Millisecond || timeout != 3*time.Second {
+		t.Fatalf("mapped token=%q transport=%q wsLanes=%d incremental=%v batchDelay=%v timeout=%v", token, transport, wsLanesN, wsLanesIncremental, batchDelay, timeout)
+	}
+}
+
+func TestApplyClientPluginEnvTLSFalse(t *testing.T) {
+	opts, err := PluginEnv.ParseOptions("tls=false;path=/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := PluginEnv.Env{Enabled: true, RemoteHost: "example.com", RemotePort: "80", LocalHost: "127.0.0.1", LocalPort: "1080", Options: opts}
+	listen, remote, token, connectIP, transport := "", "", "", "", "ws"
+	lanesN, wsLanesN, wsLanesMax, wsLanesUpgradeQueue, polls, maxInflightPosts, batchSize, sendQueue := 4, 12, 12, 64, 2, 20, 3, 4096
+	wsLanesAuto, wsLanesIncremental, metrics := false, false, false
+	timeout, metricsInterval, batchDelay, idle := 15*time.Second, time.Second, time.Millisecond, 120*time.Second
+	metricsOut := ""
+
+	if err := applyClientPluginEnv(env, &listen, &remote, &token, &connectIP, &transport, &lanesN, &wsLanesN, &wsLanesMax, &wsLanesUpgradeQueue, &polls, &maxInflightPosts, &batchSize, &sendQueue, &wsLanesAuto, &wsLanesIncremental, &metrics, &timeout, &metricsInterval, &batchDelay, &idle, &metricsOut); err != nil {
+		t.Fatal(err)
+	}
+	if remote != "http://example.com:80/" {
+		t.Fatalf("remote=%q, want http://example.com:80/", remote)
+	}
+	if connectIP != "" {
+		t.Fatalf("connectIP=%q, want empty", connectIP)
 	}
 }
 
