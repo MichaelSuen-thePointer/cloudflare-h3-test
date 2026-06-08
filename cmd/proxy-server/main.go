@@ -5,15 +5,19 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	PluginEnv "cloudflare-h3-test/internal/pluginopts"
 	"cloudflare-h3-test/internal/relay"
 )
 
@@ -90,6 +94,16 @@ func main() {
 	flag.DurationVar(&idle, "idle", 120*time.Second, "session idle timeout")
 	flag.IntVar(&udpBuffer, "udp-buffer", 4<<20, "UDP socket read/write buffer bytes")
 	flag.Parse()
+
+	sipEnv, err := PluginEnv.LoadFromEnv()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if sipEnv.Enabled {
+		if err := applyServerPluginEnv(sipEnv, &listen, &upstream, &cert, &key, &token, &requireH3, &benchEcho, &metrics, &idle, &udpBuffer); err != nil {
+			log.Fatal(err)
+		}
+	}
 	addr, err := net.ResolveUDPAddr("udp", upstream)
 	if err != nil {
 		log.Fatal(err)
@@ -752,5 +766,134 @@ func (s *session) readLoop(parent *server) {
 		f := parent.queueFrame(relay.Frame{Payload: payload})
 		parent.countQueueDrops(relay.EnqueueDropOldest(s.queue, f))
 		parent.countUDPDown(n)
+	}
+}
+
+func applyServerPluginEnv(env PluginEnv.Env, listen, upstream, cert, key, token *string, requireH3, benchEcho, metrics *bool, idle *time.Duration, udpBuffer *int) error {
+	opts := env.Options
+	warnUnknownPluginEnvOptions(opts, knownServerPluginEnvOptions)
+
+	*listen = env.RemoteAddr()
+	*upstream = env.LocalAddr()
+	applyStringOption(opts, "token", token)
+	applyStringOption(opts, "cert", cert)
+	applyStringOption(opts, "key", key)
+	if err := applyBoolOption(opts, "require-h3", requireH3); err != nil {
+		return err
+	}
+	if err := applyBoolOption(opts, "bench-echo", benchEcho); err != nil {
+		return err
+	}
+	if err := applyBoolOption(opts, "metrics", metrics); err != nil {
+		return err
+	}
+	if err := applyDurationOption(opts, "idle", idle); err != nil {
+		return err
+	}
+	if err := applyIntOption(opts, "udp-buffer", udpBuffer); err != nil {
+		return err
+	}
+	host, hasHost := opts.Get("host")
+	if hasHost && host != "" && *cert == "" && *key == "" {
+		foundCert, foundKey, ok := findACMECertKey(host)
+		if !ok {
+			return fmt.Errorf("PluginEnv host=%q set but cert/key empty and no acme.sh certificate found", host)
+		}
+		*cert = foundCert
+		*key = foundKey
+	}
+	return nil
+}
+
+func findACMECertKey(host string) (string, string, bool) {
+	for _, home := range homeDirCandidates() {
+		if cert, key, ok := findACMECertKeyIn(filepath.Join(home, ".acme.sh"), host); ok {
+			return cert, key, true
+		}
+	}
+	return "", "", false
+}
+
+func homeDirCandidates() []string {
+	seen := map[string]struct{}{}
+	var homes []string
+	add := func(home string) {
+		if home == "" {
+			return
+		}
+		if _, ok := seen[home]; ok {
+			return
+		}
+		seen[home] = struct{}{}
+		homes = append(homes, home)
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		add(home)
+	}
+	add(os.Getenv("HOME"))
+	add("/root")
+	return homes
+}
+
+func findACMECertKeyIn(base, host string) (string, string, bool) {
+	for _, dirName := range []string{host, host + "_ecc"} {
+		dir := filepath.Join(base, dirName)
+		cert := filepath.Join(dir, "fullchain.cer")
+		key := filepath.Join(dir, host+".key")
+		if fileExists(cert) && fileExists(key) {
+			return cert, key, true
+		}
+	}
+	return "", "", false
+}
+
+func fileExists(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir()
+}
+
+func applyStringOption(opts PluginEnv.Options, key string, dst *string) {
+	if v, ok := opts.Get(key); ok {
+		*dst = v
+	}
+}
+
+func applyIntOption(opts PluginEnv.Options, key string, dst *int) error {
+	if v, ok, err := opts.Int(key); err != nil {
+		return err
+	} else if ok {
+		*dst = v
+	}
+	return nil
+}
+
+func applyBoolOption(opts PluginEnv.Options, key string, dst *bool) error {
+	if v, ok, err := opts.Bool(key); err != nil {
+		return err
+	} else if ok {
+		*dst = v
+	}
+	return nil
+}
+
+func applyDurationOption(opts PluginEnv.Options, key string, dst *time.Duration) error {
+	if v, ok, err := opts.Duration(key); err != nil {
+		return err
+	} else if ok {
+		*dst = v
+	}
+	return nil
+}
+
+var knownServerPluginEnvOptions = map[string]struct{}{
+	"server": {}, "host": {}, "token": {}, "cert": {}, "key": {},
+	"require-h3": {}, "bench-echo": {}, "metrics": {}, "idle": {}, "udp-buffer": {},
+}
+
+func warnUnknownPluginEnvOptions(opts PluginEnv.Options, known map[string]struct{}) {
+	for key := range opts {
+		if _, ok := known[key]; !ok {
+			log.Printf("warning: unknown PluginEnv option %q ignored", key)
+		}
 	}
 }

@@ -6,9 +6,12 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
+	PluginEnv "cloudflare-h3-test/internal/pluginopts"
 	"cloudflare-h3-test/internal/relay"
 )
 
@@ -188,4 +191,87 @@ func TestWebSocketPingBeforeAttach(t *testing.T) {
 	if s.findSession("ping-before-attach") == nil {
 		t.Fatal("session not created after attach")
 	}
+}
+
+func TestApplyServerPluginEnvMapsAddressesAndOptions(t *testing.T) {
+	opts, err := PluginEnv.ParseOptions("server;token=example-secret;cert=/tmp/cert.pem;key=/tmp/key.pem;require-h3=false;bench-echo;metrics;idle=30s;udp-buffer=8192")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := PluginEnv.Env{
+		Enabled:    true,
+		RemoteHost: "0.0.0.0",
+		RemotePort: "2083",
+		LocalHost:  "127.0.0.1",
+		LocalPort:  "8388",
+		Options:    opts,
+	}
+	listen := ""
+	upstream := ""
+	cert := ""
+	key := ""
+	token := ""
+	requireH3 := true
+	benchEcho := false
+	metrics := false
+	idle := 120 * time.Second
+	udpBuffer := 4 << 20
+
+	err = applyServerPluginEnv(env, &listen, &upstream, &cert, &key, &token, &requireH3, &benchEcho, &metrics, &idle, &udpBuffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listen != "0.0.0.0:2083" || upstream != "127.0.0.1:8388" {
+		t.Fatalf("listen=%q upstream=%q, want mapped PluginEnv addresses", listen, upstream)
+	}
+	if token != "example-secret" || cert != "/tmp/cert.pem" || key != "/tmp/key.pem" || requireH3 || !benchEcho || !metrics || idle != 30*time.Second || udpBuffer != 8192 {
+		t.Fatalf("mapped token=%q cert=%q key=%q requireH3=%v benchEcho=%v metrics=%v idle=%v udpBuffer=%d", token, cert, key, requireH3, benchEcho, metrics, idle, udpBuffer)
+	}
+}
+
+func TestFindACMECertKeyInExactAndECCDirs(t *testing.T) {
+	base := t.TempDir()
+	exactDir := filepath.Join(base, "example.com")
+	if err := os.MkdirAll(exactDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	exactCert := filepath.Join(exactDir, "fullchain.cer")
+	exactKey := filepath.Join(exactDir, "example.com.key")
+	if err := os.WriteFile(exactCert, []byte("cert"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exactKey, []byte("key"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cert, key, ok := findACMECertKeyIn(base, "example.com")
+	if !ok || cert != exactCert || key != exactKey {
+		t.Fatalf("exact cert=%q key=%q ok=%v, want %q %q true", cert, key, ok, exactCert, exactKey)
+	}
+
+	eccDir := filepath.Join(base, "relay.example_ecc")
+	if err := os.MkdirAll(eccDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	eccCert := filepath.Join(eccDir, "fullchain.cer")
+	eccKey := filepath.Join(eccDir, "relay.example.key")
+	if err := os.WriteFile(eccCert, []byte("cert"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(eccKey, []byte("key"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cert, key, ok = findACMECertKeyIn(base, "relay.example")
+	if !ok || cert != eccCert || key != eccKey {
+		t.Fatalf("ecc cert=%q key=%q ok=%v, want %q %q true", cert, key, ok, eccCert, eccKey)
+	}
+}
+
+func TestHomeDirCandidatesIncludesRootFallback(t *testing.T) {
+	homes := homeDirCandidates()
+	for _, home := range homes {
+		if home == "/root" {
+			return
+		}
+	}
+	t.Fatalf("homeDirCandidates=%v, want /root fallback", homes)
 }
