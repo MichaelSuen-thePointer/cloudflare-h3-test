@@ -190,19 +190,26 @@ Runtime metrics are disabled by default for release-style runs.
 `proxy-client` supports:
 
 ```text
+-log-level info
+-use-syslog
 -metrics
 -metrics-out test-results/metrics-proxy-client.jsonl
 -metrics-interval 1s
 ```
 
 `-metrics-out` also enables metrics so existing benchmark commands keep working.
+`-log-level` accepts `debug`, `info`, `warn`, or `error`; default `info` keeps per-session and per-packet noise out of process logs.
+Without `-use-syslog`, Go `log` writes stderr timestamps with microseconds. `-use-syslog` sends diagnostic logs to syslog/logread, so messages omit the program's own timestamp.
 
 `proxy-server` supports:
 
 ```text
+-log-level info
+-use-syslog
 -metrics
+-metrics-out test-results/metrics-proxy-server.jsonl
 ```
 
-When enabled, `proxy-server` writes periodic `proxy-server-metrics` JSON records to the process log.
+When `-metrics-out` is omitted, `proxy-server -metrics` writes periodic `proxy-server-metrics` JSON records to the process log for compatibility.
 
 The first sweep reached the configured `8 MB/s` target stage, but the current one-packet-per-HTTP3-POST prototype did not sustain high throughput. Maximum observed goodput was about `0.0205 MB/s`, and no stage met the strict loss/latency/reorder sustainability thresholds. See `reports/go-throughput-quality-report.md` and `test-results/go-throughput-sweep-report-preferred-ip.json`.

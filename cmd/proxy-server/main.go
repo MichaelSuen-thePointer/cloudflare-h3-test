@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"cloudflare-h3-test/internal/diaglog"
 	PluginEnv "cloudflare-h3-test/internal/pluginopts"
 	"cloudflare-h3-test/internal/relay"
 )
@@ -24,6 +25,8 @@ import (
 const (
 	maxFramesPerDownlinkMessage = relay.MaxPayloadFramesPerMessage
 )
+
+var appLog = diaglog.New(diaglog.Info)
 
 type session struct {
 	id         string
@@ -79,9 +82,9 @@ type serverStats struct {
 }
 
 func main() {
-	var listen, cert, key, token, upstream string
+	var listen, cert, key, token, upstream, metricsOut, logLevel string
 	var udpBuffer int
-	var requireH3, benchEcho, metrics bool
+	var requireH3, benchEcho, metrics, useSyslog bool
 	var idle time.Duration
 	flag.StringVar(&listen, "listen", ":2083", "TLS listen address")
 	flag.StringVar(&cert, "cert", "", "TLS certificate")
@@ -91,16 +94,34 @@ func main() {
 	flag.BoolVar(&requireH3, "require-h3", true, "require X-Client-HTTP-Version: HTTP/3")
 	flag.BoolVar(&benchEcho, "bench-echo", false, "echo frames in proxy server instead of UDP upstream")
 	flag.BoolVar(&metrics, "metrics", false, "enable periodic JSON metrics logging")
+	flag.StringVar(&metricsOut, "metrics-out", "", "optional JSONL metrics output path")
+	flag.StringVar(&logLevel, "log-level", "info", "diagnostic log level: debug, info, warn, or error")
+	flag.BoolVar(&useSyslog, "use-syslog", false, "write diagnostic logs to syslog instead of stderr")
 	flag.DurationVar(&idle, "idle", 120*time.Second, "session idle timeout")
 	flag.IntVar(&udpBuffer, "udp-buffer", 4<<20, "UDP socket read/write buffer bytes")
 	flag.Parse()
 
-	sipEnv, err := PluginEnv.LoadFromEnv()
+	if err := configureLogger("proxy-server", logLevel, useSyslog); err != nil {
+		log.Fatal(err)
+	}
+
+	pluginEnv, err := PluginEnv.LoadFromEnv()
 	if err != nil {
 		log.Fatal(err)
 	}
-	if sipEnv.Enabled {
-		if err := applyServerPluginEnv(sipEnv, &listen, &upstream, &cert, &key, &token, &requireH3, &benchEcho, &metrics, &idle, &udpBuffer); err != nil {
+	if pluginEnv.Enabled {
+		if v, ok := pluginEnv.Options.Get("log-level"); ok {
+			logLevel = v
+		}
+		if v, ok, err := pluginEnv.Options.Bool("use-syslog"); err != nil {
+			log.Fatal(err)
+		} else if ok {
+			useSyslog = v
+		}
+		if err := configureLogger("proxy-server", logLevel, useSyslog); err != nil {
+			log.Fatal(err)
+		}
+		if err := applyServerPluginEnv(pluginEnv, &listen, &upstream, &cert, &key, &token, &metricsOut, &logLevel, &requireH3, &benchEcho, &metrics, &useSyslog, &idle, &udpBuffer); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -108,21 +129,25 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	metrics = metrics || metricsOut != ""
 	s := &server{token: token, requireH3: requireH3, upstream: addr, benchEcho: benchEcho, idle: idle, udpBuffer: udpBuffer, metrics: metrics, sessions: map[string]*session{}}
 	go s.cleanupLoop()
-	if s.metrics {
+	if metricsOut != "" {
+		go s.writeMetrics(metricsOut, 5*time.Second)
+	} else if s.metrics {
 		go s.metricsLoop()
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handle)
-	log.Printf("proxy-server listen=%s upstream=%s require_h3=%v bench_echo=%v metrics=%v", listen, upstream, requireH3, benchEcho, metrics)
+	appLog.Info("proxy-server-start", "listen", listen, "upstream", upstream, "require_h3", requireH3, "bench_echo", benchEcho, "metrics", metrics)
+	httpServer := &http.Server{Addr: listen, Handler: mux, ErrorLog: appLog.StdLogger(diaglog.Warn, "http-server-error")}
 	if cert == "" && key == "" {
-		log.Fatal(http.ListenAndServe(listen, mux))
+		log.Fatal(httpServer.ListenAndServe())
 	}
 	if cert == "" || key == "" {
 		log.Fatal("-cert and -key must be provided together")
 	}
-	log.Fatal(http.ListenAndServeTLS(listen, cert, key, mux))
+	log.Fatal(httpServer.ListenAndServeTLS(cert, key))
 }
 
 func (s *server) handle(w http.ResponseWriter, r *http.Request) {
@@ -170,20 +195,20 @@ func (s *server) handle(w http.ResponseWriter, r *http.Request) {
 func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	ws, err := relay.AcceptWebSocket(w, r)
 	if err != nil {
-		log.Printf("websocket accept failed: %v", err)
+		appLog.WarnRate("websocket_accept_failed", 10*time.Second, "websocket-accept-failed", "remote", r.RemoteAddr, "err", err)
 		return
 	}
 	s.stats.unattachedWS.Add(1)
 	id, err := readAttachSession(ws)
 	s.stats.unattachedWS.Add(-1)
 	if err != nil {
-		log.Printf("websocket attach failed: %v", err)
+		appLog.WarnRate("websocket_attach_failed", 10*time.Second, "websocket-attach-failed", "remote", r.RemoteAddr, "err", err)
 		_ = ws.Close()
 		return
 	}
 	sess, err := s.getSession(id)
 	if err != nil {
-		log.Printf("websocket session failed: %v", err)
+		appLog.WarnRate("websocket_session_failed", 10*time.Second, "websocket-session-failed", "session", id, "remote", r.RemoteAddr, "err", err)
 		_ = ws.Close()
 		return
 	}
@@ -231,7 +256,7 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				}
 				body, err := relay.EncodeFrames(frames)
 				if err != nil {
-					log.Printf("websocket encode: %v", err)
+					appLog.Error("websocket-encode-failed", "session", id, "err", err)
 					return
 				}
 				if sess.isClosed() {
@@ -240,12 +265,12 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				if s.metrics {
 					started := time.Now()
 					if err := ws.WriteBinary(body); err != nil {
-						log.Printf("websocket write failed: %v", err)
+						appLog.WarnRate("server_websocket_write_failed", 10*time.Second, "websocket-write-failed", "session", id, "remote", r.RemoteAddr, "err", err)
 						return
 					}
 					s.observeWSWrite(time.Since(started))
 				} else if err := ws.WriteBinary(body); err != nil {
-					log.Printf("websocket write failed: %v", err)
+					appLog.WarnRate("server_websocket_write_failed", 10*time.Second, "websocket-write-failed", "session", id, "remote", r.RemoteAddr, "err", err)
 					return
 				}
 			case <-r.Context().Done():
@@ -262,7 +287,7 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 		frames, err := relay.DecodeFrames(body)
 		if err != nil {
-			log.Printf("websocket decode: %v", err)
+			appLog.WarnRate("server_websocket_decode_failed", 10*time.Second, "websocket-decode-failed", "session", id, "remote", r.RemoteAddr, "err", err)
 			continue
 		}
 		if sess.isClosed() {
@@ -287,7 +312,7 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				if sess.isClosed() {
 					return
 				}
-				log.Printf("websocket udp write failed: %v", err)
+				appLog.WarnRate("websocket_udp_write_failed", 10*time.Second, "websocket-udp-write-failed", "session", id, "remote", r.RemoteAddr, "err", err)
 				return
 			}
 			s.countUDPUp(len(f.Payload))
@@ -493,8 +518,7 @@ func (s *server) cleanupLoop() {
 			s.closeSession(id)
 		}
 		if len(ids) > 0 {
-			b, _ := json.Marshal(map[string]any{"event": "cleanup", "expired": len(ids)})
-			log.Print(string(b))
+			appLog.Info("cleanup", "expired", len(ids))
 		}
 	}
 }
@@ -503,47 +527,69 @@ func (s *server) metricsLoop() {
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
 	for range t.C {
-		s.mu.Lock()
-		active := len(s.sessions)
-		queueDepth := 0
-		queueCapacity := 0
-		for _, sess := range s.sessions {
-			queueDepth += len(sess.queue)
-			queueCapacity += cap(sess.queue)
-		}
-		s.mu.Unlock()
-		b, _ := json.Marshal(map[string]any{
-			"event":             "proxy-server-metrics",
-			"ts":                time.Now().Format(time.RFC3339Nano),
-			"active_sessions":   active,
-			"unattached_ws":     s.stats.unattachedWS.Load(),
-			"sessions_created":  s.stats.sessionsMade.Load(),
-			"sessions_closed":   s.stats.sessionsClosed.Load(),
-			"requests":          s.stats.requests.Load(),
-			"post_requests":     s.stats.postRequests.Load(),
-			"get_requests":      s.stats.getRequests.Load(),
-			"delete_requests":   s.stats.deleteRequests.Load(),
-			"status_200":        s.stats.status200.Load(),
-			"status_204":        s.stats.status204.Load(),
-			"status_400":        s.stats.status400.Load(),
-			"status_404":        s.stats.status404.Load(),
-			"status_410":        s.stats.status410.Load(),
-			"status_413":        s.stats.status413.Load(),
-			"status_500":        s.stats.status500.Load(),
-			"status_502":        s.stats.status502.Load(),
-			"udp_up_packets":    s.stats.udpUpPackets.Load(),
-			"udp_up_bytes":      s.stats.udpUpBytes.Load(),
-			"udp_down_packets":  s.stats.udpDownPackets.Load(),
-			"udp_down_bytes":    s.stats.udpDownBytes.Load(),
-			"queue_depth":       queueDepth,
-			"queue_capacity":    queueCapacity,
-			"queue_drops":       s.stats.queueDrops.Load(),
-			"queue_wait_max_ms": float64(s.stats.queueWaitMaxUS.Load()) / 1000,
-			"queue_wait_count":  s.stats.queueWaitCount.Load(),
-			"ws_write_max_ms":   float64(s.stats.wsWriteMaxUS.Load()) / 1000,
-			"ws_write_count":    s.stats.wsWriteCount.Load(),
-		})
+		b, _ := json.Marshal(s.snapshot())
 		log.Print(string(b))
+	}
+}
+
+func (s *server) writeMetrics(path string, interval time.Duration) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		appLog.Warn("metrics-open-failed", "path", path, "err", err)
+		return
+	}
+	defer f.Close()
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	enc := json.NewEncoder(f)
+	for range t.C {
+		if err := enc.Encode(s.snapshot()); err != nil {
+			appLog.Warn("metrics-write-failed", "path", path, "err", err)
+			return
+		}
+	}
+}
+
+func (s *server) snapshot() map[string]any {
+	s.mu.Lock()
+	active := len(s.sessions)
+	queueDepth := 0
+	queueCapacity := 0
+	for _, sess := range s.sessions {
+		queueDepth += len(sess.queue)
+		queueCapacity += cap(sess.queue)
+	}
+	s.mu.Unlock()
+	return map[string]any{
+		"event":             "proxy-server-metrics",
+		"ts":                time.Now().Format(time.RFC3339Nano),
+		"active_sessions":   active,
+		"unattached_ws":     s.stats.unattachedWS.Load(),
+		"sessions_created":  s.stats.sessionsMade.Load(),
+		"sessions_closed":   s.stats.sessionsClosed.Load(),
+		"requests":          s.stats.requests.Load(),
+		"post_requests":     s.stats.postRequests.Load(),
+		"get_requests":      s.stats.getRequests.Load(),
+		"delete_requests":   s.stats.deleteRequests.Load(),
+		"status_200":        s.stats.status200.Load(),
+		"status_204":        s.stats.status204.Load(),
+		"status_400":        s.stats.status400.Load(),
+		"status_404":        s.stats.status404.Load(),
+		"status_410":        s.stats.status410.Load(),
+		"status_413":        s.stats.status413.Load(),
+		"status_500":        s.stats.status500.Load(),
+		"status_502":        s.stats.status502.Load(),
+		"udp_up_packets":    s.stats.udpUpPackets.Load(),
+		"udp_up_bytes":      s.stats.udpUpBytes.Load(),
+		"udp_down_packets":  s.stats.udpDownPackets.Load(),
+		"udp_down_bytes":    s.stats.udpDownBytes.Load(),
+		"queue_depth":       queueDepth,
+		"queue_capacity":    queueCapacity,
+		"queue_drops":       s.stats.queueDrops.Load(),
+		"queue_wait_max_ms": float64(s.stats.queueWaitMaxUS.Load()) / 1000,
+		"queue_wait_count":  s.stats.queueWaitCount.Load(),
+		"ws_write_max_ms":   float64(s.stats.wsWriteMaxUS.Load()) / 1000,
+		"ws_write_count":    s.stats.wsWriteCount.Load(),
 	}
 }
 
@@ -769,7 +815,7 @@ func (s *session) readLoop(parent *server) {
 	}
 }
 
-func applyServerPluginEnv(env PluginEnv.Env, listen, upstream, cert, key, token *string, requireH3, benchEcho, metrics *bool, idle *time.Duration, udpBuffer *int) error {
+func applyServerPluginEnv(env PluginEnv.Env, listen, upstream, cert, key, token, metricsOut, logLevel *string, requireH3, benchEcho, metrics, useSyslog *bool, idle *time.Duration, udpBuffer *int) error {
 	opts := env.Options
 	warnUnknownPluginEnvOptions(opts, knownServerPluginEnvOptions)
 
@@ -778,6 +824,10 @@ func applyServerPluginEnv(env PluginEnv.Env, listen, upstream, cert, key, token 
 	applyStringOption(opts, "token", token)
 	applyStringOption(opts, "cert", cert)
 	applyStringOption(opts, "key", key)
+	applyStringOption(opts, "metrics-out", metricsOut)
+	if err := applyLogLevelOption(opts, logLevel); err != nil {
+		return err
+	}
 	if err := applyBoolOption(opts, "require-h3", requireH3); err != nil {
 		return err
 	}
@@ -785,6 +835,9 @@ func applyServerPluginEnv(env PluginEnv.Env, listen, upstream, cert, key, token 
 		return err
 	}
 	if err := applyBoolOption(opts, "metrics", metrics); err != nil {
+		return err
+	}
+	if err := applyBoolOption(opts, "use-syslog", useSyslog); err != nil {
 		return err
 	}
 	if err := applyDurationOption(opts, "idle", idle); err != nil {
@@ -887,13 +940,38 @@ func applyDurationOption(opts PluginEnv.Options, key string, dst *time.Duration)
 
 var knownServerPluginEnvOptions = map[string]struct{}{
 	"server": {}, "host": {}, "token": {}, "cert": {}, "key": {},
-	"require-h3": {}, "bench-echo": {}, "metrics": {}, "idle": {}, "udp-buffer": {},
+	"require-h3": {}, "bench-echo": {}, "metrics": {}, "metrics-out": {}, "log-level": {}, "use-syslog": {}, "idle": {}, "udp-buffer": {},
 }
 
 func warnUnknownPluginEnvOptions(opts PluginEnv.Options, known map[string]struct{}) {
 	for key := range opts {
 		if _, ok := known[key]; !ok {
-			log.Printf("warning: unknown PluginEnv option %q ignored", key)
+			appLog.Warn("unknown-PluginEnv-option", "option", key)
 		}
 	}
+}
+
+func applyLogLevelOption(opts PluginEnv.Options, dst *string) error {
+	v, ok := opts.Get("log-level")
+	if !ok {
+		return nil
+	}
+	if _, err := diaglog.ParseLevel(v); err != nil {
+		return err
+	}
+	*dst = v
+	return nil
+}
+
+func configureLogger(tag, logLevel string, useSyslog bool) error {
+	level, err := diaglog.ParseLevel(logLevel)
+	if err != nil {
+		return err
+	}
+	appLog.SetLevel(level)
+	if useSyslog {
+		return appLog.UseSyslog(tag)
+	}
+	appLog.UseStderr()
+	return nil
 }

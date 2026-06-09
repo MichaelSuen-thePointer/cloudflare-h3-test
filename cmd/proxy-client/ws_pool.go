@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"log"
 	"sync"
 	"time"
 
@@ -173,7 +172,7 @@ func (p *wsPool) dialIdle() {
 	ws, err := p.dial(ctx, p.token)
 	if err != nil {
 		if !errors.Is(err, context.Canceled) {
-			log.Printf("websocket pool dial failed: %v", err)
+			appLog.WarnRate("websocket_pool_dial_failed", 10*time.Second, "websocket-pool-dial-failed", "err", err)
 		}
 		return
 	}
