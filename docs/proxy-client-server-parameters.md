@@ -43,6 +43,7 @@
 ### 1.2 Configuration surface
 
 Use command-line flags for normal configuration. Environment-driven plugin launch is intentionally not documented here.
+
 ## 2. proxy-client 参数
 
 ### 2.1 基础参数
@@ -56,6 +57,8 @@ Use command-line flags for normal configuration. Environment-driven plugin launc
 | `-transport` | `ws` | h3/ws | 传输模式，只允许 `ws` 或 `h3`。 |
 | `-http-timeout` | `15s` | h3/ws | HTTP 请求、WebSocket dial/attach、POST/GET 的 timeout。 |
 | `-idle` | `120s` | h3/ws | 本地 UDP client 2 元组 session 空闲超时。 |
+| `-log-level` | `info` | h3/ws | 诊断日志级别：`debug`、`info`、`warn`、`error`。 |
+| `-use-syslog` | `false` | h3/ws | 将诊断日志写入 syslog；消息体不带程序自有时间戳。 |
 
 ## 3. proxy-server 参数
 
@@ -71,6 +74,9 @@ Use command-line flags for normal configuration. Environment-driven plugin launc
 | `-require-h3` | `true` | 非 WebSocket HTTP 请求必须带 `X-Client-HTTP-Version: HTTP/3`。 |
 | `-bench-echo` | `false` | 不写 upstream，直接把上行 frame 放入下行 queue 做 echo 测试。 |
 | `-metrics` | `false` | 定期在日志输出 JSON metrics。 |
+| `-metrics-out` | 空 | 可选 JSONL metrics 输出文件；设置后自动启用 metrics。 |
+| `-log-level` | `info` | 诊断日志级别：`debug`、`info`、`warn`、`error`。 |
+| `-use-syslog` | `false` | 将诊断日志写入 syslog；消息体不带程序自有时间戳。 |
 | `-idle` | `120s` | server session 空闲超时。 |
 | `-udp-buffer` | `4194304` | upstream UDP socket read/write buffer。 |
 
@@ -92,7 +98,7 @@ TLS 行为：
 
 当 `host` 存在且 `cert/key` 都没填时，找不到证书会报错退出，不会静默降级到 HTTP。
 
-Cloudflare server 例子：
+Cloudflare server 例子:
 
 ```powershell
 .\bin\proxy-server.exe `
@@ -246,8 +252,11 @@ WebSocket 请求不走 `X-Relay-Session` 握手 header。server 流程：
 - `proxy-server` 没有 `-transport` 参数；h3/ws 在同一个 HTTP handler 里按 WebSocket upgrade 或 HTTP method 区分。
 - `-require-h3=true` 只影响非 WebSocket HTTP 请求；WebSocket upgrade 不要求 `X-Client-HTTP-Version`。
 - `-connect-ip` 只影响 client 连接 IP，不改变 `remote` URL 的 Host/SNI。
-- `-metrics-out` 只在 client 有；设置后会自动启用 metrics。
-- server `-metrics` 输出到进程日志，不写单独文件。
+- client/server 都支持 `-metrics-out`；设置后会自动启用 metrics。
+- server 未设置 `-metrics-out` 时，`-metrics` 继续输出到进程日志，保持兼容。
+- `-log-level=info` 默认不输出每个 session 创建；需要 session/lane 生命周期时用 `-log-level=debug`。
+- stderr 模式下由 Go `log` 写日期时间，开启微秒字段；程序消息体为 `[LEVEL] event "err" key: value`。
+- `-use-syslog` 开启时，syslog/logread 负责时间戳和 priority；程序消息体只写 `event "err" key: value`。
 - `-bench-echo` 适合测 relay 自身，不代表真实 upstream UDP 服务性能。
 - `-send-queue` 满时 drop oldest。高压测试中要同时看 client queue drop 和 server queue drop。
 - UDP 本身不保序；多 WS lane 的乱序率高不一定是错误，主要看 loss、duplicate、RTT、goodput。

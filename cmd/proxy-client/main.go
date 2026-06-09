@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"cloudflare-h3-test/internal/diaglog"
 	PluginEnv "cloudflare-h3-test/internal/pluginopts"
 	"cloudflare-h3-test/internal/relay"
 )
@@ -84,12 +85,15 @@ type session struct {
 	wsNext     atomic.Uint64
 }
 
-var errSessionClosed = errors.New("session closed")
+var (
+	errSessionClosed = errors.New("session closed")
+	appLog           = diaglog.New(diaglog.Info)
+)
 
 func main() {
-	var listen, remote, token, connectIP, metricsOut, transport string
+	var listen, remote, token, connectIP, metricsOut, transport, logLevel string
 	var lanesN, wsLanesN, wsLanesMax, wsLanesUpgradeQueue, polls, maxInflightPosts, batchSize, sendQueue int
-	var wsLanesAuto, wsLanesIncremental, metrics bool
+	var wsLanesAuto, wsLanesIncremental, metrics, useSyslog bool
 	var timeout, metricsInterval, batchDelay, idle time.Duration
 	flag.StringVar(&listen, "listen", "127.0.0.1:15353", "local UDP listen address")
 	flag.StringVar(&remote, "remote", "https://relay.example.com:2083/", "relay server URL")
@@ -112,14 +116,31 @@ func main() {
 	flag.BoolVar(&metrics, "metrics", false, "enable in-memory metrics counters")
 	flag.DurationVar(&metricsInterval, "metrics-interval", 1*time.Second, "metrics snapshot interval")
 	flag.StringVar(&metricsOut, "metrics-out", "", "optional JSONL metrics output path")
+	flag.StringVar(&logLevel, "log-level", "info", "diagnostic log level: debug, info, warn, or error")
+	flag.BoolVar(&useSyslog, "use-syslog", false, "write diagnostic logs to syslog instead of stderr")
 	flag.Parse()
 
-	sipEnv, err := PluginEnv.LoadFromEnv()
+	if err := configureLogger("proxy-client", logLevel, useSyslog); err != nil {
+		log.Fatal(err)
+	}
+
+	pluginEnv, err := PluginEnv.LoadFromEnv()
 	if err != nil {
 		log.Fatal(err)
 	}
-	if sipEnv.Enabled {
-		if err := applyClientPluginEnv(sipEnv, &listen, &remote, &token, &connectIP, &transport, &lanesN, &wsLanesN, &wsLanesMax, &wsLanesUpgradeQueue, &polls, &maxInflightPosts, &batchSize, &sendQueue, &wsLanesAuto, &wsLanesIncremental, &metrics, &timeout, &metricsInterval, &batchDelay, &idle, &metricsOut); err != nil {
+	if pluginEnv.Enabled {
+		if v, ok := pluginEnv.Options.Get("log-level"); ok {
+			logLevel = v
+		}
+		if v, ok, err := pluginEnv.Options.Bool("use-syslog"); err != nil {
+			log.Fatal(err)
+		} else if ok {
+			useSyslog = v
+		}
+		if err := configureLogger("proxy-client", logLevel, useSyslog); err != nil {
+			log.Fatal(err)
+		}
+		if err := applyClientPluginEnv(pluginEnv, &listen, &remote, &token, &connectIP, &transport, &logLevel, &lanesN, &wsLanesN, &wsLanesMax, &wsLanesUpgradeQueue, &polls, &maxInflightPosts, &batchSize, &sendQueue, &wsLanesAuto, &wsLanesIncremental, &metrics, &useSyslog, &timeout, &metricsInterval, &batchDelay, &idle, &metricsOut); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -179,7 +200,7 @@ func main() {
 		go state.writeMetrics(metricsOut, metricsInterval)
 	}
 	go state.cleanupLoop()
-	log.Printf("proxy-client udp listen=%s remote=%s connect_ip=%s lanes=%d ws_lanes=%d ws_lanes_auto=%v ws_lanes_incremental=%v ws_lanes_max=%d down_polls=%d", listen, remote, connectIP, lanesN, wsLanesN, wsLanesAuto, wsLanesIncremental, wsLanesMax, polls)
+	appLog.Info("proxy-client-start", "listen", listen, "remote", remote, "connect_ip", connectIP, "transport", transport, "lanes", lanesN, "ws_lanes", wsLanesN, "ws_lanes_auto", wsLanesAuto, "ws_lanes_incremental", wsLanesIncremental, "ws_lanes_max", wsLanesMax, "down_polls", polls)
 	buf := make([]byte, 65535)
 	for {
 		n, peer, err := udp.ReadFromUDP(buf)
@@ -391,7 +412,7 @@ func (c *clientState) getSession(peer *net.UDPAddr) *session {
 		sess.goRun(func() { sess.sendLoop(c.batchSize, c.batchDelay) })
 		sess.goRun(func() { sess.wsScaleLoop() })
 		sess.goRun(func() { c.connectWebSocketLanes(sess, key) })
-		log.Printf("new websocket session id=%s peer=%s lanes=%d connecting=true", id, key, c.wsLanesN)
+		appLog.Debug("websocket-session-create", "session", id, "peer", key, "lanes", c.wsLanesN, "connecting", true)
 		return sess
 	}
 	close(sess.ready)
@@ -416,7 +437,7 @@ func (c *clientState) getSession(peer *net.UDPAddr) *session {
 	sess.goRun(func() { sess.sendLoop(c.batchSize, c.batchDelay) })
 	c.sessions[key] = sess
 	c.countSession()
-	log.Printf("new session id=%s peer=%s", id, key)
+	appLog.Debug("session-create", "session", id, "peer", key, "transport", c.transport)
 	return sess
 }
 
@@ -479,7 +500,7 @@ func (c *clientState) connectWebSocketLanes(sess *session, key string) {
 	}
 	if err := c.ensureWebSocketLanes(sess, target); err != nil {
 		if !errors.Is(err, errSessionClosed) {
-			log.Printf("websocket initial connect failed: %v", err)
+			appLog.WarnRate("websocket_initial_connect_failed", 10*time.Second, "websocket-initial-connect-failed", "session", sess.id, "peer", key, "err", err)
 			if sess.state != nil {
 				go sess.state.closeSession(key, sess)
 			} else {
@@ -488,7 +509,7 @@ func (c *clientState) connectWebSocketLanes(sess *session, key string) {
 		}
 		return
 	}
-	log.Printf("new websocket session id=%s peer=%s lanes=%d", sess.id, key, sess.wsCount())
+	appLog.Debug("websocket-session-ready", "session", sess.id, "peer", key, "lanes", sess.wsCount())
 }
 
 func (c *clientState) ensureWebSocketLanes(sess *session, target int) error {
@@ -582,7 +603,7 @@ func (s *session) maybeAcquireIncrementalWebSocketLane() {
 		ws, err := s.state.acquireWebSocket(ctx, s.id)
 		if err != nil {
 			if !s.isClosed() {
-				log.Printf("websocket incremental lane acquire failed: %v", err)
+				appLog.WarnRate("websocket_incremental_lane_acquire_failed", 10*time.Second, "websocket-incremental-lane-acquire-failed", "session", s.id, "err", err)
 			}
 			return
 		}
@@ -603,7 +624,7 @@ func (s *session) maybeAcquireIncrementalWebSocketLane() {
 		}
 		s.state.countTransport()
 		s.goRun(func() { s.wsReadLoop(s.state, ln) })
-		log.Printf("websocket session id=%s incremental lanes=%d", s.id, s.wsCount())
+		appLog.Info("websocket-lanes-incremental", "session", s.id, "lanes", s.wsCount())
 	}) {
 		s.wsPending.Add(-1)
 	}
@@ -715,10 +736,10 @@ func (s *session) maybeScaleWebSocketLanes() {
 	s.goRun(func() {
 		defer s.wsScaling.Store(false)
 		if err := s.state.ensureWebSocketLanes(s, s.state.wsLanesMax); err != nil {
-			log.Printf("websocket lane scale failed: %v", err)
+			appLog.WarnRate("websocket_lane_scale_failed", 10*time.Second, "websocket-lane-scale-failed", "session", s.id, "err", err)
 			return
 		}
-		log.Printf("websocket session id=%s scaled lanes=%d", s.id, s.wsCount())
+		appLog.Info("websocket-lanes-scaled", "session", s.id, "lanes", s.wsCount())
 	})
 }
 
@@ -809,7 +830,7 @@ func (s *session) close() {
 		select {
 		case <-done:
 		case <-time.After(2 * time.Second):
-			log.Printf("session id=%s close timed out waiting for goroutines", s.id)
+			appLog.Warn("session-close-timeout", "session", s.id)
 		}
 	})
 }
@@ -835,7 +856,7 @@ func (s *session) sendBatch(frames []relay.Frame) {
 
 	chunks, err := relay.SplitFramesByEncodedLimit(frames, relay.MaxMessageBytes)
 	if err != nil {
-		log.Print(err)
+		appLog.Error("frame-split-failed", "session", s.id, "err", err)
 		return
 	}
 	for _, chunk := range chunks {
@@ -849,13 +870,13 @@ func (s *session) sendFrameChunk(frames []relay.Frame) {
 	}
 	body, err := relay.EncodeFrames(frames)
 	if err != nil {
-		log.Print(err)
+		appLog.Error("frame-encode-failed", "session", s.id, "err", err)
 		return
 	}
 	if s.wsCount() > 0 {
 		ln, selectedInflight := s.waitForWSLane(s.state.timeout)
 		if ln == nil {
-			log.Printf("websocket lane unavailable")
+			appLog.WarnRate("websocket_lane_unavailable", 10*time.Second, "websocket-lane-unavailable", "session", s.id)
 			return
 		}
 		if selectedInflight > 0 {
@@ -870,14 +891,14 @@ func (s *session) sendFrameChunk(frames []relay.Frame) {
 			s.countWSPostError(ln)
 			ln.closed.Store(true)
 			s.goRun(func() { s.reconnectWebSocketLane(s.state, ln) })
-			log.Printf("websocket write failed: %v", err)
+			appLog.WarnRate("websocket_write_failed", 10*time.Second, "websocket-write-failed", "session", s.id, "lane", ln.index, "err", err)
 			return
 		}
 		s.countWSPostOK(ln)
 		return
 	}
 	if s.wsMode {
-		log.Printf("websocket lane unavailable")
+		appLog.WarnRate("websocket_lane_unavailable", 10*time.Second, "websocket-lane-unavailable", "session", s.id)
 		return
 	}
 	ln := s.pickLane()
@@ -890,7 +911,7 @@ func (s *session) sendFrameChunk(frames []relay.Frame) {
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.remote, bytes.NewReader(body))
 	if err != nil {
-		log.Print(err)
+		appLog.Error("post-request-create-failed", "session", s.id, "err", err)
 		return
 	}
 	setHeaders(req, s.token, s.id)
@@ -903,7 +924,7 @@ func (s *session) sendFrameChunk(frames []relay.Frame) {
 		if isTimeout(err) {
 			s.countPostTimeout(ln)
 		}
-		log.Printf("post failed: %v", err)
+		appLog.WarnRate("post_failed", 10*time.Second, "post-failed", "session", s.id, "lane", ln.index, "err", err)
 		return
 	}
 	io.Copy(io.Discard, resp.Body)
@@ -912,7 +933,7 @@ func (s *session) sendFrameChunk(frames []relay.Frame) {
 	if resp.StatusCode == http.StatusNoContent {
 		s.countPostOK(ln)
 	} else {
-		log.Printf("post status=%d", resp.StatusCode)
+		appLog.WarnRate("post_status", 10*time.Second, "post-status", "session", s.id, "lane", ln.index, "status", resp.StatusCode)
 	}
 }
 
@@ -929,12 +950,12 @@ func (s *session) wsReadLoop(c *clientState, ln *wsLane) {
 			s.countWSReadError(ln)
 			ln.closed.Store(true)
 			s.goRun(func() { s.reconnectWebSocketLane(c, ln) })
-			log.Printf("websocket read failed: %v", err)
+			appLog.WarnRate("websocket_read_failed", 10*time.Second, "websocket-read-failed", "session", s.id, "lane", ln.index, "err", err)
 			return
 		}
 		frames, err := relay.DecodeFrames(body)
 		if err != nil {
-			log.Printf("websocket decode: %v", err)
+			appLog.WarnRate("websocket_decode_failed", 10*time.Second, "websocket-decode-failed", "session", s.id, "lane", ln.index, "err", err)
 			continue
 		}
 		s.touch()
@@ -966,7 +987,7 @@ func (s *session) reconnectWebSocketLane(c *clientState, old *wsLane) {
 			if s.isClosed() {
 				return
 			}
-			log.Printf("websocket reconnect failed: %v", err)
+			appLog.WarnRate("websocket_reconnect_failed", 10*time.Second, "websocket-reconnect-failed", "session", s.id, "lane", old.index, "err", err)
 			select {
 			case <-s.ctx.Done():
 				return
@@ -1000,7 +1021,7 @@ func (s *session) reconnectWebSocketLane(c *clientState, old *wsLane) {
 		c.countTransport()
 		c.countReconnect()
 		s.goRun(func() { s.wsReadLoop(c, ln) })
-		log.Printf("websocket session id=%s lane=%d reconnected", s.id, old.index)
+		appLog.Info("websocket-lane-reconnected", "session", s.id, "lane", old.index)
 		return
 	}
 }
@@ -1071,7 +1092,7 @@ func (s *session) pollLoop(c *clientState, ln *lane) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.remote, nil)
 		if err != nil {
 			cancel()
-			log.Print(err)
+			appLog.Error("poll-request-create-failed", "session", s.id, "lane", ln.index, "err", err)
 			return
 		}
 		setHeaders(req, c.token, s.id)
@@ -1084,7 +1105,7 @@ func (s *session) pollLoop(c *clientState, ln *lane) {
 			if isTimeout(err) {
 				s.countGetTimeout(ln)
 			}
-			log.Printf("poll failed: %v", err)
+			appLog.WarnRate("poll_failed", 10*time.Second, "poll-failed", "session", s.id, "lane", ln.index, "err", err)
 			select {
 			case <-s.ctx.Done():
 				return
@@ -1102,7 +1123,7 @@ func (s *session) pollLoop(c *clientState, ln *lane) {
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
-			log.Printf("poll status=%d", resp.StatusCode)
+			appLog.WarnRate("poll_status", 10*time.Second, "poll-status", "session", s.id, "lane", ln.index, "status", resp.StatusCode)
 			select {
 			case <-s.ctx.Done():
 				return
@@ -1115,7 +1136,7 @@ func (s *session) pollLoop(c *clientState, ln *lane) {
 		s.countGetOK(ln)
 		frames, err := relay.DecodeFrames(body)
 		if err != nil {
-			log.Printf("poll decode: %v", err)
+			appLog.WarnRate("poll_decode_failed", 10*time.Second, "poll-decode-failed", "session", s.id, "lane", ln.index, "err", err)
 			continue
 		}
 		s.touch()
@@ -1130,7 +1151,7 @@ func (s *session) pollLoop(c *clientState, ln *lane) {
 func (c *clientState) writeMetrics(path string, interval time.Duration) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		log.Printf("metrics open failed: %v", err)
+		appLog.Warn("metrics-open-failed", "path", path, "err", err)
 		return
 	}
 	defer f.Close()
@@ -1139,7 +1160,7 @@ func (c *clientState) writeMetrics(path string, interval time.Duration) {
 	enc := json.NewEncoder(f)
 	for range ticker.C {
 		if err := enc.Encode(c.snapshot()); err != nil {
-			log.Printf("metrics write failed: %v", err)
+			appLog.Warn("metrics-write-failed", "path", path, "err", err)
 			return
 		}
 	}
@@ -1259,7 +1280,7 @@ func setHeaders(req *http.Request, token, sessionID string) {
 	req.Header.Set("X-Relay-Session", sessionID)
 }
 
-func applyClientPluginEnv(env PluginEnv.Env, listen, remote, token, connectIP, transport *string, lanesN, wsLanesN, wsLanesMax, wsLanesUpgradeQueue, polls, maxInflightPosts, batchSize, sendQueue *int, wsLanesAuto, wsLanesIncremental, metrics *bool, timeout, metricsInterval, batchDelay, idle *time.Duration, metricsOut *string) error {
+func applyClientPluginEnv(env PluginEnv.Env, listen, remote, token, connectIP, transport, logLevel *string, lanesN, wsLanesN, wsLanesMax, wsLanesUpgradeQueue, polls, maxInflightPosts, batchSize, sendQueue *int, wsLanesAuto, wsLanesIncremental, metrics, useSyslog *bool, timeout, metricsInterval, batchDelay, idle *time.Duration, metricsOut *string) error {
 	opts := env.Options
 	warnUnknownPluginEnvOptions(opts, knownClientPluginEnvOptions)
 
@@ -1307,6 +1328,9 @@ func applyClientPluginEnv(env PluginEnv.Env, listen, remote, token, connectIP, t
 	applyStringOption(opts, "token", token)
 	applyStringOption(opts, "transport", transport)
 	applyStringOption(opts, "metrics-out", metricsOut)
+	if err := applyLogLevelOption(opts, logLevel); err != nil {
+		return err
+	}
 	if err := applyIntOption(opts, "lanes", lanesN); err != nil {
 		return err
 	}
@@ -1338,6 +1362,9 @@ func applyClientPluginEnv(env PluginEnv.Env, listen, remote, token, connectIP, t
 		return err
 	}
 	if err := applyBoolOption(opts, "metrics", metrics); err != nil {
+		return err
+	}
+	if err := applyBoolOption(opts, "use-syslog", useSyslog); err != nil {
 		return err
 	}
 	if err := applyDurationOption(opts, "http-timeout", timeout); err != nil {
@@ -1386,7 +1413,7 @@ func applyDurationOption(opts PluginEnv.Options, key string, dst *time.Duration)
 }
 
 var knownClientPluginEnvOptions = map[string]struct{}{
-	"scheme": {}, "tls": {}, "host": {}, "path": {}, "connect-ip": {}, "token": {}, "transport": {}, "metrics-out": {},
+	"scheme": {}, "tls": {}, "host": {}, "path": {}, "connect-ip": {}, "token": {}, "transport": {}, "metrics-out": {}, "log-level": {}, "use-syslog": {},
 	"lanes": {}, "ws-lanes": {}, "ws-lanes-max": {}, "ws-lanes-upgrade-queue": {}, "down-polls": {}, "max-inflight-posts": {}, "batch-size": {}, "send-queue": {},
 	"ws-lanes-auto": {}, "ws-lanes-incremental": {}, "metrics": {},
 	"http-timeout": {}, "metrics-interval": {}, "batch-delay": {}, "idle": {},
@@ -1395,9 +1422,34 @@ var knownClientPluginEnvOptions = map[string]struct{}{
 func warnUnknownPluginEnvOptions(opts PluginEnv.Options, known map[string]struct{}) {
 	for key := range opts {
 		if _, ok := known[key]; !ok {
-			log.Printf("warning: unknown PluginEnv option %q ignored", key)
+			appLog.Warn("unknown-PluginEnv-option", "option", key)
 		}
 	}
+}
+
+func applyLogLevelOption(opts PluginEnv.Options, dst *string) error {
+	v, ok := opts.Get("log-level")
+	if !ok {
+		return nil
+	}
+	if _, err := diaglog.ParseLevel(v); err != nil {
+		return err
+	}
+	*dst = v
+	return nil
+}
+
+func configureLogger(tag, logLevel string, useSyslog bool) error {
+	level, err := diaglog.ParseLevel(logLevel)
+	if err != nil {
+		return err
+	}
+	appLog.SetLevel(level)
+	if useSyslog {
+		return appLog.UseSyslog(tag)
+	}
+	appLog.UseStderr()
+	return nil
 }
 
 func randomID() string {

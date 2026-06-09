@@ -194,7 +194,7 @@ func TestWebSocketPingBeforeAttach(t *testing.T) {
 }
 
 func TestApplyServerPluginEnvMapsAddressesAndOptions(t *testing.T) {
-	opts, err := PluginEnv.ParseOptions("server;token=example-secret;cert=/tmp/cert.pem;key=/tmp/key.pem;require-h3=false;bench-echo;metrics;idle=30s;udp-buffer=8192")
+	opts, err := PluginEnv.ParseOptions("server;token=example-secret;cert=/tmp/cert.pem;key=/tmp/key.pem;require-h3=false;bench-echo;metrics;metrics-out=/tmp/metrics.jsonl;log-level=error;use-syslog;idle=30s;udp-buffer=8192")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,21 +211,38 @@ func TestApplyServerPluginEnvMapsAddressesAndOptions(t *testing.T) {
 	cert := ""
 	key := ""
 	token := ""
+	metricsOut := ""
+	logLevel := "info"
 	requireH3 := true
 	benchEcho := false
 	metrics := false
+	useSyslog := false
 	idle := 120 * time.Second
 	udpBuffer := 4 << 20
 
-	err = applyServerPluginEnv(env, &listen, &upstream, &cert, &key, &token, &requireH3, &benchEcho, &metrics, &idle, &udpBuffer)
+	err = applyServerPluginEnv(env, &listen, &upstream, &cert, &key, &token, &metricsOut, &logLevel, &requireH3, &benchEcho, &metrics, &useSyslog, &idle, &udpBuffer)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if listen != "0.0.0.0:2083" || upstream != "127.0.0.1:8388" {
 		t.Fatalf("listen=%q upstream=%q, want mapped PluginEnv addresses", listen, upstream)
 	}
-	if token != "example-secret" || cert != "/tmp/cert.pem" || key != "/tmp/key.pem" || requireH3 || !benchEcho || !metrics || idle != 30*time.Second || udpBuffer != 8192 {
-		t.Fatalf("mapped token=%q cert=%q key=%q requireH3=%v benchEcho=%v metrics=%v idle=%v udpBuffer=%d", token, cert, key, requireH3, benchEcho, metrics, idle, udpBuffer)
+	if token != "example-secret" || cert != "/tmp/cert.pem" || key != "/tmp/key.pem" || metricsOut != "/tmp/metrics.jsonl" || logLevel != "error" || !useSyslog || requireH3 || !benchEcho || !metrics || idle != 30*time.Second || udpBuffer != 8192 {
+		t.Fatalf("mapped token=%q cert=%q key=%q metricsOut=%q logLevel=%q useSyslog=%v requireH3=%v benchEcho=%v metrics=%v idle=%v udpBuffer=%d", token, cert, key, metricsOut, logLevel, useSyslog, requireH3, benchEcho, metrics, idle, udpBuffer)
+	}
+}
+
+func TestApplyServerLogLevelOptionRejectsInvalid(t *testing.T) {
+	opts, err := PluginEnv.ParseOptions("log-level=verbose")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logLevel := "info"
+	if err := applyLogLevelOption(opts, &logLevel); err == nil {
+		t.Fatal("applyLogLevelOption returned nil error")
+	}
+	if logLevel != "info" {
+		t.Fatalf("logLevel=%q, want unchanged info", logLevel)
 	}
 }
 
