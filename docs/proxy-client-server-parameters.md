@@ -1,6 +1,6 @@
-# proxy-client / proxy-server 参数和组合
+# udp-proxy / proxy-client / proxy-server 参数和组合
 
-本文说明 `proxy-client` 和 `proxy-server` 在 `h3`、`ws` 两种模式下的传参方式、参数含义和推荐组合。当前实现是 UDP relay 数据面；PluginEnv 支持只覆盖进程启动传参规则，不新增 TCP stream 转发。
+本文说明 `udp-proxy`、`proxy-client` 和 `proxy-server` 在 `h3`、`ws` 两种模式下的传参方式、参数含义和推荐组合。当前实现是 UDP relay 数据面；PluginEnv 支持只覆盖进程启动传参规则，不新增 TCP stream 转发。
 
 ## 1. 两种传参入口
 
@@ -9,6 +9,24 @@
 不设置 PluginEnv 环境变量时，程序完全使用命令行参数和内置默认值。
 
 典型本地明文 WS 测试：
+
+```powershell
+.\bin\udp-proxy.exe `
+  -server `
+  -listen 127.0.0.1:18083 `
+  -upstream 127.0.0.1:19090 `
+  -require-h3=false `
+  -token change-me-token
+
+.\bin\udp-proxy.exe `
+  -listen 127.0.0.1:15353 `
+  -remote http://127.0.0.1:18083/ `
+  -transport ws `
+  -ws-lanes 12 `
+  -token change-me-token
+```
+
+旧独立二进制保留，等价写法：
 
 ```powershell
 .\bin\proxy-server.exe `
@@ -260,4 +278,4 @@ WebSocket 请求不走 `X-Relay-Session` 握手 header。server 流程：
 - `-bench-echo` 适合测 relay 自身，不代表真实 upstream UDP 服务性能。
 - `-send-queue` 满时 drop oldest。高压测试中要同时看 client queue drop 和 server queue drop。
 - UDP 本身不保序；多 WS lane 的乱序率高不一定是错误，主要看 loss、duplicate、RTT、goodput。
-- Environment-driven plugin launch remains a compatibility layer; CLI flags are the documented configuration surface.
+- 当前 PluginEnv 支持是传参层；如果后续实现 TCP stream 数据面，需要复用这套 env 映射，但新增 TCP listener/stream 转发逻辑。
