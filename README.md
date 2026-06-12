@@ -8,11 +8,22 @@ This workspace contains a prototype for the HTTP/3-over-Cloudflare UDP relay des
 - `legacy/client_bench.js`: original Chrome/Node benchmark prototype.
 - `legacy/client_udp_relay.js`: original Chrome/Node UDP relay prototype.
 - `docs/cloudflare-http3-udp-relay-design.md`: design notes and measurement plan.
-- `cmd/proxy-client`, `cmd/proxy-server`, `cmd/test-client`, `cmd/test-server`: native Go implementation of the relay and its UDP echo test harness.
+- `cmd/udp-proxy`, `cmd/proxy-client`, `cmd/proxy-server`, `cmd/test-client`, `cmd/test-server`: native Go implementation of the relay and its UDP echo test harness.
 - `reports/go-test-quality-report.md`: first native Go deployment and test quality report.
 - `reports/go-throughput-quality-report.md`: throughput sweep report using preferred Cloudflare edge IP `104.17.173.91` and max target `8 MB/s`.
 - `test-results/`: JSON outputs from functional and throughput test runs.
 - `evidence/netlogs/`: Chrome NetLog evidence from earlier HTTP/3 validation runs.
+
+## Go Binaries
+
+`udp-proxy` is the combined entrypoint. It starts client mode by default and starts server mode with `-server`:
+
+```powershell
+.\bin\udp-proxy.exe -listen 127.0.0.1:15353 -remote http://127.0.0.1:18083/ -transport ws
+.\bin\udp-proxy.exe -server -listen 127.0.0.1:18083 -upstream 127.0.0.1:19090 -require-h3=false
+```
+
+PluginEnv mode uses the same split: server mode is selected through the standard plugin option marker; otherwise `udp-proxy` starts client mode. The legacy `proxy-client` and `proxy-server` binaries are still built and keep their original flags.
 
 ## Request Model
 
