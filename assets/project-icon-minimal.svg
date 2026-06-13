@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Minimal Cloudflare HTTP/3 UDP Relay Prototype icon</title>
+  <desc id="desc">Orange edge cloud with three transport lanes and a centered UDP relay packet.</desc>
+  <defs>
+    <linearGradient id="cloud" x1="122" y1="128" x2="384" y2="298" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffb14a"/>
+      <stop offset="0.58" stop-color="#f48120"/>
+      <stop offset="1" stop-color="#d95d0b"/>
+    </linearGradient>
+    <linearGradient id="packet" x1="174" y1="186" x2="330" y2="340" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#19d3ff"/>
+      <stop offset="1" stop-color="#0069c9"/>
+    </linearGradient>
+    <filter id="softShadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#1b2b44" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+
+  <g transform="translate(0 38)">
+    <g filter="url(#softShadow)">
+      <path
+        fill="url(#cloud)"
+        d="M152 307c-40 0-72-31-72-69 0-35 26-63 59-68 17-48 62-82 116-82 61 0 112 43 124 101 31 7 53 34 53 67 0 38-31 69-70 69H152Z"/>
+      <path
+        fill="#fff3df"
+        opacity="0.88"
+        d="M358 174c-19-39-59-66-103-66-41 0-78 22-99 57 21-23 51-37 85-37 46 0 86 26 105 64 23 1 44 10 59 25-8-22-26-39-47-43Z"/>
+    </g>
+
+    <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M118 214c84-36 192-36 276 0" stroke="#13c7f3" stroke-width="18"/>
+      <path d="M118 256c84-36 192-36 276 0" stroke="#0677d8" stroke-width="18"/>
+      <path d="M118 298c84-36 192-36 276 0" stroke="#0eb38c" stroke-width="18"/>
+    </g>
+
+    <g filter="url(#softShadow)">
+      <path
+        fill="url(#packet)"
+        d="M256 164 348 256 256 348 164 256 256 164Z"/>
+      <path
+        fill="none"
+        stroke="#ffffff"
+        stroke-width="18"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        d="M218 220h76M218 256h76M218 292h76"/>
+    </g>
+  </g>
+</svg>
