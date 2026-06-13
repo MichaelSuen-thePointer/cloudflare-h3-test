@@ -30,22 +30,23 @@ type Frame struct {
 }
 
 func EncodeFrames(frames []Frame) ([]byte, error) {
-	if len(frames) > 65535 {
-		return nil, fmt.Errorf("too many frames: %d", len(frames))
+	n, err := EncodedFramesLen(frames)
+	if err != nil {
+		return nil, err
 	}
-	var b bytes.Buffer
-	b.Write(Magic[:])
-	b.WriteByte(Version)
-	_ = binary.Write(&b, binary.BigEndian, uint16(len(frames)))
+	b := make([]byte, n)
+	copy(b, Magic[:])
+	b[4] = Version
+	binary.BigEndian.PutUint16(b[5:7], uint16(len(frames)))
+	pos := encodedHeaderBytes
 	for _, f := range frames {
-		if len(f.Payload) > MaxFramePayloadBytes {
-			return nil, fmt.Errorf("payload too large: %d", len(f.Payload))
-		}
-		_ = binary.Write(&b, binary.BigEndian, f.PacketID)
-		_ = binary.Write(&b, binary.BigEndian, uint16(len(f.Payload)))
-		b.Write(f.Payload)
+		binary.BigEndian.PutUint64(b[pos:pos+8], f.PacketID)
+		binary.BigEndian.PutUint16(b[pos+8:pos+10], uint16(len(f.Payload)))
+		pos += encodedFrameHeaderBytes
+		copy(b[pos:pos+len(f.Payload)], f.Payload)
+		pos += len(f.Payload)
 	}
-	return b.Bytes(), nil
+	return b, nil
 }
 
 func EncodedFramesLen(frames []Frame) (int, error) {
@@ -92,42 +93,46 @@ func SplitFramesByEncodedLimit(frames []Frame, limit int) ([][]Frame, error) {
 }
 
 func DecodeFrames(data []byte) ([]Frame, error) {
-	r := bytes.NewReader(data)
-	var magic [4]byte
-	if _, err := io.ReadFull(r, magic[:]); err != nil {
-		return nil, err
+	return decodeFrames(data, true)
+}
+
+func DecodeFramesView(data []byte) ([]Frame, error) {
+	return decodeFrames(data, false)
+}
+
+func decodeFrames(data []byte, copyPayload bool) ([]Frame, error) {
+	if len(data) < encodedHeaderBytes {
+		return nil, io.ErrUnexpectedEOF
 	}
+	var magic [4]byte
+	copy(magic[:], data[:4])
 	if magic != Magic {
 		return nil, errors.New("bad frame magic")
 	}
-	version, err := r.ReadByte()
-	if err != nil {
-		return nil, err
+	if data[4] != Version {
+		return nil, fmt.Errorf("bad frame version: %d", data[4])
 	}
-	if version != Version {
-		return nil, fmt.Errorf("bad frame version: %d", version)
-	}
-	var count uint16
-	if err := binary.Read(r, binary.BigEndian, &count); err != nil {
-		return nil, err
-	}
+	count := binary.BigEndian.Uint16(data[5:7])
+	pos := encodedHeaderBytes
 	frames := make([]Frame, 0, count)
 	for i := 0; i < int(count); i++ {
-		var id uint64
-		var n uint16
-		if err := binary.Read(r, binary.BigEndian, &id); err != nil {
-			return nil, err
+		if len(data)-pos < encodedFrameHeaderBytes {
+			return nil, io.ErrUnexpectedEOF
 		}
-		if err := binary.Read(r, binary.BigEndian, &n); err != nil {
-			return nil, err
+		id := binary.BigEndian.Uint64(data[pos : pos+8])
+		n := int(binary.BigEndian.Uint16(data[pos+8 : pos+10]))
+		pos += encodedFrameHeaderBytes
+		if len(data)-pos < n {
+			return nil, io.ErrUnexpectedEOF
 		}
-		payload := make([]byte, int(n))
-		if _, err := io.ReadFull(r, payload); err != nil {
-			return nil, err
+		payload := data[pos : pos+n]
+		if copyPayload {
+			payload = append([]byte(nil), payload...)
 		}
 		frames = append(frames, Frame{PacketID: id, Payload: payload})
+		pos += n
 	}
-	if r.Len() != 0 {
+	if pos != len(data) {
 		return nil, errors.New("trailing frame bytes")
 	}
 	return frames, nil
