@@ -286,7 +286,7 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return
 		}
-		frames, err := relay.DecodeFrames(body)
+		frames, err := relay.DecodeFramesView(body)
 		if err != nil {
 			appLog.WarnRate("server_websocket_decode_failed", 10*time.Second, "websocket-decode-failed", "session", id, "remote", r.RemoteAddr, "err", err)
 			continue
@@ -343,7 +343,7 @@ func (s *server) handlePost(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
 		return
 	}
-	frames, err := relay.DecodeFrames(body)
+	frames, err := relay.DecodeFramesView(body)
 	if err != nil {
 		s.countStatus(http.StatusBadRequest)
 		http.Error(w, err.Error(), http.StatusBadRequest)

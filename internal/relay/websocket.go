@@ -186,6 +186,14 @@ func (c *WebSocketConn) SetDeadline(t time.Time) error {
 }
 
 func (c *WebSocketConn) WriteBinary(payload []byte) error {
+	return c.writeBinary(payload, false)
+}
+
+func (c *WebSocketConn) WriteBinaryOwned(payload []byte) error {
+	return c.writeBinary(payload, true)
+}
+
+func (c *WebSocketConn) writeBinary(payload []byte, owned bool) error {
 	if len(payload) > MaxWebSocketPayloadBytes {
 		return fmt.Errorf("websocket payload too large: %d > %d", len(payload), MaxWebSocketPayloadBytes)
 	}
@@ -219,14 +227,17 @@ func (c *WebSocketConn) WriteBinary(payload []byte) error {
 		}
 		copy(hdr[pos:pos+4], key[:])
 		pos += 4
-		masked := make([]byte, len(payload))
-		for i := range payload {
-			masked[i] = payload[i] ^ key[i%4]
+		out := payload
+		if !owned {
+			out = append([]byte(nil), payload...)
+		}
+		for i := range out {
+			out[i] ^= key[i%4]
 		}
 		if _, err := c.conn.Write(hdr[:pos]); err != nil {
 			return err
 		}
-		_, err := c.conn.Write(masked)
+		_, err := c.conn.Write(out)
 		return err
 	}
 	if _, err := c.conn.Write(hdr[:pos]); err != nil {

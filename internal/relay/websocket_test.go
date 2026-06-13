@@ -2,7 +2,9 @@ package relay
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -93,4 +95,139 @@ func TestWebSocketClientControlFramesAreMasked(t *testing.T) {
 	if err := <-errCh; err != nil {
 		t.Fatalf("writeControl: %v", err)
 	}
+}
+
+func TestWebSocketClientWriteBinaryOwnedMasksInPlace(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	payload := []byte("payload")
+	original := append([]byte(nil), payload...)
+	errCh := make(chan error, 1)
+	go func() {
+		ws := &WebSocketConn{conn: client, reader: bufio.NewReader(client), mask: true}
+		errCh <- ws.WriteBinaryOwned(payload)
+	}()
+
+	masked, got := readTestWebSocketFrame(t, server, true)
+	if !masked {
+		t.Fatal("mask bit not set")
+	}
+	if string(got) != string(original) {
+		t.Fatalf("unmasked=%q, want %q", got, original)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("WriteBinaryOwned: %v", err)
+	}
+	if bytes.Equal(payload, original) {
+		t.Fatal("owned payload was not masked in place")
+	}
+}
+
+func TestWebSocketClientWriteBinaryDoesNotMutatePayload(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	payload := []byte("payload")
+	original := append([]byte(nil), payload...)
+	errCh := make(chan error, 1)
+	go func() {
+		ws := &WebSocketConn{conn: client, reader: bufio.NewReader(client), mask: true}
+		errCh <- ws.WriteBinary(payload)
+	}()
+
+	_, got := readTestWebSocketFrame(t, server, true)
+	if string(got) != string(original) {
+		t.Fatalf("unmasked=%q, want %q", got, original)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("WriteBinary: %v", err)
+	}
+	if !bytes.Equal(payload, original) {
+		t.Fatalf("payload mutated: %q want %q", payload, original)
+	}
+}
+
+func TestWebSocketServerWriteBinaryOwnedUnmasked(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	payload := []byte("payload")
+	errCh := make(chan error, 1)
+	go func() {
+		ws := &WebSocketConn{conn: client, reader: bufio.NewReader(client), mask: false}
+		errCh <- ws.WriteBinaryOwned(payload)
+	}()
+
+	masked, got := readTestWebSocketFrame(t, server, false)
+	if masked {
+		t.Fatal("server frame unexpectedly masked")
+	}
+	if string(got) != "payload" {
+		t.Fatalf("payload=%q, want payload", got)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("WriteBinaryOwned: %v", err)
+	}
+}
+
+func TestWebSocketWriteBinaryOwnedRejectsOversizedPayload(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	ws := &WebSocketConn{conn: client, reader: bufio.NewReader(client), mask: true}
+	err := ws.WriteBinaryOwned(make([]byte, MaxWebSocketPayloadBytes+1))
+	if err == nil || !strings.Contains(err.Error(), "websocket payload too large") {
+		t.Fatalf("err=%v, want payload too large", err)
+	}
+}
+
+func readTestWebSocketFrame(t *testing.T, conn net.Conn, wantMasked bool) (bool, []byte) {
+	t.Helper()
+	var hdr [2]byte
+	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+		t.Fatalf("read header: %v", err)
+	}
+	if hdr[0] != 0x82 {
+		t.Fatalf("opcode byte=%#x, want 0x82", hdr[0])
+	}
+	masked := hdr[1]&0x80 != 0
+	if masked != wantMasked {
+		t.Fatalf("masked=%v, want %v", masked, wantMasked)
+	}
+	n := uint64(hdr[1] & 0x7f)
+	switch n {
+	case 126:
+		var b [2]byte
+		if _, err := io.ReadFull(conn, b[:]); err != nil {
+			t.Fatalf("read payload length: %v", err)
+		}
+		n = uint64(binary.BigEndian.Uint16(b[:]))
+	case 127:
+		var b [8]byte
+		if _, err := io.ReadFull(conn, b[:]); err != nil {
+			t.Fatalf("read payload length: %v", err)
+		}
+		n = binary.BigEndian.Uint64(b[:])
+	}
+	var key [4]byte
+	if masked {
+		if _, err := io.ReadFull(conn, key[:]); err != nil {
+			t.Fatalf("read mask key: %v", err)
+		}
+	}
+	payload := make([]byte, int(n))
+	if _, err := io.ReadFull(conn, payload); err != nil {
+		t.Fatalf("read payload: %v", err)
+	}
+	if masked {
+		for i := range payload {
+			payload[i] ^= key[i%4]
+		}
+	}
+	return masked, payload
 }

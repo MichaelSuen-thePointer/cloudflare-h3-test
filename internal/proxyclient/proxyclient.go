@@ -411,7 +411,9 @@ func (c *clientState) getSession(peer *net.UDPAddr) *session {
 		c.sessions[key] = sess
 		c.countSession()
 		sess.goRun(func() { sess.sendLoop(c.batchSize, c.batchDelay) })
-		sess.goRun(func() { sess.wsScaleLoop() })
+		if c.wsLanesAuto {
+			sess.goRun(func() { sess.wsScaleLoop() })
+		}
 		sess.goRun(func() { c.connectWebSocketLanes(sess, key) })
 		appLog.Debug("websocket-session-create", "session", id, "peer", key, "lanes", c.wsLanesN, "connecting", true)
 		return sess
@@ -888,7 +890,7 @@ func (s *session) sendFrameChunk(frames []relay.Frame) {
 		s.countUDPInFrames(frames)
 		defer ln.inflight.Add(-int64(len(body)))
 		defer s.countWSRequestDone(ln)
-		if err := ln.conn.WriteBinary(body); err != nil {
+		if err := ln.conn.WriteBinaryOwned(body); err != nil {
 			s.countWSPostError(ln)
 			ln.closed.Store(true)
 			s.goRun(func() { s.reconnectWebSocketLane(s.state, ln) })
@@ -954,7 +956,7 @@ func (s *session) wsReadLoop(c *clientState, ln *wsLane) {
 			appLog.WarnRate("websocket_read_failed", 10*time.Second, "websocket-read-failed", "session", s.id, "lane", ln.index, "err", err)
 			return
 		}
-		frames, err := relay.DecodeFrames(body)
+		frames, err := relay.DecodeFramesView(body)
 		if err != nil {
 			appLog.WarnRate("websocket_decode_failed", 10*time.Second, "websocket-decode-failed", "session", s.id, "lane", ln.index, "err", err)
 			continue
