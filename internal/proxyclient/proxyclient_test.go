@@ -474,6 +474,12 @@ func TestWaitForWebSocketLaneWakesOnChange(t *testing.T) {
 	}
 }
 
+func TestTouchIntervalDefaultsToIdleOver500(t *testing.T) {
+	if got := touchInterval(120 * time.Second); got != 240*time.Millisecond {
+		t.Fatalf("touchInterval=%v, want 240ms", got)
+	}
+}
+
 func TestWebSocketPoolAcquireAttachesSession(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
