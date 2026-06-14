@@ -521,7 +521,7 @@ func (s *server) cleanupLoop() {
 			s.closeSession(id)
 		}
 		if len(ids) > 0 {
-			appLog.Info("cleanup", "expired", len(ids))
+			appLog.Debug("cleanup", "expired", len(ids))
 		}
 	}
 }
