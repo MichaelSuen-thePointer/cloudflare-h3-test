@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"cloudflare-h3-test/internal/coarsetime"
 	"cloudflare-h3-test/internal/diaglog"
 	PluginEnv "cloudflare-h3-test/internal/pluginopts"
 	"cloudflare-h3-test/internal/relay"
@@ -81,6 +82,7 @@ type session struct {
 	cancel     context.CancelFunc
 	closed     chan struct{}
 	lastActive atomic.Int64
+	touchEvery time.Duration
 	closeOnce  sync.Once
 	wgMu       sync.Mutex
 	wg         sync.WaitGroup
@@ -410,7 +412,7 @@ func (c *clientState) getSession(peer *net.UDPAddr) *session {
 	}
 	id := randomID()
 	ctx, cancel := context.WithCancel(context.Background())
-	sess := &session{id: id, peer: peer, remote: c.remote, token: c.token, state: c, ctx: ctx, cancel: cancel, closed: make(chan struct{}), ready: make(chan struct{}), wsChanged: make(chan struct{}, 1), stats: c.stats, metrics: c.metrics, posts: make(chan struct{}, c.maxInflightPosts), sendQ: make(chan []byte, c.sendQueue)}
+	sess := &session{id: id, peer: peer, remote: c.remote, token: c.token, state: c, ctx: ctx, cancel: cancel, closed: make(chan struct{}), ready: make(chan struct{}), wsChanged: make(chan struct{}, 1), lastActive: atomic.Int64{}, touchEvery: touchInterval(c.idle), stats: c.stats, metrics: c.metrics, posts: make(chan struct{}, c.maxInflightPosts), sendQ: make(chan []byte, c.sendQueue)}
 	sess.touch()
 	if c.transport == "ws" {
 		sess.wsMode = true
@@ -821,7 +823,14 @@ func (s *session) isClosed() bool {
 	}
 }
 
-func (s *session) touch() { s.lastActive.Store(time.Now().UnixNano()) }
+func (s *session) touch() { coarsetime.Touch(&s.lastActive, s.touchEvery) }
+
+func touchInterval(idle time.Duration) time.Duration {
+	if idle <= 0 {
+		return 0
+	}
+	return idle / 500
+}
 
 func (s *session) idleBefore(cutoff time.Time) bool {
 	return s.lastActive.Load() < cutoff.UnixNano()

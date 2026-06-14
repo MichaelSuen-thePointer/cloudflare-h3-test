@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"cloudflare-h3-test/internal/coarsetime"
 	"cloudflare-h3-test/internal/diaglog"
 	PluginEnv "cloudflare-h3-test/internal/pluginopts"
 	"cloudflare-h3-test/internal/relay"
@@ -35,6 +36,7 @@ type session struct {
 	queue      chan relay.Frame
 	done       chan struct{}
 	lastActive atomic.Int64
+	touchEvery time.Duration
 	closed     atomic.Bool
 	closeOnce  sync.Once
 	wsMu       sync.Mutex
@@ -475,7 +477,7 @@ func (s *server) getSession(id string) (*session, error) {
 		_ = udp.SetReadBuffer(s.udpBuffer)
 		_ = udp.SetWriteBuffer(s.udpBuffer)
 	}
-	sess := &session{id: id, udp: udp, queue: make(chan relay.Frame, 1024), done: make(chan struct{}), ws: make(map[*relay.WebSocketConn]struct{})}
+	sess := &session{id: id, udp: udp, queue: make(chan relay.Frame, 1024), done: make(chan struct{}), touchEvery: touchInterval(s.idle), ws: make(map[*relay.WebSocketConn]struct{})}
 	sess.touch()
 	s.sessions[id] = sess
 	s.countSessionMade()
@@ -743,7 +745,14 @@ func readAttachSession(ws *relay.WebSocketConn) (string, error) {
 	}
 }
 
-func (s *session) touch() { s.lastActive.Store(time.Now().UnixNano()) }
+func (s *session) touch() { coarsetime.Touch(&s.lastActive, s.touchEvery) }
+
+func touchInterval(idle time.Duration) time.Duration {
+	if idle <= 0 {
+		return 0
+	}
+	return idle / 500
+}
 
 func (s *session) idleBefore(cutoff time.Time) bool {
 	return s.lastActive.Load() < cutoff.UnixNano()
