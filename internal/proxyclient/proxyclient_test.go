@@ -174,26 +174,26 @@ func TestEnsureWebSocketLanesClosesSuccessfulLaneAfterParallelFailure(t *testing
 	successClosed := make(chan struct{})
 	accepted := make(chan struct{}, 2)
 	go func() {
-		conn, err := ln.Accept()
+		conn1, err := ln.Accept()
 		if err != nil {
 			return
 		}
 		accepted <- struct{}{}
-		go func() {
+		go func(conn net.Conn) {
 			defer conn.Close()
 			defer close(successClosed)
 			if err := writeWebSocketUpgradeAndAttachAck(conn); err != nil {
 				return
 			}
 			_, _ = io.Copy(io.Discard, conn)
-		}()
+		}(conn1)
 
-		conn, err = ln.Accept()
+		conn2, err := ln.Accept()
 		if err != nil {
 			return
 		}
 		accepted <- struct{}{}
-		_ = conn.Close()
+		_ = conn2.Close()
 	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -303,6 +303,7 @@ func TestIncrementalWebSocketOneLaneUsesAsyncSend(t *testing.T) {
 	sess.state = c
 	sess.wsMode = true
 	sess.ws = append(sess.ws, &wsLane{index: 0})
+	publishTestWSSnapshot(sess)
 
 	if sess.shouldSendBatchSync() {
 		t.Fatal("incremental websocket session with one lane should dispatch sendBatch asynchronously")
@@ -339,6 +340,7 @@ func TestIncrementalWebSocketLaneAcquireFailureKeepsSession(t *testing.T) {
 	sess.state = c
 	sess.wsMode = true
 	sess.ws = append(sess.ws, &wsLane{index: 0})
+	publishTestWSSnapshot(sess)
 
 	sess.maybeAcquireIncrementalWebSocketLane()
 
@@ -375,6 +377,7 @@ func TestIncrementalWebSocketLaneDoesNotReservePastMax(t *testing.T) {
 	}
 	defer sess.close()
 	sess.ws = append(sess.ws, &wsLane{index: 0})
+	publishTestWSSnapshot(sess)
 	sess.wsPending.Store(1)
 
 	if sess.reservePendingWebSocketLane(2) {
@@ -382,6 +385,92 @@ func TestIncrementalWebSocketLaneDoesNotReservePastMax(t *testing.T) {
 	}
 	if got := sess.wsPending.Load(); got != 1 {
 		t.Fatalf("wsPending=%d, want 1", got)
+	}
+}
+
+func TestPickWebSocketLaneUsesSnapshotAndSkipsClosed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sess := &session{
+		id:        "test-session",
+		ctx:       ctx,
+		cancel:    cancel,
+		closed:    make(chan struct{}),
+		wsChanged: make(chan struct{}, 1),
+	}
+	defer sess.close()
+	closedLane := &wsLane{index: 0}
+	closedLane.closed.Store(true)
+	openLane := &wsLane{index: 1}
+	sess.ws = append(sess.ws, closedLane, openLane)
+	publishTestWSSnapshot(sess)
+
+	got, _ := sess.pickWSLane()
+	if got != openLane {
+		t.Fatalf("picked lane=%v, want open lane", got)
+	}
+	if got := sess.wsCount(); got != 2 {
+		t.Fatalf("wsCount=%d, want 2 snapshot lanes", got)
+	}
+}
+
+func TestWebSocketSnapshotReplacePublishesNewLane(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sess := &session{
+		id:        "test-session",
+		ctx:       ctx,
+		cancel:    cancel,
+		closed:    make(chan struct{}),
+		wsChanged: make(chan struct{}, 1),
+	}
+	defer sess.close()
+	oldLane := &wsLane{index: 0}
+	newLane := &wsLane{index: 0}
+	sess.ws = append(sess.ws, oldLane)
+	publishTestWSSnapshot(sess)
+
+	oldLane.closed.Store(true)
+	sess.notifyWSChanged()
+	if got, _ := sess.pickWSLane(); got != nil {
+		t.Fatalf("picked closed old lane=%v, want nil", got)
+	}
+
+	sess.wsMu.Lock()
+	sess.ws[0] = newLane
+	sess.publishWSSnapshotLocked()
+	sess.wsMu.Unlock()
+	sess.notifyWSChanged()
+	got, _ := sess.pickWSLane()
+	if got != newLane {
+		t.Fatalf("picked lane=%v, want replacement", got)
+	}
+}
+
+func TestWaitForWebSocketLaneWakesOnChange(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sess := &session{
+		id:        "test-session",
+		ctx:       ctx,
+		cancel:    cancel,
+		closed:    make(chan struct{}),
+		wsChanged: make(chan struct{}, 1),
+	}
+	defer sess.close()
+	ln := &wsLane{index: 0}
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		sess.wsMu.Lock()
+		sess.ws = append(sess.ws, ln)
+		sess.publishWSSnapshotLocked()
+		sess.wsMu.Unlock()
+		sess.notifyWSChanged()
+	}()
+
+	got, _ := sess.waitForWSLane(time.Second)
+	if got != ln {
+		t.Fatalf("waitForWSLane returned %v, want lane", got)
 	}
 }
 
@@ -649,4 +738,14 @@ func writeServerBinary(conn net.Conn, payload []byte) error {
 	}
 	_, err := conn.Write(payload)
 	return err
+}
+
+func publishTestWSSnapshot(sess *session) {
+	if sess.wsChanged == nil {
+		sess.wsChanged = make(chan struct{}, 1)
+	}
+	sess.wsMu.Lock()
+	sess.publishWSSnapshotLocked()
+	sess.wsMu.Unlock()
+	sess.notifyWSChanged()
 }
