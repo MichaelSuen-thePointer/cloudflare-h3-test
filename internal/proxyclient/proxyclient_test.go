@@ -544,7 +544,6 @@ func TestApplyClientPluginEnvMapsAddressesAndOptions(t *testing.T) {
 	connectIP := "old"
 	transport := "h3"
 	logLevel := "info"
-	lanesN := 4
 	wsLanesN := 12
 	wsLanesMax := 12
 	wsLanesUpgradeQueue := 64
@@ -588,7 +587,7 @@ func TestApplyClientPluginEnvTLSFalse(t *testing.T) {
 	env := PluginEnv.Env{Enabled: true, RemoteHost: "example.com", RemotePort: "80", LocalHost: "127.0.0.1", LocalPort: "1080", Options: opts}
 	listen, remote, token, connectIP, transport := "", "", "", "", "ws"
 	logLevel := "info"
-	lanesN, wsLanesN, wsLanesMax, wsLanesUpgradeQueue, polls, maxInflightPosts, batchSize, sendQueue := 4, 12, 12, 64, 2, 20, 3, 4096
+	wsLanesN, wsLanesMax, wsLanesUpgradeQueue, polls, maxInflightPosts, batchSize, sendQueue := 12, 12, 64, 2, 20, 3, 4096
 	wsLanesAuto, wsLanesIncremental, metrics := false, false, false
 	useSyslog := false
 	timeout, metricsInterval, batchDelay, idle := 15*time.Second, time.Second, time.Millisecond, 120*time.Second

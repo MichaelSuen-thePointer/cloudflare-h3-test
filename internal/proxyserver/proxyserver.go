@@ -1,7 +1,6 @@
 package proxyserver
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -27,7 +26,10 @@ const (
 	maxFramesPerDownlinkMessage = relay.MaxPayloadFramesPerMessage
 )
 
-var appLog = diaglog.New(diaglog.Info)
+var (
+	appLog           = diaglog.New(diaglog.Info)
+	errSessionClosed = errors.New("session closed")
+)
 
 type session struct {
 	id         string
@@ -50,6 +52,7 @@ type server struct {
 	benchEcho bool
 	idle      time.Duration
 	udpBuffer int
+	downQueue int
 	metrics   bool
 	mu        sync.Mutex
 	sessions  map[string]*session
@@ -85,7 +88,7 @@ type serverStats struct {
 
 func Main(args []string) {
 	var listen, cert, key, token, upstream, metricsOut, logLevel string
-	var udpBuffer int
+	var udpBuffer, downQueue int
 	var requireH3, benchEcho, metrics, useSyslog bool
 	var idle time.Duration
 	fs := flag.NewFlagSet("proxy-server", flag.ExitOnError)
@@ -102,6 +105,7 @@ func Main(args []string) {
 	fs.BoolVar(&useSyslog, "use-syslog", false, "write diagnostic logs to syslog instead of stderr")
 	fs.DurationVar(&idle, "idle", 120*time.Second, "session idle timeout")
 	fs.IntVar(&udpBuffer, "udp-buffer", 4<<20, "UDP socket read/write buffer bytes")
+	fs.IntVar(&downQueue, "down-queue", 65536, "per-session downlink queue capacity")
 	fs.Parse(args)
 
 	if err := configureLogger("proxy-server", logLevel, useSyslog); err != nil {
@@ -124,16 +128,19 @@ func Main(args []string) {
 		if err := configureLogger("proxy-server", logLevel, useSyslog); err != nil {
 			log.Fatal(err)
 		}
-		if err := applyServerPluginEnv(pluginEnv, &listen, &upstream, &cert, &key, &token, &metricsOut, &logLevel, &requireH3, &benchEcho, &metrics, &useSyslog, &idle, &udpBuffer); err != nil {
+		if err := applyServerPluginEnv(pluginEnv, &listen, &upstream, &cert, &key, &token, &metricsOut, &logLevel, &requireH3, &benchEcho, &metrics, &useSyslog, &idle, &udpBuffer, &downQueue); err != nil {
 			log.Fatal(err)
 		}
+	}
+	if downQueue < 1 {
+		downQueue = 1
 	}
 	addr, err := net.ResolveUDPAddr("udp", upstream)
 	if err != nil {
 		log.Fatal(err)
 	}
 	metrics = metrics || metricsOut != ""
-	s := &server{token: token, requireH3: requireH3, upstream: addr, benchEcho: benchEcho, idle: idle, udpBuffer: udpBuffer, metrics: metrics, sessions: map[string]*session{}}
+	s := &server{token: token, requireH3: requireH3, upstream: addr, benchEcho: benchEcho, idle: idle, udpBuffer: udpBuffer, downQueue: downQueue, metrics: metrics, sessions: map[string]*session{}}
 	go s.cleanupLoop()
 	if metricsOut != "" {
 		go s.writeMetrics(metricsOut, 5*time.Second)
@@ -297,28 +304,13 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		sess.touch()
-		if s.benchEcho {
-			for _, f := range frames {
-				if sess.isClosed() {
-					return
-				}
-				f = s.queueFrame(f)
-				s.countQueueDrops(relay.EnqueueDropOldest(sess.queue, f))
-			}
-			continue
-		}
 		for _, f := range frames {
-			if sess.isClosed() {
-				return
-			}
-			if _, err := sess.udp.Write(f.Payload); err != nil {
-				if sess.isClosed() {
-					return
+			if err := s.handleInboundFrame(sess, f); err != nil {
+				if !sess.isClosed() {
+					appLog.WarnRate("websocket_udp_write_failed", 10*time.Second, "websocket-udp-write-failed", "session", id, "remote", r.RemoteAddr, "err", err)
 				}
-				appLog.WarnRate("websocket_udp_write_failed", 10*time.Second, "websocket-udp-write-failed", "session", id, "remote", r.RemoteAddr, "err", err)
 				return
 			}
-			s.countUDPUp(len(f.Payload))
 		}
 		select {
 		case <-done:
@@ -329,28 +321,6 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handlePost(w http.ResponseWriter, r *http.Request, id string) {
-	if r.ContentLength > relay.MaxMessageBytes {
-		s.countStatus(http.StatusRequestEntityTooLarge)
-		http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
-		return
-	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, relay.MaxMessageBytes+1))
-	if err != nil {
-		s.countStatus(http.StatusBadRequest)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if len(body) > relay.MaxMessageBytes {
-		s.countStatus(http.StatusRequestEntityTooLarge)
-		http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
-		return
-	}
-	frames, err := relay.DecodeFramesView(body)
-	if err != nil {
-		s.countStatus(http.StatusBadRequest)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
 	sess, err := s.getSession(id)
 	if err != nil {
 		s.countStatus(http.StatusBadGateway)
@@ -362,19 +332,26 @@ func (s *server) handlePost(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, "session gone", http.StatusGone)
 		return
 	}
-	sess.touch()
-	if s.benchEcho {
-		for _, f := range frames {
-			if sess.isClosed() {
-				s.countStatus(http.StatusGone)
-				http.Error(w, "session gone", http.StatusGone)
-				return
-			}
-			f = s.queueFrame(f)
-			s.countQueueDrops(relay.EnqueueDropOldest(sess.queue, f))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, relay.MaxMessageBytes+1))
+	if err != nil {
+		if sess.isClosed() {
+			s.countStatus(http.StatusGone)
+			http.Error(w, "session gone", http.StatusGone)
+			return
 		}
-		s.countStatus(http.StatusNoContent)
-		w.WriteHeader(http.StatusNoContent)
+		s.countStatus(http.StatusRequestEntityTooLarge)
+		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+		return
+	}
+	if len(body) > relay.MaxMessageBytes {
+		s.countStatus(http.StatusRequestEntityTooLarge)
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	frames, err := relay.DecodeFramesView(body)
+	if err != nil {
+		s.countStatus(http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	for _, f := range frames {
@@ -383,27 +360,38 @@ func (s *server) handlePost(w http.ResponseWriter, r *http.Request, id string) {
 			http.Error(w, "session gone", http.StatusGone)
 			return
 		}
-		if _, err := sess.udp.Write(f.Payload); err != nil {
-			if sess.isClosed() {
-				s.countStatus(http.StatusGone)
-				http.Error(w, "session gone", http.StatusGone)
-				return
-			}
+		if err := s.handleInboundFrame(sess, f); err != nil {
 			s.countStatus(http.StatusBadGateway)
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
-		s.countUDPUp(len(f.Payload))
 	}
 	s.countStatus(http.StatusNoContent)
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *server) handleInboundFrame(sess *session, f relay.Frame) error {
+	if sess.isClosed() {
+		return errSessionClosed
+	}
+	sess.touch()
+	if s.benchEcho {
+		f = s.queueFrame(f)
+		s.countQueueDrops(relay.EnqueueDropOldest(sess.queue, f))
+		return nil
+	}
+	if _, err := sess.udp.Write(f.Payload); err != nil {
+		return err
+	}
+	s.countUDPUp(len(f.Payload))
+	return nil
+}
+
 func (s *server) handleGet(w http.ResponseWriter, r *http.Request, id string) {
-	sess := s.findSession(id)
-	if sess == nil {
-		s.countStatus(http.StatusGone)
-		http.Error(w, "session gone", http.StatusGone)
+	sess, err := s.getSession(id)
+	if err != nil {
+		s.countStatus(http.StatusBadGateway)
+		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	if sess.isClosed() {
@@ -411,56 +399,51 @@ func (s *server) handleGet(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, "session gone", http.StatusGone)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-	defer cancel()
-	var frames []relay.Frame
-	select {
-	case f := <-sess.queue:
-		if sess.isClosed() {
-			s.countStatus(http.StatusGone)
-			http.Error(w, "session gone", http.StatusGone)
-			return
-		}
-		s.observeQueueWait(f)
-		frames = append(frames, f)
-	drain:
-		for len(frames) < maxFramesPerDownlinkMessage {
+	flusher, _ := w.(http.Flusher)
+	w.Header().Set("Content-Type", "application/octet-stream")
+	s.countStatus(http.StatusOK)
+	w.WriteHeader(http.StatusOK)
+	if flusher != nil {
+		flusher.Flush()
+	}
+	for {
+		var frames []relay.Frame
+		select {
+		case f := <-sess.queue:
 			if sess.isClosed() {
-				s.countStatus(http.StatusGone)
-				http.Error(w, "session gone", http.StatusGone)
 				return
 			}
+			s.observeQueueWait(f)
+			frames = append(frames, f)
+		case <-r.Context().Done():
+			return
+		case <-sess.done:
+			return
+		}
+	drain:
+		for len(frames) < maxFramesPerDownlinkMessage {
 			select {
 			case f := <-sess.queue:
+				if sess.isClosed() {
+					return
+				}
 				s.observeQueueWait(f)
 				frames = append(frames, f)
 			default:
 				break drain
 			}
 		}
-	case <-ctx.Done():
-		s.countStatus(http.StatusNoContent)
-		w.WriteHeader(http.StatusNoContent)
-		return
-	case <-sess.done:
-		s.countStatus(http.StatusGone)
-		http.Error(w, "session gone", http.StatusGone)
-		return
+		body, err := relay.EncodeFrames(frames)
+		if err != nil {
+			return
+		}
+		if err := relay.WriteStreamMessage(w, body); err != nil {
+			return
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
 	}
-	body, err := relay.EncodeFrames(frames)
-	if err != nil {
-		s.countStatus(http.StatusInternalServerError)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if sess.isClosed() {
-		s.countStatus(http.StatusGone)
-		http.Error(w, "session gone", http.StatusGone)
-		return
-	}
-	w.Header().Set("Content-Type", "application/octet-stream")
-	s.countStatus(http.StatusOK)
-	_, _ = w.Write(body)
 }
 
 func (s *server) getSession(id string) (*session, error) {
@@ -469,15 +452,23 @@ func (s *server) getSession(id string) (*session, error) {
 	if sess := s.sessions[id]; sess != nil {
 		return sess, nil
 	}
-	udp, err := net.DialUDP("udp", nil, s.upstream)
-	if err != nil {
-		return nil, err
+	var udp *net.UDPConn
+	if !s.benchEcho {
+		var err error
+		udp, err = net.DialUDP("udp", nil, s.upstream)
+		if err != nil {
+			return nil, err
+		}
+		if s.udpBuffer > 0 {
+			_ = udp.SetReadBuffer(s.udpBuffer)
+			_ = udp.SetWriteBuffer(s.udpBuffer)
+		}
 	}
-	if s.udpBuffer > 0 {
-		_ = udp.SetReadBuffer(s.udpBuffer)
-		_ = udp.SetWriteBuffer(s.udpBuffer)
+	queueCap := s.downQueue
+	if queueCap < 1 {
+		queueCap = 65536
 	}
-	sess := &session{id: id, udp: udp, queue: make(chan relay.Frame, 1024), done: make(chan struct{}), touchEvery: touchInterval(s.idle), ws: make(map[*relay.WebSocketConn]struct{})}
+	sess := &session{id: id, udp: udp, queue: make(chan relay.Frame, queueCap), done: make(chan struct{}), touchEvery: touchInterval(s.idle), ws: make(map[*relay.WebSocketConn]struct{})}
 	sess.touch()
 	s.sessions[id] = sess
 	s.countSessionMade()
@@ -825,7 +816,7 @@ func (s *session) readLoop(parent *server) {
 	}
 }
 
-func applyServerPluginEnv(env PluginEnv.Env, listen, upstream, cert, key, token, metricsOut, logLevel *string, requireH3, benchEcho, metrics, useSyslog *bool, idle *time.Duration, udpBuffer *int) error {
+func applyServerPluginEnv(env PluginEnv.Env, listen, upstream, cert, key, token, metricsOut, logLevel *string, requireH3, benchEcho, metrics, useSyslog *bool, idle *time.Duration, udpBuffer, downQueue *int) error {
 	opts := env.Options
 	warnUnknownPluginEnvOptions(opts, knownServerPluginEnvOptions)
 
@@ -854,6 +845,9 @@ func applyServerPluginEnv(env PluginEnv.Env, listen, upstream, cert, key, token,
 		return err
 	}
 	if err := applyIntOption(opts, "udp-buffer", udpBuffer); err != nil {
+		return err
+	}
+	if err := applyIntOption(opts, "down-queue", downQueue); err != nil {
 		return err
 	}
 	host, hasHost := opts.Get("host")
@@ -950,7 +944,7 @@ func applyDurationOption(opts PluginEnv.Options, key string, dst *time.Duration)
 
 var knownServerPluginEnvOptions = map[string]struct{}{
 	"server": {}, "host": {}, "token": {}, "cert": {}, "key": {},
-	"require-h3": {}, "bench-echo": {}, "metrics": {}, "metrics-out": {}, "log-level": {}, "use-syslog": {}, "idle": {}, "udp-buffer": {},
+	"require-h3": {}, "bench-echo": {}, "metrics": {}, "metrics-out": {}, "log-level": {}, "use-syslog": {}, "idle": {}, "udp-buffer": {}, "down-queue": {},
 }
 
 func warnUnknownPluginEnvOptions(opts PluginEnv.Options, known map[string]struct{}) {

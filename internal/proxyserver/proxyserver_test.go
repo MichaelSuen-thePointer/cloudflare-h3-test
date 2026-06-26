@@ -26,11 +26,11 @@ func TestHandlePostClosedSessionReturnsGone(t *testing.T) {
 	s.sessions[sess.id] = sess
 	sess.close()
 
-	body, err := relay.EncodeFrames([]relay.Frame{{Payload: []byte("payload")}})
+	encoded, err := relay.EncodeFrames([]relay.Frame{{Payload: []byte("payload")}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(encoded))
 	rec := httptest.NewRecorder()
 	s.handlePost(rec, req, sess.id)
 
@@ -63,20 +63,46 @@ func TestHandleGetClosedSessionWithQueuedPacketReturnsGone(t *testing.T) {
 	}
 }
 
-func TestHandlePostOversizedBodyReturnsTooLargeWithoutSession(t *testing.T) {
+func TestHandlePostBenchEcho(t *testing.T) {
 	s := &server{benchEcho: true, sessions: map[string]*session{}}
-	body := bytes.Repeat([]byte{0}, relay.MaxMessageBytes+1)
+	encoded, err := relay.EncodeFrames([]relay.Frame{{PacketID: 7, Payload: []byte("payload")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(encoded))
+	rec := httptest.NewRecorder()
+	s.handlePost(rec, req, "post-session")
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("post status=%d, want %d", rec.Code, http.StatusNoContent)
+	}
+
+	sess := s.findSession("post-session")
+	if sess == nil {
+		t.Fatal("session not created")
+	}
+	select {
+	case f := <-sess.queue:
+		if f.PacketID != 7 || string(f.Payload) != "payload" {
+			t.Fatalf("frame=%+v, want payload echo", f)
+		}
+	default:
+		t.Fatal("echo frame not queued")
+	}
+}
+
+func TestHandlePostBadFrameReturnsBadRequest(t *testing.T) {
+	s := &server{benchEcho: true, sessions: map[string]*session{}}
+	body := []byte("bad stream frame")
 	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
-	req.ContentLength = int64(len(body))
 	rec := httptest.NewRecorder()
 
-	s.handlePost(rec, req, "oversized")
+	s.handlePost(rec, req, "bad-stream")
 
-	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("status=%d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want %d", rec.Code, http.StatusBadRequest)
 	}
-	if got := len(s.sessions); got != 0 {
-		t.Fatalf("sessions=%d, want 0", got)
+	if got := len(s.sessions); got != 1 {
+		t.Fatalf("sessions=%d, want 1", got)
 	}
 }
 
@@ -219,8 +245,9 @@ func TestApplyServerPluginEnvMapsAddressesAndOptions(t *testing.T) {
 	useSyslog := false
 	idle := 120 * time.Second
 	udpBuffer := 4 << 20
+	downQueue := 65536
 
-	err = applyServerPluginEnv(env, &listen, &upstream, &cert, &key, &token, &metricsOut, &logLevel, &requireH3, &benchEcho, &metrics, &useSyslog, &idle, &udpBuffer)
+	err = applyServerPluginEnv(env, &listen, &upstream, &cert, &key, &token, &metricsOut, &logLevel, &requireH3, &benchEcho, &metrics, &useSyslog, &idle, &udpBuffer, &downQueue)
 	if err != nil {
 		t.Fatal(err)
 	}

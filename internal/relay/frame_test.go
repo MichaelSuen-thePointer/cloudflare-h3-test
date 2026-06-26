@@ -2,6 +2,8 @@ package relay
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"strings"
 	"testing"
 )
@@ -79,5 +81,50 @@ func TestEncodeFramesRejectsPayloadTooLarge(t *testing.T) {
 	_, err := EncodeFrames([]Frame{{Payload: make([]byte, MaxFramePayloadBytes+1)}})
 	if err == nil || !strings.Contains(err.Error(), "payload too large") {
 		t.Fatalf("err=%v, want payload too large", err)
+	}
+}
+
+func TestStreamMessageRoundTrip(t *testing.T) {
+	var buf bytes.Buffer
+	in := [][]byte{[]byte("one"), []byte("two")}
+	for _, payload := range in {
+		if err := WriteStreamMessage(&buf, payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, want := range in {
+		got, err := ReadStreamMessage(&buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != string(want) {
+			t.Fatalf("message %d=%q, want %q", i, got, want)
+		}
+	}
+	if _, err := ReadStreamMessage(&buf); !errors.Is(err, io.EOF) {
+		t.Fatalf("err=%v, want EOF", err)
+	}
+}
+
+func TestStreamMessageRejectsMalformed(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteStreamMessage(&buf, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	body := buf.Bytes()
+	badMagic := append([]byte(nil), body...)
+	badMagic[0] = 'X'
+	if _, err := ReadStreamMessage(bytes.NewReader(badMagic)); err == nil || !strings.Contains(err.Error(), "bad stream message magic") {
+		t.Fatalf("err=%v, want bad magic", err)
+	}
+	if _, err := ReadStreamMessage(bytes.NewReader(body[:len(body)-1])); !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("err=%v, want EOF", err)
+	}
+}
+
+func TestWriteStreamMessageRejectsPayloadTooLarge(t *testing.T) {
+	err := WriteStreamMessage(io.Discard, make([]byte, MaxMessageBytes+1))
+	if err == nil || !strings.Contains(err.Error(), "stream message too large") {
+		t.Fatalf("err=%v, want stream message too large", err)
 	}
 }
