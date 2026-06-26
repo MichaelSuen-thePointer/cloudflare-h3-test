@@ -10,6 +10,7 @@ import (
 )
 
 var Magic = [4]byte{'H', '3', 'U', 'R'}
+var StreamMessageMagic = [4]byte{'H', '3', 'U', 'M'}
 var ControlMagic = [4]byte{'H', '3', 'U', 'C'}
 
 const Version byte = 1
@@ -21,6 +22,7 @@ const MaxPayloadFramesPerMessage = (MaxMessageBytes - encodedHeaderBytes) / (enc
 
 const encodedHeaderBytes = 7
 const encodedFrameHeaderBytes = 10
+const encodedStreamMessageHeaderBytes = 9
 const encodedControlHeaderBytes = 8
 
 type Frame struct {
@@ -98,6 +100,45 @@ func DecodeFrames(data []byte) ([]Frame, error) {
 
 func DecodeFramesView(data []byte) ([]Frame, error) {
 	return decodeFrames(data, false)
+}
+
+func WriteStreamMessage(w io.Writer, payload []byte) error {
+	if len(payload) > MaxMessageBytes {
+		return fmt.Errorf("stream message too large: %d > %d", len(payload), MaxMessageBytes)
+	}
+	var hdr [encodedStreamMessageHeaderBytes]byte
+	copy(hdr[:4], StreamMessageMagic[:])
+	hdr[4] = Version
+	binary.BigEndian.PutUint32(hdr[5:9], uint32(len(payload)))
+	if _, err := w.Write(hdr[:]); err != nil {
+		return err
+	}
+	_, err := w.Write(payload)
+	return err
+}
+
+func ReadStreamMessage(r io.Reader) ([]byte, error) {
+	var hdr [encodedStreamMessageHeaderBytes]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, err
+	}
+	var magic [4]byte
+	copy(magic[:], hdr[:4])
+	if magic != StreamMessageMagic {
+		return nil, errors.New("bad stream message magic")
+	}
+	if hdr[4] != Version {
+		return nil, fmt.Errorf("bad stream message version: %d", hdr[4])
+	}
+	n := int(binary.BigEndian.Uint32(hdr[5:9]))
+	if n > MaxMessageBytes {
+		return nil, fmt.Errorf("stream message too large: %d > %d", n, MaxMessageBytes)
+	}
+	payload := make([]byte, n)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
 }
 
 func decodeFrames(data []byte, copyPayload bool) ([]Frame, error) {

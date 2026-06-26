@@ -78,6 +78,135 @@ Use command-line flags for normal configuration. Environment-driven plugin launc
 | `-log-level` | `info` | h3/ws | 诊断日志级别：`debug`、`info`、`warn`、`error`。 |
 | `-use-syslog` | `false` | h3/ws | 将诊断日志写入 syslog；消息体不带程序自有时间戳。 |
 
+### 2.2 h3 参数组合
+
+`-transport h3` 时，每个 UDP client 2 元组创建一个 session：
+
+- 每条 lane 用 HTTP/3 `POST /` 上行和长期 `GET /` 下行。
+- 上行每个 binary message 独立发一个 POST，server 处理完 body 后返回 `204`；client 收到 response 后本次写入才返回。
+- 下行 `GET /` 是长期 streaming response。
+- 关闭用 `DELETE /`。
+- 每个请求带：
+
+```text
+X-Relay-Token: <token>
+X-Relay-Session: <session-id>
+X-Relay-Lane: <lane-id>
+Content-Type: application/octet-stream
+```
+
+h3 相关参数：
+
+| 参数 | 默认值 | 含义 |
+|---|---:|---|
+| `-ws-lanes` | `12` | h3/ws 共用的每 session lane 数。h3 中每条 lane 维护一个 streaming GET，并用同 lane header 发上行 POST。 |
+| `-ws-lanes-incremental` | `false` | h3/ws 共用的增量建 lane 策略。 |
+| `-send-queue` | `4096` | 每 session 上行队列容量；满时 drop oldest。h3 高速测试建议 `65536`。 |
+
+h3 推荐组合：
+
+```powershell
+.\bin\proxy-client.exe `
+  -transport h3 `
+  -ws-lanes 12 `
+  -send-queue 65536 `
+  -http-timeout 15s
+```
+
+适用场景：
+
+- 需要确认 Cloudflare HTTP/3 行为。
+- 不追求低延迟 UDP 语义。
+
+注意：
+
+- UDP payload 先按现有 relay frame 合并成 binary message，再作为完整 h3 POST body 发送；收到 HTTP response 后本次写入完成。
+- `-down-polls` 不再影响 h3；h3 下行改为 streaming GET。
+- 旧 h3 batch POST 的 `-lanes` 参数已移除；`-max-inflight-posts`、`-batch-size`、`-batch-delay` 现在影响 h3/ws 共用 binary lane 发送路径。
+- Cloudflare 侧 HTTP/3 质量差时，h3 模式延迟和抖动会明显变差。
+- server 若开启 `-require-h3=true`，必须依赖 Cloudflare Transform 写入 `X-Client-HTTP-Version: HTTP/3`。
+
+### 2.3 ws 参数组合
+
+`-transport ws` 时，client 启动一个全局 standby WebSocket pool，目标空闲连接数等于 `-ws-lanes`。每个 UDP client 2 元组 session 获取 WebSocket lane，并用 attach 控制帧绑定 session。
+
+WebSocket 握手只带：
+
+```text
+X-Relay-Token: <token>
+```
+
+握手成功后，client 发送 binary attach 控制帧，payload 是 session id。server ack 后，该 WebSocket lane 才进入 session 数据面。
+
+ws 相关参数：
+
+| 参数 | 默认值 | 含义 |
+|---|---:|---|
+| `-ws-lanes` | `12` | 默认策略下每 session 一次性获取的 lane 数；也是 standby pool 目标空闲数。 |
+| `-ws-lanes-incremental` | `false` | 增量策略。初始只拿 1 条 lane，选中 lane 非空闲时后台申请新 lane，最多到 `-ws-lanes`。 |
+| `-ws-lanes-auto` | `false` | 旧队列扩容策略。按 sendQ 深度扩到 `-ws-lanes-max`。 |
+| `-ws-lanes-max` | `4` | `-ws-lanes-auto` 开启时的最大 lane 数；若小于 `-ws-lanes` 会被拉到 `-ws-lanes`。 |
+| `-ws-lanes-upgrade-queue` | `64` | `-ws-lanes-auto` 触发扩容的队列深度。 |
+| `-batch-size` | `3` | 一个 WebSocket binary message 最多合并多少个 UDP 包。 |
+| `-batch-delay` | `1ms` | 等待凑 batch 的最长时间。 |
+| `-max-inflight-posts` | `20` | WebSocket send batch 并发上限，也复用 posts 信号量。 |
+
+互斥规则：
+
+```text
+-ws-lanes-incremental 和 -ws-lanes-auto 不能同时开启
+```
+
+默认全 lane 策略：
+
+```powershell
+.\bin\proxy-client.exe `
+  -transport ws `
+  -ws-lanes 12 `
+  -batch-size 3 `
+  -batch-delay 1ms `
+  -http-timeout 15s
+```
+
+行为：
+
+- session 初始一次性获取 `-ws-lanes` 条 lane。
+- 初始任意 lane 获取失败，session 关闭。
+- 发送时用当前 “RR 起点 + least inflight” 选 lane。
+- 多 lane 时 batch 异步并发写；1 lane 且非 incremental 时同步写。
+
+增量 lane 策略：
+
+```powershell
+.\bin\proxy-client.exe `
+  -transport ws `
+  -ws-lanes 12 `
+  -ws-lanes-incremental `
+  -batch-size 3 `
+  -batch-delay 1ms `
+  -http-timeout 15s
+```
+
+行为：
+
+- session 初始只获取 1 条 lane。
+- 初始 1 条获取失败，session 关闭。
+- 如果发送选中的 lane `inflight > 0`，且 `当前lane数 + 申请中lane数 < ws-lanes`，后台申请 1 条新 lane。
+- 后台申请失败只减少 pending 计数，不关闭 session。
+- 当前包不等待新 lane，仍用已选 lane 发送。
+- incremental 模式下，即使只有 1 lane，也异步发送 batch，以便 inflight 能触发增长。
+
+适用场景：
+
+- 想降低 session 初始建联压力。
+- 可接受 ramp-up 过程里 lane 数不到最大值。
+
+注意：
+
+- 当前增长触发条件是“选中 lane 非空闲”，不是“sendQ 非空”。
+- 如果已有 lane 足够让 least-inflight 经常选到空闲 lane，可能不会增长到 `-ws-lanes`。
+- 之前同 IP 小 sweep 中，全 12 lane 延迟优于 incremental；incremental 主要价值是抗建联失败和降低冷启动压力。
+
 ## 3. proxy-server 参数
 
 ### 3.1 基础参数
@@ -97,6 +226,7 @@ Use command-line flags for normal configuration. Environment-driven plugin launc
 | `-use-syslog` | `false` | 将诊断日志写入 syslog；消息体不带程序自有时间戳。 |
 | `-idle` | `120s` | server session 空闲超时。 |
 | `-udp-buffer` | `4194304` | upstream UDP socket read/write buffer。 |
+| `-down-queue` | `65536` | 每 session 下行 queue 容量；满时 drop oldest。 |
 
 TLS 行为：
 
@@ -135,8 +265,8 @@ h3 模式 server 不通过 `-transport` 区分，而是看 HTTP method：
 
 | Method | 含义 |
 |---|---|
-| `POST /` | 上行 UDP payload，解 frame 后写 upstream。 |
-| `GET /` | 下行 long poll，从 session queue 取 upstream 回包。 |
+| `POST /` | lane 上行请求，body 承载一个完整 binary message，server 处理完后返回 `204`。 |
+| `GET /` | lane 下行 stream，从 session queue 取 upstream 回包并持续写 response body。 |
 | `DELETE /` | 关闭 session。 |
 
 请求必须带：
@@ -144,6 +274,7 @@ h3 模式 server 不通过 `-transport` 区分，而是看 HTTP method：
 ```text
 X-Relay-Token: <token>
 X-Relay-Session: <session-id>
+X-Relay-Lane: <lane-id>
 ```
 
 当 `-require-h3=true` 时，还必须带：
@@ -251,11 +382,8 @@ WebSocket 请求不走 `X-Relay-Session` 握手 header。server 流程：
   -remote https://relay.example.com:2083/ `
   -connect-ip <preferred-cf-ip> `
   -transport h3 `
-  -lanes 4 `
-  -down-polls 2 `
-  -max-inflight-posts 20 `
-  -batch-size 3 `
-  -batch-delay 1ms `
+  -ws-lanes 12 `
+  -send-queue 65536 `
   -http-timeout 15s `
   -token change-me-token
 ```
