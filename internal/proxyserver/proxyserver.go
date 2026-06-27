@@ -42,7 +42,15 @@ type session struct {
 	closed     atomic.Bool
 	closeOnce  sync.Once
 	wsMu       sync.Mutex
-	ws         map[*relay.WebSocketConn]struct{}
+	ws         map[*relay.WebSocketConn]*serverWSLane
+	wsNext     atomic.Int64
+}
+
+type serverWSLane struct {
+	id     int64
+	writes atomic.Int64
+	frames atomic.Int64
+	bytes  atomic.Int64
 }
 
 type server struct {
@@ -222,7 +230,8 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		_ = ws.Close()
 		return
 	}
-	if !sess.addWebSocket(ws) {
+	wsLane, ok := sess.addWebSocket(ws)
+	if !ok {
 		_ = ws.Close()
 		return
 	}
@@ -278,10 +287,13 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 						appLog.WarnRate("server_websocket_write_failed", 10*time.Second, "websocket-write-failed", "session", id, "remote", r.RemoteAddr, "err", err)
 						return
 					}
+					wsLane.observeDownlink(len(frames), len(body))
 					s.observeWSWrite(time.Since(started))
 				} else if err := ws.WriteBinary(body); err != nil {
 					appLog.WarnRate("server_websocket_write_failed", 10*time.Second, "websocket-write-failed", "session", id, "remote", r.RemoteAddr, "err", err)
 					return
+				} else {
+					wsLane.observeDownlink(len(frames), len(body))
 				}
 			case <-r.Context().Done():
 				return
@@ -321,24 +333,8 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handlePost(w http.ResponseWriter, r *http.Request, id string) {
-	sess, err := s.getSession(id)
-	if err != nil {
-		s.countStatus(http.StatusBadGateway)
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	if sess.isClosed() {
-		s.countStatus(http.StatusGone)
-		http.Error(w, "session gone", http.StatusGone)
-		return
-	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, relay.MaxMessageBytes+1))
 	if err != nil {
-		if sess.isClosed() {
-			s.countStatus(http.StatusGone)
-			http.Error(w, "session gone", http.StatusGone)
-			return
-		}
 		s.countStatus(http.StatusRequestEntityTooLarge)
 		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
 		return
@@ -352,6 +348,17 @@ func (s *server) handlePost(w http.ResponseWriter, r *http.Request, id string) {
 	if err != nil {
 		s.countStatus(http.StatusBadRequest)
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	sess, err := s.getSession(id)
+	if err != nil {
+		s.countStatus(http.StatusBadGateway)
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	if sess.isClosed() {
+		s.countStatus(http.StatusGone)
+		http.Error(w, "session gone", http.StatusGone)
 		return
 	}
 	for _, f := range frames {
@@ -468,7 +475,7 @@ func (s *server) getSession(id string) (*session, error) {
 	if queueCap < 1 {
 		queueCap = 65536
 	}
-	sess := &session{id: id, udp: udp, queue: make(chan relay.Frame, queueCap), done: make(chan struct{}), touchEvery: touchInterval(s.idle), ws: make(map[*relay.WebSocketConn]struct{})}
+	sess := &session{id: id, udp: udp, queue: make(chan relay.Frame, queueCap), done: make(chan struct{}), touchEvery: touchInterval(s.idle), ws: make(map[*relay.WebSocketConn]*serverWSLane)}
 	sess.touch()
 	s.sessions[id] = sess
 	s.countSessionMade()
@@ -549,9 +556,11 @@ func (s *server) snapshot() map[string]any {
 	active := len(s.sessions)
 	queueDepth := 0
 	queueCapacity := 0
+	wsLanes := []map[string]any{}
 	for _, sess := range s.sessions {
 		queueDepth += len(sess.queue)
 		queueCapacity += cap(sess.queue)
+		wsLanes = append(wsLanes, sess.wsSnapshots()...)
 	}
 	s.mu.Unlock()
 	return map[string]any{
@@ -584,6 +593,7 @@ func (s *server) snapshot() map[string]any {
 		"queue_wait_count":  s.stats.queueWaitCount.Load(),
 		"ws_write_max_ms":   float64(s.stats.wsWriteMaxUS.Load()) / 1000,
 		"ws_write_count":    s.stats.wsWriteCount.Load(),
+		"ws_lanes":          wsLanes,
 	}
 }
 
@@ -779,23 +789,50 @@ func (s *session) isClosed() bool {
 	return s.closed.Load()
 }
 
-func (s *session) addWebSocket(ws *relay.WebSocketConn) bool {
+func (s *session) addWebSocket(ws *relay.WebSocketConn) (*serverWSLane, bool) {
 	if s.isClosed() {
-		return false
+		return nil, false
 	}
 	s.wsMu.Lock()
 	defer s.wsMu.Unlock()
 	if s.isClosed() {
-		return false
+		return nil, false
 	}
-	s.ws[ws] = struct{}{}
-	return true
+	ln := &serverWSLane{id: s.wsNext.Add(1)}
+	s.ws[ws] = ln
+	return ln, true
 }
 
 func (s *session) removeWebSocket(ws *relay.WebSocketConn) {
 	s.wsMu.Lock()
 	delete(s.ws, ws)
 	s.wsMu.Unlock()
+}
+
+func (s *session) wsSnapshots() []map[string]any {
+	s.wsMu.Lock()
+	lanes := make([]*serverWSLane, 0, len(s.ws))
+	for _, ln := range s.ws {
+		lanes = append(lanes, ln)
+	}
+	s.wsMu.Unlock()
+	out := make([]map[string]any, 0, len(lanes))
+	for _, ln := range lanes {
+		out = append(out, map[string]any{
+			"session": s.id,
+			"lane":    ln.id,
+			"writes":  ln.writes.Load(),
+			"frames":  ln.frames.Load(),
+			"bytes":   ln.bytes.Load(),
+		})
+	}
+	return out
+}
+
+func (l *serverWSLane) observeDownlink(frames, bytes int) {
+	l.writes.Add(1)
+	l.frames.Add(int64(frames))
+	l.bytes.Add(int64(bytes))
 }
 
 func (s *session) readLoop(parent *server) {

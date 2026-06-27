@@ -46,6 +46,7 @@ func TestEnsureWebSocketLanesDoesNotAppendAfterClose(t *testing.T) {
 		ready:  make(chan struct{}),
 		posts:  make(chan struct{}, 1),
 		sendQ:  make(chan []byte, 1),
+		batchQ: make(chan []relay.Frame, 1),
 	}
 	c := &clientState{
 		remote:  "http://" + ln.Addr().String() + "/",
@@ -234,7 +235,7 @@ func TestEnsureWebSocketLanesClosesSuccessfulLaneAfterParallelFailure(t *testing
 	}
 }
 
-func TestIncrementalWebSocketLaneAddsLaneWhenSelectedLaneBusy(t *testing.T) {
+func TestIncrementalWebSocketLaneAddsLaneWhenBatchQueueBacklogged(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -252,6 +253,7 @@ func TestIncrementalWebSocketLaneAddsLaneWhenSelectedLaneBusy(t *testing.T) {
 		ready:  make(chan struct{}),
 		posts:  make(chan struct{}, 1),
 		sendQ:  make(chan []byte, 1),
+		batchQ: make(chan []relay.Frame, 1),
 	}
 	c := &clientState{
 		remote:             "http://" + ln.Addr().String() + "/",
@@ -262,13 +264,12 @@ func TestIncrementalWebSocketLaneAddsLaneWhenSelectedLaneBusy(t *testing.T) {
 	}
 	sess.state = c
 	sess.wsMode = true
-	if err := c.ensureWebSocketLanes(sess, 1); err != nil {
-		t.Fatal(err)
-	}
+	sess.ws = append(sess.ws, &wsLane{index: 0})
+	publishTestWSSnapshot(sess)
 	defer sess.close()
-	sess.ws[0].inflight.Add(1)
+	sess.batchQ <- []relay.Frame{{PacketID: 1, Payload: []byte("backlog")}}
 
-	sess.sendFrameChunk([]relay.Frame{{PacketID: 1, Payload: []byte("hello")}})
+	sess.maybeAcquireIncrementalWebSocketLane()
 
 	deadline := time.After(time.Second)
 	for {
@@ -328,6 +329,7 @@ func TestIncrementalWebSocketLaneAcquireFailureKeepsSession(t *testing.T) {
 		ready:  make(chan struct{}),
 		posts:  make(chan struct{}, 1),
 		sendQ:  make(chan []byte, 1),
+		batchQ: make(chan []relay.Frame, 1),
 	}
 	defer sess.close()
 	c := &clientState{
@@ -341,6 +343,7 @@ func TestIncrementalWebSocketLaneAcquireFailureKeepsSession(t *testing.T) {
 	sess.wsMode = true
 	sess.ws = append(sess.ws, &wsLane{index: 0})
 	publishTestWSSnapshot(sess)
+	sess.batchQ <- []relay.Frame{{PacketID: 1, Payload: []byte("backlog")}}
 
 	sess.maybeAcquireIncrementalWebSocketLane()
 
@@ -388,7 +391,7 @@ func TestIncrementalWebSocketLaneDoesNotReservePastMax(t *testing.T) {
 	}
 }
 
-func TestPickWebSocketLaneUsesSnapshotAndSkipsClosed(t *testing.T) {
+func TestFirstOpenWebSocketLaneUsesSnapshotAndSkipsClosed(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sess := &session{
@@ -405,7 +408,7 @@ func TestPickWebSocketLaneUsesSnapshotAndSkipsClosed(t *testing.T) {
 	sess.ws = append(sess.ws, closedLane, openLane)
 	publishTestWSSnapshot(sess)
 
-	got, _ := sess.pickWSLane()
+	got := sess.firstOpenWSLane()
 	if got != openLane {
 		t.Fatalf("picked lane=%v, want open lane", got)
 	}
@@ -432,7 +435,7 @@ func TestWebSocketSnapshotReplacePublishesNewLane(t *testing.T) {
 
 	oldLane.closed.Store(true)
 	sess.notifyWSChanged()
-	if got, _ := sess.pickWSLane(); got != nil {
+	if got := sess.firstOpenWSLane(); got != nil {
 		t.Fatalf("picked closed old lane=%v, want nil", got)
 	}
 
@@ -441,36 +444,79 @@ func TestWebSocketSnapshotReplacePublishesNewLane(t *testing.T) {
 	sess.publishWSSnapshotLocked()
 	sess.wsMu.Unlock()
 	sess.notifyWSChanged()
-	got, _ := sess.pickWSLane()
+	got := sess.firstOpenWSLane()
 	if got != newLane {
 		t.Fatalf("picked lane=%v, want replacement", got)
 	}
 }
 
-func TestWaitForWebSocketLaneWakesOnChange(t *testing.T) {
+func TestEnqueueFrameBatchDropOldestCountsDroppedFrames(t *testing.T) {
+	ch := make(chan []relay.Frame, 1)
+	ch <- []relay.Frame{
+		{PacketID: 1, Payload: []byte("a")},
+		{PacketID: 2, Payload: []byte("b")},
+	}
+	dropped := enqueueFrameBatchDropOldest(ch, []relay.Frame{{PacketID: 3, Payload: []byte("c")}})
+	if dropped != 2 {
+		t.Fatalf("dropped=%d, want 2", dropped)
+	}
+	got := <-ch
+	if len(got) != 1 || got[0].PacketID != 3 {
+		t.Fatalf("queue=%v, want replacement batch packet 3", got)
+	}
+}
+
+func TestWebSocketBacklogPacketsIncludesBatchQueue(t *testing.T) {
+	sess := &session{
+		state:  &clientState{batchSize: 3},
+		sendQ:  make(chan []byte, 4),
+		batchQ: make(chan []relay.Frame, 4),
+	}
+	sess.sendQ <- []byte("raw")
+	sess.batchQ <- []relay.Frame{{PacketID: 1}, {PacketID: 2}, {PacketID: 3}}
+	sess.batchQ <- []relay.Frame{{PacketID: 4}}
+
+	if got := sess.wsBacklogPackets(); got != 7 {
+		t.Fatalf("wsBacklogPackets=%d, want 7", got)
+	}
+}
+
+func TestWebSocketWriteBatchReturnsBatchWhenLaneClosesWhileWaitingForPostSlot(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sess := &session{
-		id:        "test-session",
-		ctx:       ctx,
-		cancel:    cancel,
-		closed:    make(chan struct{}),
-		wsChanged: make(chan struct{}, 1),
+		id:     "test-session",
+		ctx:    ctx,
+		cancel: cancel,
+		closed: make(chan struct{}),
+		posts:  make(chan struct{}, 1),
+		batchQ: make(chan []relay.Frame, 1),
 	}
-	defer sess.close()
-	ln := &wsLane{index: 0}
+	sess.posts <- struct{}{}
+	ln := newWSLane(0, nil)
+	frames := []relay.Frame{{PacketID: 1, Payload: []byte("payload")}}
+	done := make(chan struct{})
 	go func() {
-		time.Sleep(20 * time.Millisecond)
-		sess.wsMu.Lock()
-		sess.ws = append(sess.ws, ln)
-		sess.publishWSSnapshotLocked()
-		sess.wsMu.Unlock()
-		sess.notifyWSChanged()
+		defer close(done)
+		sess.writeBatchOnLane(&clientState{}, ln, frames)
 	}()
 
-	got, _ := sess.waitForWSLane(time.Second)
-	if got != ln {
-		t.Fatalf("waitForWSLane returned %v, want lane", got)
+	ln.closed.Store(true)
+	ln.closeWorker()
+	<-sess.posts
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("writeBatchOnLane did not return after lane close")
+	}
+	select {
+	case got := <-sess.batchQ:
+		if len(got) != 1 || got[0].PacketID != 1 {
+			t.Fatalf("returned batch=%v, want packet 1", got)
+		}
+	default:
+		t.Fatal("batch was not returned after lane close")
 	}
 }
 
