@@ -45,7 +45,8 @@ type lane struct {
 type wsLane struct {
 	index        int
 	conn         relay.BinaryConn
-	inflight     atomic.Int64
+	done         chan struct{}
+	doneOnce     sync.Once
 	requests     atomic.Int64
 	posts        atomic.Int64
 	postOK       atomic.Int64
@@ -57,6 +58,17 @@ type wsLane struct {
 
 type wsLaneSnapshot struct {
 	lanes []*wsLane
+}
+
+func newWSLane(index int, conn relay.BinaryConn) *wsLane {
+	return &wsLane{index: index, conn: conn, done: make(chan struct{})}
+}
+
+func (ln *wsLane) closeWorker() {
+	if ln == nil || ln.done == nil {
+		return
+	}
+	ln.doneOnce.Do(func() { close(ln.done) })
 }
 
 type session struct {
@@ -88,6 +100,7 @@ type session struct {
 	metrics    bool
 	posts      chan struct{}
 	sendQ      chan []byte
+	batchQ     chan []relay.Frame
 	wsNext     atomic.Uint64
 }
 
@@ -399,7 +412,7 @@ func (c *clientState) getSession(peer *net.UDPAddr) *session {
 	}
 	id := randomID()
 	ctx, cancel := context.WithCancel(context.Background())
-	sess := &session{id: id, peer: peer, remote: c.remote, token: c.token, state: c, ctx: ctx, cancel: cancel, closed: make(chan struct{}), ready: make(chan struct{}), wsChanged: make(chan struct{}, 1), lastActive: atomic.Int64{}, touchEvery: touchInterval(c.idle), stats: c.stats, metrics: c.metrics, posts: make(chan struct{}, c.maxInflightPosts), sendQ: make(chan []byte, c.sendQueue)}
+	sess := &session{id: id, peer: peer, remote: c.remote, token: c.token, state: c, ctx: ctx, cancel: cancel, closed: make(chan struct{}), ready: make(chan struct{}), wsChanged: make(chan struct{}, 1), lastActive: atomic.Int64{}, touchEvery: touchInterval(c.idle), stats: c.stats, metrics: c.metrics, posts: make(chan struct{}, c.maxInflightPosts), sendQ: make(chan []byte, c.sendQueue), batchQ: make(chan []relay.Frame, c.sendQueue)}
 	sess.touch()
 	if c.transport == "ws" || c.transport == "h3" {
 		sess.wsMode = true
@@ -530,7 +543,7 @@ func (c *clientState) ensureWebSocketLanes(sess *session, target int) error {
 				errCh <- errSessionClosed
 				return
 			}
-			wsLanes[pos] = &wsLane{index: index, conn: ws}
+			wsLanes[pos] = newWSLane(index, ws)
 			errCh <- nil
 		}(i, index)
 	}
@@ -566,6 +579,7 @@ func (c *clientState) ensureWebSocketLanes(sess *session, target int) error {
 		c.countTransport()
 		sess.ws = append(sess.ws, ln)
 		sess.goRun(func() { sess.wsReadLoop(c, ln) })
+		sess.goRun(func() { sess.wsWriteLoop(c, ln) })
 	}
 	sess.publishWSSnapshotLocked()
 	sess.wsMu.Unlock()
@@ -575,6 +589,9 @@ func (c *clientState) ensureWebSocketLanes(sess *session, target int) error {
 
 func (s *session) maybeAcquireIncrementalWebSocketLane() {
 	if !s.wsMode || s.state == nil || !s.state.wsLanesIncremental || s.state.wsLanesN <= 1 {
+		return
+	}
+	if s.batchQ == nil || len(s.batchQ) == 0 {
 		return
 	}
 	if !s.reservePendingWebSocketLane(s.state.wsLanesN) {
@@ -599,7 +616,7 @@ func (s *session) maybeAcquireIncrementalWebSocketLane() {
 		var ln *wsLane
 		s.wsMu.Lock()
 		if !s.isClosed() && len(s.ws) < s.state.wsLanesN {
-			ln = &wsLane{index: s.nextWSLaneIndexLocked(), conn: ws}
+			ln = newWSLane(s.nextWSLaneIndexLocked(), ws)
 			s.ws = append(s.ws, ln)
 			s.publishWSSnapshotLocked()
 		}
@@ -611,6 +628,7 @@ func (s *session) maybeAcquireIncrementalWebSocketLane() {
 		s.notifyWSChanged()
 		s.state.countTransport()
 		s.goRun(func() { s.wsReadLoop(s.state, ln) })
+		s.goRun(func() { s.wsWriteLoop(s.state, ln) })
 		appLog.Info("websocket-lanes-incremental", "session", s.id, "lanes", s.wsCount())
 	}) {
 		s.wsPending.Add(-1)
@@ -709,11 +727,7 @@ func (s *session) sendLoop(batchSize int, batchDelay time.Duration) {
 				default:
 				}
 			}
-			if s.shouldSendBatchSync() {
-				s.sendBatch(batch)
-			} else {
-				s.goRun(func() { s.sendBatch(batch) })
-			}
+			s.sendBatch(batch)
 		}
 	}
 }
@@ -731,7 +745,7 @@ func (s *session) maybeScaleWebSocketLanes() {
 	default:
 		return
 	}
-	if len(s.sendQ) < s.state.wsLanesUpgradeQueue || s.wsCount() >= s.state.wsLanesMax {
+	if s.wsBacklogPackets() < s.state.wsLanesUpgradeQueue || s.wsCount() >= s.state.wsLanesMax {
 		return
 	}
 	if !s.wsScaling.CompareAndSwap(false, true) {
@@ -760,6 +774,18 @@ func (s *session) wsScaleLoop() {
 			s.maybeScaleWebSocketLanes()
 		}
 	}
+}
+
+func (s *session) wsBacklogPackets() int {
+	backlog := len(s.sendQ)
+	if s.batchQ != nil {
+		batchSize := 1
+		if s.state != nil && s.state.batchSize > 1 {
+			batchSize = s.state.batchSize
+		}
+		backlog += len(s.batchQ) * batchSize
+	}
+	return backlog
 }
 
 func (s *session) wsCount() int {
@@ -831,6 +857,7 @@ func (s *session) close() {
 		s.wsMu.Unlock()
 		s.notifyWSChanged()
 		for _, ln := range wsLanes {
+			ln.closeWorker()
 			if ln.conn != nil {
 				_ = ln.conn.Close()
 			}
@@ -883,6 +910,45 @@ func (s *session) sendBatch(frames []relay.Frame) {
 			return
 		}
 	}
+	if s.shouldSendBatchSync() {
+		s.writeBatchSync(frames)
+		return
+	}
+	s.enqueueBatch(frames)
+	s.maybeAcquireIncrementalWebSocketLane()
+}
+
+func (s *session) enqueueBatch(frames []relay.Frame) {
+	if len(frames) == 0 || s.batchQ == nil {
+		return
+	}
+	dropped := enqueueFrameBatchDropOldest(s.batchQ, frames)
+	s.countQueueDrops(dropped)
+}
+
+func enqueueFrameBatchDropOldest(ch chan []relay.Frame, frames []relay.Frame) int {
+	select {
+	case ch <- frames:
+		return 0
+	default:
+	}
+
+	dropped := 0
+	select {
+	case old := <-ch:
+		dropped = len(old)
+	default:
+	}
+
+	select {
+	case ch <- frames:
+		return dropped
+	default:
+		return dropped + len(frames)
+	}
+}
+
+func (s *session) writeBatchSync(frames []relay.Frame) {
 	select {
 	case <-s.ctx.Done():
 		return
@@ -898,49 +964,116 @@ func (s *session) sendBatch(frames []relay.Frame) {
 		return
 	}
 	for _, chunk := range chunks {
-		s.sendFrameChunk(chunk)
-	}
-}
-
-func (s *session) sendFrameChunk(frames []relay.Frame) {
-	if s.isClosed() {
-		return
-	}
-	body, err := relay.EncodeFrames(frames)
-	if err != nil {
-		appLog.Error("frame-encode-failed", "session", s.id, "err", err)
-		return
-	}
-	if s.wsCount() > 0 {
-		ln, selectedInflight := s.waitForWSLane(s.state.timeout)
+		ln := s.firstOpenWSLane()
 		if ln == nil {
 			appLog.WarnRate("websocket_lane_unavailable", 10*time.Second, "websocket-lane-unavailable", "session", s.id)
 			return
 		}
-		if selectedInflight > 0 {
-			s.maybeAcquireIncrementalWebSocketLane()
+		s.writeFrameChunk(ln, chunk)
+	}
+}
+
+func (s *session) wsWriteLoop(c *clientState, ln *wsLane) {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-s.closed:
+			return
+		case <-ln.done:
+			return
+		case frames := <-s.batchQ:
+			if ln.closed.Load() {
+				s.returnBatch(frames)
+				return
+			}
+			s.writeBatchOnLane(c, ln, frames)
+			if ln.closed.Load() {
+				return
+			}
 		}
-		ln.inflight.Add(int64(len(body)))
-		s.countWSPostStart(ln)
-		s.countUDPInFrames(frames)
-		defer ln.inflight.Add(-int64(len(body)))
-		defer s.countWSRequestDone(ln)
-		if err := ln.conn.WriteBinaryOwned(body); err != nil {
-			s.countWSPostError(ln)
-			ln.closed.Store(true)
-			s.notifyWSChanged()
-			s.goRun(func() { s.reconnectWebSocketLane(s.state, ln) })
-			appLog.WarnRate("websocket_write_failed", 10*time.Second, "websocket-write-failed", "session", s.id, "lane", ln.index, "err", err)
+	}
+}
+
+func (s *session) returnBatch(frames []relay.Frame) {
+	select {
+	case <-s.ctx.Done():
+		return
+	case <-s.closed:
+		return
+	default:
+	}
+	s.enqueueBatch(frames)
+}
+
+func (s *session) writeBatchOnLane(c *clientState, ln *wsLane, frames []relay.Frame) {
+	select {
+	case <-s.ctx.Done():
+		return
+	case <-s.closed:
+		return
+	case <-ln.done:
+		s.returnBatch(frames)
+		return
+	case s.posts <- struct{}{}:
+	}
+	defer func() { <-s.posts }()
+
+	if ln.closed.Load() {
+		s.returnBatch(frames)
+		return
+	}
+	select {
+	case <-ln.done:
+		s.returnBatch(frames)
+		return
+	default:
+	}
+
+	chunks, err := relay.SplitFramesByEncodedLimit(frames, relay.MaxMessageBytes)
+	if err != nil {
+		appLog.Error("frame-split-failed", "session", s.id, "err", err)
+		return
+	}
+	for _, chunk := range chunks {
+		if !s.writeFrameChunk(ln, chunk) {
 			return
 		}
-		s.countWSPostOK(ln)
-		return
 	}
-	if s.wsMode {
-		appLog.WarnRate("websocket_lane_unavailable", 10*time.Second, "websocket-lane-unavailable", "session", s.id)
-		return
+}
+
+func (s *session) writeFrameChunk(ln *wsLane, frames []relay.Frame) bool {
+	if s.isClosed() {
+		return false
 	}
-	appLog.WarnRate("unexpected_send_frame_chunk", 10*time.Second, "unexpected-send-frame-chunk", "session", s.id, "frames", len(frames), "bytes", len(body))
+	body, err := relay.EncodeFrames(frames)
+	if err != nil {
+		appLog.Error("frame-encode-failed", "session", s.id, "err", err)
+		return false
+	}
+	s.countWSPostStart(ln)
+	s.countUDPInFrames(frames)
+	defer s.countWSRequestDone(ln)
+	if err := ln.conn.WriteBinaryOwned(body); err != nil {
+		s.countWSPostError(ln)
+		ln.closed.Store(true)
+		ln.closeWorker()
+		s.notifyWSChanged()
+		s.goRun(func() { s.reconnectWebSocketLane(s.state, ln) })
+		appLog.WarnRate("websocket_write_failed", 10*time.Second, "websocket-write-failed", "session", s.id, "lane", ln.index, "err", err)
+		return false
+	}
+	s.countWSPostOK(ln)
+	return true
+}
+
+func (s *session) firstOpenWSLane() *wsLane {
+	for _, ln := range s.currentWSSnapshot() {
+		if !ln.closed.Load() {
+			return ln
+		}
+	}
+	return nil
 }
 
 func (s *session) wsReadLoop(c *clientState, ln *wsLane) {
@@ -955,6 +1088,7 @@ func (s *session) wsReadLoop(c *clientState, ln *wsLane) {
 			}
 			s.countWSReadError(ln)
 			ln.closed.Store(true)
+			ln.closeWorker()
 			s.notifyWSChanged()
 			s.goRun(func() { s.reconnectWebSocketLane(c, ln) })
 			appLog.WarnRate("websocket_read_failed", 10*time.Second, "websocket-read-failed", "session", s.id, "lane", ln.index, "err", err)
@@ -978,6 +1112,7 @@ func (s *session) reconnectWebSocketLane(c *clientState, old *wsLane) {
 	if !old.reconnecting.CompareAndSwap(false, true) {
 		return
 	}
+	old.closeWorker()
 	_ = old.conn.Close()
 	for {
 		select {
@@ -1008,7 +1143,7 @@ func (s *session) reconnectWebSocketLane(c *clientState, old *wsLane) {
 			_ = ws.Close()
 			return
 		}
-		ln := &wsLane{index: old.index, conn: ws}
+		ln := newWSLane(old.index, ws)
 		replaced := false
 		s.wsMu.Lock()
 		if !s.isClosed() {
@@ -1032,50 +1167,10 @@ func (s *session) reconnectWebSocketLane(c *clientState, old *wsLane) {
 		c.countTransport()
 		c.countReconnect()
 		s.goRun(func() { s.wsReadLoop(c, ln) })
+		s.goRun(func() { s.wsWriteLoop(c, ln) })
 		appLog.Info("websocket-lane-reconnected", "session", s.id, "lane", old.index)
 		return
 	}
-}
-
-func (s *session) waitForWSLane(timeout time.Duration) (*wsLane, int64) {
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	for {
-		if ln, inflight := s.pickWSLane(); ln != nil {
-			return ln, inflight
-		}
-		select {
-		case <-s.ctx.Done():
-			return nil, 0
-		case <-s.closed:
-			return nil, 0
-		case <-s.wsChanged:
-		case <-timer.C:
-			return nil, 0
-		}
-	}
-}
-
-func (s *session) pickWSLane() (*wsLane, int64) {
-	lanes := s.currentWSSnapshot()
-	if len(lanes) == 0 {
-		return nil, 0
-	}
-	start := int(s.wsNext.Add(1)-1) % len(lanes)
-	var best *wsLane
-	var bestInflight int64
-	for i := 0; i < len(lanes); i++ {
-		ln := lanes[(start+i)%len(lanes)]
-		if ln.closed.Load() {
-			continue
-		}
-		inflight := ln.inflight.Load()
-		if best == nil || inflight < bestInflight {
-			best = ln
-			bestInflight = inflight
-		}
-	}
-	return best, bestInflight
 }
 
 func (s *session) pollLoop(c *clientState, ln *lane) {
@@ -1178,19 +1273,21 @@ func (c *clientState) snapshot() map[string]any {
 	for _, sess := range sessions {
 		sendQueueDepth += len(sess.sendQ)
 		sendQueueCapacity += cap(sess.sendQ)
+		if sess.batchQ != nil {
+			sendQueueDepth += len(sess.batchQ)
+			sendQueueCapacity += cap(sess.batchQ)
+		}
 		sess.wsMu.Lock()
 		wsLanes := append([]*wsLane(nil), sess.ws...)
 		sess.wsMu.Unlock()
 		for _, ln := range wsLanes {
-			b := ln.inflight.Load()
 			r := ln.requests.Load()
-			inflightBytes += b
 			inflightRequests += r
 			lanes = append(lanes, map[string]any{
 				"session":           sess.id,
 				"direction":         "ws",
 				"lane":              ln.index,
-				"inflight_bytes":    b,
+				"inflight_bytes":    int64(0),
 				"inflight_requests": r,
 				"post_started":      ln.posts.Load(),
 				"post_ok":           ln.postOK.Load(),

@@ -21,7 +21,7 @@ func TestHandlePostClosedSessionReturnsGone(t *testing.T) {
 		id:    "closed-session",
 		queue: make(chan relay.Frame, 1),
 		done:  make(chan struct{}),
-		ws:    make(map[*relay.WebSocketConn]struct{}),
+		ws:    make(map[*relay.WebSocketConn]*serverWSLane),
 	}
 	s.sessions[sess.id] = sess
 	sess.close()
@@ -48,7 +48,7 @@ func TestHandleGetClosedSessionWithQueuedPacketReturnsGone(t *testing.T) {
 		id:    "closed-session",
 		queue: make(chan relay.Frame, 1),
 		done:  make(chan struct{}),
-		ws:    make(map[*relay.WebSocketConn]struct{}),
+		ws:    make(map[*relay.WebSocketConn]*serverWSLane),
 	}
 	sess.queue <- relay.Frame{Payload: []byte("stale")}
 	s.sessions[sess.id] = sess
@@ -60,6 +60,30 @@ func TestHandleGetClosedSessionWithQueuedPacketReturnsGone(t *testing.T) {
 
 	if rec.Code != http.StatusGone {
 		t.Fatalf("status=%d, want %d", rec.Code, http.StatusGone)
+	}
+}
+
+func TestServerSnapshotIncludesWebSocketLaneDownlinkStats(t *testing.T) {
+	s := &server{sessions: map[string]*session{}}
+	sess := &session{
+		id:    "session-1",
+		queue: make(chan relay.Frame, 1),
+		done:  make(chan struct{}),
+		ws:    make(map[*relay.WebSocketConn]*serverWSLane),
+	}
+	ln := &serverWSLane{id: 3}
+	ln.observeDownlink(2, 128)
+	sess.ws[nil] = ln
+	s.sessions[sess.id] = sess
+
+	snap := s.snapshot()
+	lanes, ok := snap["ws_lanes"].([]map[string]any)
+	if !ok || len(lanes) != 1 {
+		t.Fatalf("ws_lanes=%#v, want one lane", snap["ws_lanes"])
+	}
+	got := lanes[0]
+	if got["session"] != "session-1" || got["lane"] != int64(3) || got["writes"] != int64(1) || got["frames"] != int64(2) || got["bytes"] != int64(128) {
+		t.Fatalf("lane stats=%#v, want session/lane/writes/frames/bytes", got)
 	}
 }
 
@@ -101,8 +125,8 @@ func TestHandlePostBadFrameReturnsBadRequest(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d, want %d", rec.Code, http.StatusBadRequest)
 	}
-	if got := len(s.sessions); got != 1 {
-		t.Fatalf("sessions=%d, want 1", got)
+	if got := len(s.sessions); got != 0 {
+		t.Fatalf("sessions=%d, want 0", got)
 	}
 }
 
