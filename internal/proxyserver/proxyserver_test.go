@@ -196,6 +196,39 @@ func TestServerExpandHintQueuedWhenBatchBacklogged(t *testing.T) {
 	}
 }
 
+func TestServerExpandHintLoopNotStartedWhenMaxLaneOne(t *testing.T) {
+	sess := &session{
+		id:     "hint-session",
+		queue:  make(chan relay.Frame, 1),
+		batchQ: make(chan []relay.Frame, 2),
+		done:   make(chan struct{}),
+		ws:     make(map[*relay.WebSocketConn]*serverWSLane),
+	}
+	defer close(sess.done)
+	sess.ws[nil] = &serverWSLane{id: 1}
+	sess.batchQ <- []relay.Frame{{PacketID: 1}}
+	sess.batchQ <- []relay.Frame{{PacketID: 2}}
+
+	sess.startExpandHintLoop(&server{downExpandLanesMax: 1, downExpandHintTimeout: 15 * time.Second})
+	time.Sleep(30 * time.Millisecond)
+	if sess.expandHintPending.Load() {
+		t.Fatal("expandHintPending=true, want false with max lane 1")
+	}
+
+	sess.startExpandHintLoop(&server{downExpandLanesMax: 2, downExpandHintTimeout: 15 * time.Second})
+	deadline := time.After(time.Second)
+	for {
+		if sess.expandHintPending.Load() {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("expand hint loop did not start after max lane increased")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 func TestServerExpandHintNotQueuedForSingleBatch(t *testing.T) {
 	s := &server{metrics: true, downExpandLanesMax: 2, downExpandHintTimeout: 15 * time.Second}
 	sess := &session{

@@ -463,6 +463,9 @@ func (sess *session) startDownBatchLoop(parent *server) {
 }
 
 func (sess *session) startExpandHintLoop(parent *server) {
+	if parent.downExpandLanesMax <= 1 {
+		return
+	}
 	sess.expandHintOnce.Do(func() {
 		go sess.expandHintLoop(parent)
 	})
