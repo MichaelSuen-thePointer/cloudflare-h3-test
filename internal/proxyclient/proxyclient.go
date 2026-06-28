@@ -72,36 +72,36 @@ func (ln *wsLane) closeWorker() {
 }
 
 type session struct {
-	id         string
-	peer       *net.UDPAddr
-	remote     string
-	token      string
-	state      *clientState
-	ws         []*wsLane
-	wsMode     bool
-	ready      chan struct{}
-	wsMu       sync.Mutex
-	wsSnapshot atomic.Pointer[wsLaneSnapshot]
-	wsChanged  chan struct{}
-	wsScaling  atomic.Bool
-	wsPending  atomic.Int64
-	up         []*lane
-	down       []*lane
-	next       atomic.Uint64
-	ctx        context.Context
-	cancel     context.CancelFunc
-	closed     chan struct{}
-	lastActive atomic.Int64
-	touchEvery time.Duration
-	closeOnce  sync.Once
-	wgMu       sync.Mutex
-	wg         sync.WaitGroup
-	stats      *clientStats
-	metrics    bool
-	posts      chan struct{}
-	sendQ      chan []byte
-	batchQ     chan []relay.Frame
-	wsNext     atomic.Uint64
+	id                string
+	peer              *net.UDPAddr
+	remote            string
+	token             string
+	state             *clientState
+	ws                []*wsLane
+	wsMode            bool
+	ready             chan struct{}
+	wsMu              sync.Mutex
+	wsSnapshot        atomic.Pointer[wsLaneSnapshot]
+	wsChanged         chan struct{}
+	wsPending         atomic.Int64
+	expandHintPending atomic.Bool
+	up                []*lane
+	down              []*lane
+	next              atomic.Uint64
+	ctx               context.Context
+	cancel            context.CancelFunc
+	closed            chan struct{}
+	lastActive        atomic.Int64
+	touchEvery        time.Duration
+	closeOnce         sync.Once
+	wgMu              sync.Mutex
+	wg                sync.WaitGroup
+	stats             *clientStats
+	metrics           bool
+	posts             chan struct{}
+	sendQ             chan []byte
+	batchQ            chan []relay.Frame
+	wsNext            atomic.Uint64
 }
 
 var (
@@ -111,8 +111,8 @@ var (
 
 func Main(args []string) {
 	var listen, remote, token, connectIP, metricsOut, transport, logLevel string
-	var wsLanesN, wsLanesMax, wsLanesUpgradeQueue, polls, maxInflightPosts, batchSize, sendQueue int
-	var wsLanesAuto, wsLanesIncremental, metrics, useSyslog bool
+	var wsLanesN, polls, maxInflightPosts, batchSize, sendQueue int
+	var wsLanesIncremental, metrics, useSyslog bool
 	var timeout, metricsInterval, batchDelay, idle time.Duration
 	fs := flag.NewFlagSet("proxy-client", flag.ExitOnError)
 	fs.StringVar(&listen, "listen", "127.0.0.1:15353", "local UDP listen address")
@@ -121,10 +121,7 @@ func Main(args []string) {
 	fs.StringVar(&connectIP, "connect-ip", "", "optional Cloudflare edge IP to connect to instead of DNS")
 	fs.StringVar(&transport, "transport", "ws", "relay transport: ws or h3")
 	fs.IntVar(&wsLanesN, "ws-lanes", 12, "WebSocket lanes")
-	fs.BoolVar(&wsLanesAuto, "ws-lanes-auto", false, "automatically add WebSocket lanes when UDP queue builds up")
-	fs.BoolVar(&wsLanesIncremental, "ws-lanes-incremental", false, "start WebSocket sessions with one lane and add lanes when selected lane is busy")
-	fs.IntVar(&wsLanesMax, "ws-lanes-max", 4, "maximum WebSocket lanes when auto lane scaling is enabled")
-	fs.IntVar(&wsLanesUpgradeQueue, "ws-lanes-upgrade-queue", 64, "queued UDP packets needed before auto WebSocket lane scaling")
+	fs.BoolVar(&wsLanesIncremental, "ws-lanes-incremental", false, "start WebSocket sessions with one lane and add lanes when batch queue backs up")
 	fs.IntVar(&polls, "down-polls", 2, "downlink long-poll workers")
 	fs.IntVar(&maxInflightPosts, "max-inflight-posts", 20, "maximum in-flight POST requests per session")
 	fs.IntVar(&batchSize, "batch-size", 3, "maximum UDP packets per POST")
@@ -167,17 +164,8 @@ func Main(args []string) {
 	if transport != "ws" && transport != "h3" {
 		log.Fatalf("invalid -transport %q: expected ws or h3", transport)
 	}
-	if wsLanesIncremental && wsLanesAuto {
-		log.Fatal("-ws-lanes-incremental and -ws-lanes-auto are mutually exclusive")
-	}
 	if wsLanesN < 1 {
 		wsLanesN = 1
-	}
-	if wsLanesMax < wsLanesN {
-		wsLanesMax = wsLanesN
-	}
-	if wsLanesUpgradeQueue < 1 {
-		wsLanesUpgradeQueue = 1
 	}
 	if maxInflightPosts < 1 {
 		maxInflightPosts = 1
@@ -207,7 +195,7 @@ func Main(args []string) {
 
 	metrics = metrics || metricsOut != ""
 	stats := &clientStats{started: time.Now()}
-	state := &clientState{remote: remote, token: token, connectIP: connectIP, transport: transport, wsLanesN: wsLanesN, wsLanesAuto: wsLanesAuto, wsLanesIncremental: wsLanesIncremental, wsLanesMax: wsLanesMax, wsLanesUpgradeQueue: wsLanesUpgradeQueue, polls: polls, maxInflightPosts: maxInflightPosts, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, idle: idle, udp: udp, sessions: map[string]*session{}, stats: stats, metrics: metrics}
+	state := &clientState{remote: remote, token: token, connectIP: connectIP, transport: transport, wsLanesN: wsLanesN, wsLanesIncremental: wsLanesIncremental, polls: polls, maxInflightPosts: maxInflightPosts, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, idle: idle, udp: udp, sessions: map[string]*session{}, stats: stats, metrics: metrics}
 	if transport == "ws" {
 		state.wsPool = newWSPool(remote, connectIP, token, wsLanesN, timeout)
 		defer state.wsPool.Close()
@@ -216,7 +204,7 @@ func Main(args []string) {
 		go state.writeMetrics(metricsOut, metricsInterval)
 	}
 	go state.cleanupLoop()
-	appLog.Info("proxy-client-start", "listen", listen, "remote", remote, "connect_ip", connectIP, "transport", transport, "ws_lanes", wsLanesN, "ws_lanes_auto", wsLanesAuto, "ws_lanes_incremental", wsLanesIncremental, "ws_lanes_max", wsLanesMax, "down_polls", polls)
+	appLog.Info("proxy-client-start", "listen", listen, "remote", remote, "connect_ip", connectIP, "transport", transport, "ws_lanes", wsLanesN, "ws_lanes_incremental", wsLanesIncremental, "down_polls", polls)
 	buf := make([]byte, 65535)
 	for {
 		n, peer, err := udp.ReadFromUDP(buf)
@@ -230,42 +218,45 @@ func Main(args []string) {
 }
 
 type clientState struct {
-	remote              string
-	token               string
-	connectIP           string
-	transport           string
-	wsLanesN            int
-	wsLanesAuto         bool
-	wsLanesIncremental  bool
-	wsLanesMax          int
-	wsLanesUpgradeQueue int
-	polls               int
-	maxInflightPosts    int
-	batchSize           int
-	batchDelay          time.Duration
-	sendQueue           int
-	timeout             time.Duration
-	idle                time.Duration
-	udp                 *net.UDPConn
-	mu                  sync.Mutex
-	sessions            map[string]*session
-	wsPool              *wsPool
-	stats               *clientStats
-	metrics             bool
+	remote             string
+	token              string
+	connectIP          string
+	transport          string
+	wsLanesN           int
+	wsLanesIncremental bool
+	polls              int
+	maxInflightPosts   int
+	batchSize          int
+	batchDelay         time.Duration
+	sendQueue          int
+	timeout            time.Duration
+	idle               time.Duration
+	udp                *net.UDPConn
+	mu                 sync.Mutex
+	sessions           map[string]*session
+	wsPool             *wsPool
+	stats              *clientStats
+	metrics            bool
 }
 
 type clientStats struct {
-	started       time.Time
-	sessions      atomic.Int64
-	udpInPackets  atomic.Int64
-	udpInBytes    atomic.Int64
-	udpOutPackets atomic.Int64
-	udpOutBytes   atomic.Int64
-	queueDrops    atomic.Int64
-	sendQDrops    atomic.Int64
-	batchQDrops   atomic.Int64
-	transports    atomic.Int64
-	reconnects    atomic.Int64
+	started                         time.Time
+	sessions                        atomic.Int64
+	udpInPackets                    atomic.Int64
+	udpInBytes                      atomic.Int64
+	udpOutPackets                   atomic.Int64
+	udpOutBytes                     atomic.Int64
+	queueDrops                      atomic.Int64
+	sendQDrops                      atomic.Int64
+	batchQDrops                     atomic.Int64
+	transports                      atomic.Int64
+	reconnects                      atomic.Int64
+	wsExpandHintsReceived           atomic.Int64
+	wsExpandHintsUsed               atomic.Int64
+	wsIncrementalAcquireStarted     atomic.Int64
+	wsIncrementalAcquireSucceeded   atomic.Int64
+	wsIncrementalAcquireFailed      atomic.Int64
+	wsIncrementalAcquireSkippedFull atomic.Int64
 }
 
 func (c *clientState) countSession() {
@@ -283,6 +274,42 @@ func (c *clientState) countTransport() {
 func (c *clientState) countReconnect() {
 	if c.metrics {
 		c.stats.reconnects.Add(1)
+	}
+}
+
+func (c *clientState) countWSExpandHintReceived() {
+	if c.metrics {
+		c.stats.wsExpandHintsReceived.Add(1)
+	}
+}
+
+func (c *clientState) countWSExpandHintUsed() {
+	if c.metrics {
+		c.stats.wsExpandHintsUsed.Add(1)
+	}
+}
+
+func (c *clientState) countWSIncrementalAcquireStarted() {
+	if c.metrics {
+		c.stats.wsIncrementalAcquireStarted.Add(1)
+	}
+}
+
+func (c *clientState) countWSIncrementalAcquireSucceeded() {
+	if c.metrics {
+		c.stats.wsIncrementalAcquireSucceeded.Add(1)
+	}
+}
+
+func (c *clientState) countWSIncrementalAcquireFailed() {
+	if c.metrics {
+		c.stats.wsIncrementalAcquireFailed.Add(1)
+	}
+}
+
+func (c *clientState) countWSIncrementalAcquireSkippedFull() {
+	if c.metrics {
+		c.stats.wsIncrementalAcquireSkippedFull.Add(1)
 	}
 }
 
@@ -429,8 +456,8 @@ func (c *clientState) getSession(peer *net.UDPAddr) *session {
 		c.sessions[key] = sess
 		c.countSession()
 		sess.goRun(func() { sess.sendLoop(c.batchSize, c.batchDelay) })
-		if c.wsLanesAuto {
-			sess.goRun(func() { sess.wsScaleLoop() })
+		if c.wsLanesIncremental {
+			sess.goRun(func() { sess.wsIncrementalLoop() })
 		}
 		sess.goRun(func() { c.connectWebSocketLanes(sess, key) })
 		appLog.Debug("binary-session-create", "session", id, "peer", key, "transport", c.transport, "lanes", c.wsLanesN, "connecting", true)
@@ -598,22 +625,44 @@ func (c *clientState) ensureWebSocketLanes(sess *session, target int) error {
 }
 
 func (s *session) maybeAcquireIncrementalWebSocketLane() {
-	if !s.wsMode || s.state == nil || !s.state.wsLanesIncremental || s.state.wsLanesN <= 1 {
+	if !s.wsMode || s.state == nil || !s.state.wsLanesIncremental {
 		return
 	}
-	if s.batchQ == nil || len(s.batchQ) == 0 {
+	if s.state.wsLanesN <= 1 {
+		if s.expandHintPending.Load() {
+			s.expandHintPending.Store(false)
+			s.state.countWSIncrementalAcquireSkippedFull()
+		}
+		return
+	}
+	localBacklog := s.batchQ != nil && len(s.batchQ) > 1
+	serverHint := s.expandHintPending.Load()
+	if !localBacklog && !serverHint {
+		return
+	}
+	if s.wsTotalPlanned() >= s.state.wsLanesN {
+		if serverHint {
+			s.expandHintPending.Store(false)
+			s.state.countWSIncrementalAcquireSkippedFull()
+		}
 		return
 	}
 	if !s.reservePendingWebSocketLane(s.state.wsLanesN) {
 		return
 	}
+	if serverHint {
+		s.expandHintPending.Store(false)
+		s.state.countWSExpandHintUsed()
+	}
 	laneID := int(s.wsNext.Add(1))
 	if !s.goRun(func() {
 		defer s.wsPending.Add(-1)
+		s.state.countWSIncrementalAcquireStarted()
 		ctx, cancel := context.WithTimeout(s.ctx, s.state.timeout)
 		defer cancel()
 		ws, err := s.state.acquireBinaryConn(ctx, s.id, laneID)
 		if err != nil {
+			s.state.countWSIncrementalAcquireFailed()
 			if !s.isClosed() {
 				appLog.WarnRate("websocket_incremental_lane_acquire_failed", 10*time.Second, "websocket-incremental-lane-acquire-failed", "session", s.id, "err", err)
 			}
@@ -637,6 +686,7 @@ func (s *session) maybeAcquireIncrementalWebSocketLane() {
 		}
 		s.notifyWSChanged()
 		s.state.countTransport()
+		s.state.countWSIncrementalAcquireSucceeded()
 		s.goRun(func() { s.wsReadLoop(s.state, ln) })
 		s.goRun(func() { s.wsWriteLoop(s.state, ln) })
 		appLog.Info("websocket-lanes-incremental", "session", s.id, "lanes", s.wsCount())
@@ -714,7 +764,6 @@ func (s *session) sendLoop(batchSize int, batchDelay time.Duration) {
 		case <-s.closed:
 			return
 		case first := <-s.sendQ:
-			s.maybeScaleWebSocketLanes()
 			currentBatchSize := batchSize
 			batch := []relay.Frame{{PacketID: s.next.Add(1), Payload: first}}
 			timer := time.NewTimer(batchDelay)
@@ -746,32 +795,7 @@ func (s *session) shouldSendBatchSync() bool {
 	return s.wsCount() == 1 && (s.state == nil || !s.state.wsLanesIncremental)
 }
 
-func (s *session) maybeScaleWebSocketLanes() {
-	if !s.wsMode || s.state == nil || !s.state.wsLanesAuto || s.state.wsLanesMax <= 1 {
-		return
-	}
-	select {
-	case <-s.ready:
-	default:
-		return
-	}
-	if s.wsBacklogPackets() < s.state.wsLanesUpgradeQueue || s.wsCount() >= s.state.wsLanesMax {
-		return
-	}
-	if !s.wsScaling.CompareAndSwap(false, true) {
-		return
-	}
-	s.goRun(func() {
-		defer s.wsScaling.Store(false)
-		if err := s.state.ensureWebSocketLanes(s, s.state.wsLanesMax); err != nil {
-			appLog.WarnRate("websocket_lane_scale_failed", 10*time.Second, "websocket-lane-scale-failed", "session", s.id, "err", err)
-			return
-		}
-		appLog.Info("websocket-lanes-scaled", "session", s.id, "lanes", s.wsCount())
-	})
-}
-
-func (s *session) wsScaleLoop() {
+func (s *session) wsIncrementalLoop() {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -781,21 +805,13 @@ func (s *session) wsScaleLoop() {
 		case <-s.closed:
 			return
 		case <-ticker.C:
-			s.maybeScaleWebSocketLanes()
+			select {
+			case <-s.ready:
+				s.maybeAcquireIncrementalWebSocketLane()
+			default:
+			}
 		}
 	}
-}
-
-func (s *session) wsBacklogPackets() int {
-	backlog := len(s.sendQ)
-	if s.batchQ != nil {
-		batchSize := 1
-		if s.state != nil && s.state.batchSize > 1 {
-			batchSize = s.state.batchSize
-		}
-		backlog += len(s.batchQ) * batchSize
-	}
-	return backlog
 }
 
 func (s *session) wsCount() int {
@@ -925,7 +941,6 @@ func (s *session) sendBatch(frames []relay.Frame) {
 		return
 	}
 	s.enqueueBatch(frames)
-	s.maybeAcquireIncrementalWebSocketLane()
 }
 
 func (s *session) enqueueBatch(frames []relay.Frame) {
@@ -1104,6 +1119,9 @@ func (s *session) wsReadLoop(c *clientState, ln *wsLane) {
 			appLog.WarnRate("websocket_read_failed", 10*time.Second, "websocket-read-failed", "session", s.id, "lane", ln.index, "err", err)
 			return
 		}
+		if s.handleWSControlMessage(c, ln.index, body) {
+			continue
+		}
 		frames, err := relay.DecodeFramesView(body)
 		if err != nil {
 			appLog.WarnRate("websocket_decode_failed", 10*time.Second, "websocket-decode-failed", "session", s.id, "lane", ln.index, "err", err)
@@ -1116,6 +1134,30 @@ func (s *session) wsReadLoop(c *clientState, ln *wsLane) {
 			}
 		}
 	}
+}
+
+func (s *session) handleWSControlMessage(c *clientState, laneIndex int, body []byte) bool {
+	if !relay.IsControlMessage(body) {
+		return false
+	}
+	op, payload, err := relay.DecodeControl(body)
+	if err != nil {
+		appLog.WarnRate("websocket_control_decode_failed", 10*time.Second, "websocket-control-decode-failed", "session", s.id, "lane", laneIndex, "err", err)
+		return true
+	}
+	switch op {
+	case relay.ControlOpExpandLanesHint:
+		if len(payload) != 0 {
+			appLog.WarnRate("websocket_expand_hint_payload", 10*time.Second, "websocket-expand-hint-payload", "session", s.id, "lane", laneIndex, "payload_bytes", len(payload))
+		}
+		s.expandHintPending.Store(true)
+		if c != nil {
+			c.countWSExpandHintReceived()
+		}
+	default:
+		appLog.WarnRate("websocket_unknown_control", 10*time.Second, "websocket-unknown-control", "session", s.id, "lane", laneIndex, "op", op)
+	}
+	return true
 }
 
 func (s *session) reconnectWebSocketLane(c *clientState, old *wsLane) {
@@ -1372,30 +1414,36 @@ func (c *clientState) snapshot() map[string]any {
 		}
 	}
 	return map[string]any{
-		"event":               "proxy-client-metrics",
-		"ts":                  time.Now().Format(time.RFC3339Nano),
-		"uptime_sec":          time.Since(c.stats.started).Seconds(),
-		"active_sessions":     len(sessions),
-		"created_sessions":    c.stats.sessions.Load(),
-		"transports":          c.stats.transports.Load(),
-		"reconnects":          c.stats.reconnects.Load(),
-		"udp_in_packets":      c.stats.udpInPackets.Load(),
-		"udp_in_bytes":        c.stats.udpInBytes.Load(),
-		"udp_out_packets":     c.stats.udpOutPackets.Load(),
-		"udp_out_bytes":       c.stats.udpOutBytes.Load(),
-		"send_queue_depth":    sendQueueDepth,
-		"send_queue_capacity": sendQueueCapacity,
-		"send_queue_drops":    c.stats.queueDrops.Load(),
-		"sendq_depth":         sendQDepth,
-		"sendq_capacity":      sendQCapacity,
-		"sendq_drops":         c.stats.sendQDrops.Load(),
-		"batchq_depth":        batchQDepth,
-		"batchq_capacity":     batchQCapacity,
-		"batchq_drops":        c.stats.batchQDrops.Load(),
-		"batchq_packet_depth": batchQPacketDepthEstimate,
-		"inflight_bytes":      inflightBytes,
-		"inflight_requests":   inflightRequests,
-		"lanes":               lanes,
+		"event":                               "proxy-client-metrics",
+		"ts":                                  time.Now().Format(time.RFC3339Nano),
+		"uptime_sec":                          time.Since(c.stats.started).Seconds(),
+		"active_sessions":                     len(sessions),
+		"created_sessions":                    c.stats.sessions.Load(),
+		"transports":                          c.stats.transports.Load(),
+		"reconnects":                          c.stats.reconnects.Load(),
+		"udp_in_packets":                      c.stats.udpInPackets.Load(),
+		"udp_in_bytes":                        c.stats.udpInBytes.Load(),
+		"udp_out_packets":                     c.stats.udpOutPackets.Load(),
+		"udp_out_bytes":                       c.stats.udpOutBytes.Load(),
+		"send_queue_depth":                    sendQueueDepth,
+		"send_queue_capacity":                 sendQueueCapacity,
+		"send_queue_drops":                    c.stats.queueDrops.Load(),
+		"sendq_depth":                         sendQDepth,
+		"sendq_capacity":                      sendQCapacity,
+		"sendq_drops":                         c.stats.sendQDrops.Load(),
+		"batchq_depth":                        batchQDepth,
+		"batchq_capacity":                     batchQCapacity,
+		"batchq_drops":                        c.stats.batchQDrops.Load(),
+		"batchq_packet_depth":                 batchQPacketDepthEstimate,
+		"ws_expand_hints_received":            c.stats.wsExpandHintsReceived.Load(),
+		"ws_expand_hints_used":                c.stats.wsExpandHintsUsed.Load(),
+		"ws_incremental_acquire_started":      c.stats.wsIncrementalAcquireStarted.Load(),
+		"ws_incremental_acquire_succeeded":    c.stats.wsIncrementalAcquireSucceeded.Load(),
+		"ws_incremental_acquire_failed":       c.stats.wsIncrementalAcquireFailed.Load(),
+		"ws_incremental_acquire_skipped_full": c.stats.wsIncrementalAcquireSkippedFull.Load(),
+		"inflight_bytes":                      inflightBytes,
+		"inflight_requests":                   inflightRequests,
+		"lanes":                               lanes,
 	}
 }
 
@@ -1465,12 +1513,6 @@ func applyClientPluginEnv(env PluginEnv.Env, listen, remote, token, connectIP, t
 	if err := applyIntOption(opts, "ws-lanes", wsLanesN); err != nil {
 		return err
 	}
-	if err := applyIntOption(opts, "ws-lanes-max", wsLanesMax); err != nil {
-		return err
-	}
-	if err := applyIntOption(opts, "ws-lanes-upgrade-queue", wsLanesUpgradeQueue); err != nil {
-		return err
-	}
 	if err := applyIntOption(opts, "down-polls", polls); err != nil {
 		return err
 	}
@@ -1481,9 +1523,6 @@ func applyClientPluginEnv(env PluginEnv.Env, listen, remote, token, connectIP, t
 		return err
 	}
 	if err := applyIntOption(opts, "send-queue", sendQueue); err != nil {
-		return err
-	}
-	if err := applyBoolOption(opts, "ws-lanes-auto", wsLanesAuto); err != nil {
 		return err
 	}
 	if err := applyBoolOption(opts, "ws-lanes-incremental", wsLanesIncremental); err != nil {
@@ -1542,8 +1581,8 @@ func applyDurationOption(opts PluginEnv.Options, key string, dst *time.Duration)
 
 var knownClientPluginEnvOptions = map[string]struct{}{
 	"scheme": {}, "tls": {}, "host": {}, "path": {}, "connect-ip": {}, "token": {}, "transport": {}, "metrics-out": {}, "log-level": {}, "use-syslog": {},
-	"ws-lanes": {}, "ws-lanes-max": {}, "ws-lanes-upgrade-queue": {}, "down-polls": {}, "max-inflight-posts": {}, "batch-size": {}, "send-queue": {},
-	"ws-lanes-auto": {}, "ws-lanes-incremental": {}, "metrics": {},
+	"ws-lanes": {}, "down-polls": {}, "max-inflight-posts": {}, "batch-size": {}, "send-queue": {},
+	"ws-lanes-incremental": {}, "metrics": {},
 	"http-timeout": {}, "metrics-interval": {}, "batch-delay": {}, "idle": {},
 }
 
