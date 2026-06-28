@@ -262,6 +262,8 @@ type clientStats struct {
 	udpOutPackets atomic.Int64
 	udpOutBytes   atomic.Int64
 	queueDrops    atomic.Int64
+	sendQDrops    atomic.Int64
+	batchQDrops   atomic.Int64
 	transports    atomic.Int64
 	reconnects    atomic.Int64
 }
@@ -291,9 +293,17 @@ func (c *clientState) countUDPOut(n int) {
 	}
 }
 
-func (s *session) countQueueDrops(n int) {
+func (s *session) countSendQueueDrops(n int) {
 	if s.metrics && n > 0 {
 		s.stats.queueDrops.Add(int64(n))
+		s.stats.sendQDrops.Add(int64(n))
+	}
+}
+
+func (s *session) countBatchQueueDrops(n int) {
+	if s.metrics && n > 0 {
+		s.stats.queueDrops.Add(int64(n))
+		s.stats.batchQDrops.Add(int64(n))
 	}
 }
 
@@ -693,7 +703,7 @@ func (s *session) enqueue(payload []byte) {
 		return
 	}
 	s.touch()
-	s.countQueueDrops(relay.EnqueueDropOldest(s.sendQ, payload))
+	s.countSendQueueDrops(relay.EnqueueDropOldest(s.sendQ, payload))
 }
 
 func (s *session) sendLoop(batchSize int, batchDelay time.Duration) {
@@ -923,7 +933,7 @@ func (s *session) enqueueBatch(frames []relay.Frame) {
 		return
 	}
 	dropped := enqueueFrameBatchDropOldest(s.batchQ, frames)
-	s.countQueueDrops(dropped)
+	s.countBatchQueueDrops(dropped)
 }
 
 func enqueueFrameBatchDropOldest(ch chan []relay.Frame, frames []relay.Frame) int {
@@ -1270,13 +1280,31 @@ func (c *clientState) snapshot() map[string]any {
 	var lanes []map[string]any
 	var inflightBytes, inflightRequests int64
 	var sendQueueDepth, sendQueueCapacity int
+	var sendQDepth, sendQCapacity int
+	var batchQDepth, batchQCapacity int
+	var batchQPacketDepthEstimate int
 	for _, sess := range sessions {
-		sendQueueDepth += len(sess.sendQ)
-		sendQueueCapacity += cap(sess.sendQ)
+		sessSendQDepth := len(sess.sendQ)
+		sessSendQCapacity := cap(sess.sendQ)
+		sessBatchQDepth := 0
+		sessBatchQCapacity := 0
+		sessBatchQPacketDepthEstimate := 0
 		if sess.batchQ != nil {
-			sendQueueDepth += len(sess.batchQ)
-			sendQueueCapacity += cap(sess.batchQ)
+			sessBatchQDepth = len(sess.batchQ)
+			sessBatchQCapacity = cap(sess.batchQ)
+			batchSize := 1
+			if sess.state != nil && sess.state.batchSize > 1 {
+				batchSize = sess.state.batchSize
+			}
+			sessBatchQPacketDepthEstimate = sessBatchQDepth * batchSize
 		}
+		sendQDepth += sessSendQDepth
+		sendQCapacity += sessSendQCapacity
+		batchQDepth += sessBatchQDepth
+		batchQCapacity += sessBatchQCapacity
+		batchQPacketDepthEstimate += sessBatchQPacketDepthEstimate
+		sendQueueDepth += sessSendQDepth + sessBatchQPacketDepthEstimate
+		sendQueueCapacity += sessSendQCapacity + sessBatchQCapacity
 		sess.wsMu.Lock()
 		wsLanes := append([]*wsLane(nil), sess.ws...)
 		sess.wsMu.Unlock()
@@ -1358,6 +1386,13 @@ func (c *clientState) snapshot() map[string]any {
 		"send_queue_depth":    sendQueueDepth,
 		"send_queue_capacity": sendQueueCapacity,
 		"send_queue_drops":    c.stats.queueDrops.Load(),
+		"sendq_depth":         sendQDepth,
+		"sendq_capacity":      sendQCapacity,
+		"sendq_drops":         c.stats.sendQDrops.Load(),
+		"batchq_depth":        batchQDepth,
+		"batchq_capacity":     batchQCapacity,
+		"batchq_drops":        c.stats.batchQDrops.Load(),
+		"batchq_packet_depth": batchQPacketDepthEstimate,
 		"inflight_bytes":      inflightBytes,
 		"inflight_requests":   inflightRequests,
 		"lanes":               lanes,
