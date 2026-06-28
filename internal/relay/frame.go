@@ -16,6 +16,7 @@ var ControlMagic = [4]byte{'H', '3', 'U', 'C'}
 const Version byte = 1
 const ControlOpAttach byte = 1
 const ControlOpAttachOK byte = 2
+const ControlOpExpandLanesHint byte = 3
 const MaxMessageBytes = 2 << 20
 const MaxFramePayloadBytes = 65535
 const MaxPayloadFramesPerMessage = (MaxMessageBytes - encodedHeaderBytes) / (encodedFrameHeaderBytes + MaxFramePayloadBytes)
@@ -227,6 +228,15 @@ func DecodeControl(data []byte) (byte, []byte, error) {
 		return 0, nil, errors.New("trailing control bytes")
 	}
 	return op, payload, nil
+}
+
+func IsControlMessage(data []byte) bool {
+	if len(data) < len(ControlMagic) {
+		return false
+	}
+	var magic [4]byte
+	copy(magic[:], data[:4])
+	return magic == ControlMagic
 }
 
 func EncodeAttach(sessionID string) ([]byte, error) {

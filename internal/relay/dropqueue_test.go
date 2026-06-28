@@ -97,3 +97,23 @@ func TestDecodeControlAcceptsEmptyPayload(t *testing.T) {
 		t.Fatalf("op=%d payload_len=%d, want attach-ok empty", op, len(payload))
 	}
 }
+
+func TestEncodeDecodeExpandLanesHint(t *testing.T) {
+	body, err := EncodeControl(ControlOpExpandLanesHint, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !IsControlMessage(body) {
+		t.Fatal("IsControlMessage returned false for expand hint")
+	}
+	op, payload, err := DecodeControl(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op != ControlOpExpandLanesHint || len(payload) != 0 {
+		t.Fatalf("op=%d payload_len=%d, want expand hint empty", op, len(payload))
+	}
+	if IsControlMessage([]byte{'H', '3', 'U', 'R', Version}) {
+		t.Fatal("IsControlMessage returned true for data frame magic")
+	}
+}

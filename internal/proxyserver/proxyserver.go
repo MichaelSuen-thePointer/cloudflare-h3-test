@@ -32,18 +32,24 @@ var (
 )
 
 type session struct {
-	id         string
-	mode       string
-	udp        *net.UDPConn
-	queue      chan relay.Frame
-	done       chan struct{}
-	lastActive atomic.Int64
-	touchEvery time.Duration
-	closed     atomic.Bool
-	closeOnce  sync.Once
-	wsMu       sync.Mutex
-	ws         map[*relay.WebSocketConn]*serverWSLane
-	wsNext     atomic.Int64
+	id                   string
+	mode                 string
+	udp                  *net.UDPConn
+	queue                chan relay.Frame
+	batchQ               chan []relay.Frame
+	done                 chan struct{}
+	lastActive           atomic.Int64
+	touchEvery           time.Duration
+	closed               atomic.Bool
+	closeOnce            sync.Once
+	batchOnce            sync.Once
+	expandHintOnce       sync.Once
+	expandHintPending    atomic.Bool
+	expandHintInFlight   atomic.Bool
+	expandHintInFlightAt atomic.Int64
+	wsMu                 sync.Mutex
+	ws                   map[*relay.WebSocketConn]*serverWSLane
+	wsNext               atomic.Int64
 }
 
 type serverWSLane struct {
@@ -54,51 +60,62 @@ type serverWSLane struct {
 }
 
 type server struct {
-	token     string
-	requireH3 bool
-	upstream  *net.UDPAddr
-	benchEcho bool
-	idle      time.Duration
-	udpBuffer int
-	downQueue int
-	metrics   bool
-	mu        sync.Mutex
-	sessions  map[string]*session
-	stats     serverStats
+	token                 string
+	requireH3             bool
+	upstream              *net.UDPAddr
+	benchEcho             bool
+	idle                  time.Duration
+	udpBuffer             int
+	downQueue             int
+	batchSize             int
+	batchDelay            time.Duration
+	downExpandLanesMax    int
+	downExpandHintTimeout time.Duration
+	metrics               bool
+	mu                    sync.Mutex
+	sessions              map[string]*session
+	stats                 serverStats
 }
 
 type serverStats struct {
-	requests       atomic.Int64
-	postRequests   atomic.Int64
-	getRequests    atomic.Int64
-	deleteRequests atomic.Int64
-	status200      atomic.Int64
-	status204      atomic.Int64
-	status400      atomic.Int64
-	status404      atomic.Int64
-	status410      atomic.Int64
-	status413      atomic.Int64
-	status502      atomic.Int64
-	status500      atomic.Int64
-	udpUpPackets   atomic.Int64
-	udpUpBytes     atomic.Int64
-	udpDownPackets atomic.Int64
-	udpDownBytes   atomic.Int64
-	queueDrops     atomic.Int64
-	queueWaitMaxUS atomic.Int64
-	queueWaitCount atomic.Int64
-	wsWriteMaxUS   atomic.Int64
-	wsWriteCount   atomic.Int64
-	sessionsMade   atomic.Int64
-	sessionsClosed atomic.Int64
-	unattachedWS   atomic.Int64
+	requests                   atomic.Int64
+	postRequests               atomic.Int64
+	getRequests                atomic.Int64
+	deleteRequests             atomic.Int64
+	status200                  atomic.Int64
+	status204                  atomic.Int64
+	status400                  atomic.Int64
+	status404                  atomic.Int64
+	status410                  atomic.Int64
+	status413                  atomic.Int64
+	status502                  atomic.Int64
+	status500                  atomic.Int64
+	udpUpPackets               atomic.Int64
+	udpUpBytes                 atomic.Int64
+	udpDownPackets             atomic.Int64
+	udpDownBytes               atomic.Int64
+	queueDrops                 atomic.Int64
+	batchQDrops                atomic.Int64
+	queueWaitMaxUS             atomic.Int64
+	queueWaitCount             atomic.Int64
+	batchQWaitMaxUS            atomic.Int64
+	batchQWaitCount            atomic.Int64
+	wsWriteMaxUS               atomic.Int64
+	wsWriteCount               atomic.Int64
+	expandHintsSent            atomic.Int64
+	expandHintsWriteFailed     atomic.Int64
+	expandHintsExpired         atomic.Int64
+	expandHintsSkippedMaxLanes atomic.Int64
+	sessionsMade               atomic.Int64
+	sessionsClosed             atomic.Int64
+	unattachedWS               atomic.Int64
 }
 
 func Main(args []string) {
 	var listen, cert, key, token, upstream, metricsOut, logLevel string
-	var udpBuffer, downQueue int
+	var udpBuffer, downQueue, batchSize, downExpandLanesMax int
 	var requireH3, benchEcho, metrics, useSyslog bool
-	var idle time.Duration
+	var idle, batchDelay, downExpandHintTimeout time.Duration
 	fs := flag.NewFlagSet("proxy-server", flag.ExitOnError)
 	fs.StringVar(&listen, "listen", ":2083", "TLS listen address")
 	fs.StringVar(&cert, "cert", "", "TLS certificate")
@@ -114,6 +131,10 @@ func Main(args []string) {
 	fs.DurationVar(&idle, "idle", 120*time.Second, "session idle timeout")
 	fs.IntVar(&udpBuffer, "udp-buffer", 4<<20, "UDP socket read/write buffer bytes")
 	fs.IntVar(&downQueue, "down-queue", 65536, "per-session downlink queue capacity")
+	fs.IntVar(&batchSize, "batch-size", 3, "maximum UDP packets per WebSocket downlink batch")
+	fs.DurationVar(&batchDelay, "batch-delay", time.Millisecond, "maximum time to wait for a partially filled WebSocket downlink batch")
+	fs.IntVar(&downExpandLanesMax, "down-expand-lanes-max", 12, "maximum attached WebSocket lanes before suppressing server downlink expand hints")
+	fs.DurationVar(&downExpandHintTimeout, "down-expand-hint-timeout", 15*time.Second, "time to wait for a hinted WebSocket lane before sending another downlink expand hint")
 	fs.Parse(args)
 
 	if err := configureLogger("proxy-server", logLevel, useSyslog); err != nil {
@@ -136,19 +157,28 @@ func Main(args []string) {
 		if err := configureLogger("proxy-server", logLevel, useSyslog); err != nil {
 			log.Fatal(err)
 		}
-		if err := applyServerPluginEnv(pluginEnv, &listen, &upstream, &cert, &key, &token, &metricsOut, &logLevel, &requireH3, &benchEcho, &metrics, &useSyslog, &idle, &udpBuffer, &downQueue); err != nil {
+		if err := applyServerPluginEnv(pluginEnv, &listen, &upstream, &cert, &key, &token, &metricsOut, &logLevel, &requireH3, &benchEcho, &metrics, &useSyslog, &idle, &batchDelay, &downExpandHintTimeout, &udpBuffer, &downQueue, &batchSize, &downExpandLanesMax); err != nil {
 			log.Fatal(err)
 		}
 	}
 	if downQueue < 1 {
 		downQueue = 1
 	}
+	if batchSize < 1 {
+		batchSize = 1
+	}
+	if downExpandLanesMax < 1 {
+		downExpandLanesMax = 1
+	}
+	if downExpandHintTimeout <= 0 {
+		downExpandHintTimeout = 15 * time.Second
+	}
 	addr, err := net.ResolveUDPAddr("udp", upstream)
 	if err != nil {
 		log.Fatal(err)
 	}
 	metrics = metrics || metricsOut != ""
-	s := &server{token: token, requireH3: requireH3, upstream: addr, benchEcho: benchEcho, idle: idle, udpBuffer: udpBuffer, downQueue: downQueue, metrics: metrics, sessions: map[string]*session{}}
+	s := &server{token: token, requireH3: requireH3, upstream: addr, benchEcho: benchEcho, idle: idle, udpBuffer: udpBuffer, downQueue: downQueue, batchSize: batchSize, batchDelay: batchDelay, downExpandLanesMax: downExpandLanesMax, downExpandHintTimeout: downExpandHintTimeout, metrics: metrics, sessions: map[string]*session{}}
 	go s.cleanupLoop()
 	if metricsOut != "" {
 		go s.writeMetrics(metricsOut, 5*time.Second)
@@ -157,7 +187,7 @@ func Main(args []string) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handle)
-	appLog.Info("proxy-server-start", "listen", listen, "upstream", upstream, "require_h3", requireH3, "bench_echo", benchEcho, "metrics", metrics)
+	appLog.Info("proxy-server-start", "listen", listen, "upstream", upstream, "require_h3", requireH3, "bench_echo", benchEcho, "metrics", metrics, "batch_size", batchSize, "batch_delay", batchDelay, "down_expand_lanes_max", downExpandLanesMax, "down_expand_hint_timeout", downExpandHintTimeout)
 	httpServer := &http.Server{Addr: listen, Handler: mux, ErrorLog: appLog.StdLogger(diaglog.Warn, "http-server-error")}
 	if cert == "" && key == "" {
 		log.Fatal(httpServer.ListenAndServe())
@@ -237,15 +267,19 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	ack, err := relay.EncodeControl(relay.ControlOpAttachOK, nil)
 	if err != nil {
+		sess.removeWebSocket(ws)
 		_ = ws.Close()
 		return
 	}
 	if err := ws.WriteBinary(ack); err != nil {
+		sess.removeWebSocket(ws)
 		_ = ws.Close()
 		return
 	}
 	defer sess.removeWebSocket(ws)
 	defer ws.Close()
+	sess.startDownBatchLoop(s)
+	sess.startExpandHintLoop(s)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -254,46 +288,15 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			select {
-			case f := <-sess.queue:
+			case frames := <-sess.batchQ:
 				if sess.isClosed() {
 					return
 				}
-				s.observeQueueWait(f)
-				frames := []relay.Frame{f}
-			drain:
-				for len(frames) < maxFramesPerDownlinkMessage {
-					if sess.isClosed() {
-						return
-					}
-					select {
-					case f := <-sess.queue:
-						s.observeQueueWait(f)
-						frames = append(frames, f)
-					default:
-						break drain
-					}
-				}
-				body, err := relay.EncodeFrames(frames)
-				if err != nil {
-					appLog.Error("websocket-encode-failed", "session", id, "err", err)
+				if !s.writePendingExpandHint(ws, sess, id, r.RemoteAddr) {
 					return
 				}
-				if sess.isClosed() {
+				if !s.writeDownBatch(ws, wsLane, id, r.RemoteAddr, frames) {
 					return
-				}
-				if s.metrics {
-					started := time.Now()
-					if err := ws.WriteBinary(body); err != nil {
-						appLog.WarnRate("server_websocket_write_failed", 10*time.Second, "websocket-write-failed", "session", id, "remote", r.RemoteAddr, "err", err)
-						return
-					}
-					wsLane.observeDownlink(len(frames), len(body))
-					s.observeWSWrite(time.Since(started))
-				} else if err := ws.WriteBinary(body); err != nil {
-					appLog.WarnRate("server_websocket_write_failed", 10*time.Second, "websocket-write-failed", "session", id, "remote", r.RemoteAddr, "err", err)
-					return
-				} else {
-					wsLane.observeDownlink(len(frames), len(body))
 				}
 			case <-r.Context().Done():
 				return
@@ -453,6 +456,167 @@ func (s *server) handleGet(w http.ResponseWriter, r *http.Request, id string) {
 	}
 }
 
+func (sess *session) startDownBatchLoop(parent *server) {
+	sess.batchOnce.Do(func() {
+		go sess.downBatchLoop(parent)
+	})
+}
+
+func (sess *session) startExpandHintLoop(parent *server) {
+	sess.expandHintOnce.Do(func() {
+		go sess.expandHintLoop(parent)
+	})
+}
+
+func (sess *session) expandHintLoop(parent *server) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-sess.done:
+			return
+		case <-ticker.C:
+			sess.maybeQueueExpandHint(parent, time.Now())
+		}
+	}
+}
+
+func (sess *session) maybeQueueExpandHint(parent *server, now time.Time) {
+	if sess.isClosed() || sess.batchQ == nil || len(sess.batchQ) <= 1 {
+		return
+	}
+	maxLanes := parent.downExpandLanesMax
+	if maxLanes < 1 {
+		maxLanes = 12
+	}
+	hintTimeout := parent.downExpandHintTimeout
+	if hintTimeout <= 0 {
+		hintTimeout = 15 * time.Second
+	}
+	if sess.wsCount() >= maxLanes {
+		parent.countExpandHintSkippedMaxLanes()
+		return
+	}
+	if sess.expandHintInFlight.Load() {
+		inFlightAt := time.Unix(0, sess.expandHintInFlightAt.Load())
+		if !inFlightAt.IsZero() && now.Sub(inFlightAt) < hintTimeout {
+			return
+		}
+		if sess.expandHintInFlight.CompareAndSwap(true, false) {
+			sess.expandHintInFlightAt.Store(0)
+			parent.countExpandHintExpired()
+		}
+	}
+	sess.expandHintPending.CompareAndSwap(false, true)
+}
+
+func (sess *session) downBatchLoop(parent *server) {
+	batchSize := parent.batchSize
+	if batchSize < 1 {
+		batchSize = 1
+	}
+	for {
+		select {
+		case <-sess.done:
+			return
+		case first := <-sess.queue:
+			if sess.isClosed() {
+				return
+			}
+			parent.observeQueueWait(first)
+			batch := []relay.Frame{first}
+			timer := time.NewTimer(parent.batchDelay)
+		collect:
+			for len(batch) < batchSize {
+				select {
+				case <-sess.done:
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					return
+				case f := <-sess.queue:
+					if sess.isClosed() {
+						if !timer.Stop() {
+							select {
+							case <-timer.C:
+							default:
+							}
+						}
+						return
+					}
+					parent.observeQueueWait(f)
+					batch = append(batch, f)
+				case <-timer.C:
+					break collect
+				}
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			parent.markBatchQueued(batch)
+			parent.countBatchQueueDrops(enqueueFrameBatchDropOldest(sess.batchQ, batch))
+		}
+	}
+}
+
+func (s *server) writePendingExpandHint(ws *relay.WebSocketConn, sess *session, id, remoteAddr string) bool {
+	if !sess.expandHintPending.CompareAndSwap(true, false) {
+		return true
+	}
+	body, err := relay.EncodeControl(relay.ControlOpExpandLanesHint, nil)
+	if err != nil {
+		appLog.Error("websocket-expand-hint-encode-failed", "session", id, "err", err)
+		return false
+	}
+	if err := ws.WriteBinaryOwned(body); err != nil {
+		s.countExpandHintWriteFailed()
+		appLog.WarnRate("server_websocket_expand_hint_write_failed", 10*time.Second, "websocket-expand-hint-write-failed", "session", id, "remote", remoteAddr, "err", err)
+		return false
+	}
+	sess.expandHintInFlight.Store(true)
+	sess.expandHintInFlightAt.Store(time.Now().UnixNano())
+	s.countExpandHintSent()
+	return true
+}
+
+func (s *server) writeDownBatch(ws *relay.WebSocketConn, wsLane *serverWSLane, id, remoteAddr string, frames []relay.Frame) bool {
+	chunks, err := relay.SplitFramesByEncodedLimit(frames, relay.MaxMessageBytes)
+	if err != nil {
+		appLog.Error("frame-split-failed", "session", id, "err", err)
+		return false
+	}
+	for _, chunk := range chunks {
+		s.observeBatchQueueWait(chunk)
+		body, err := relay.EncodeFrames(chunk)
+		if err != nil {
+			appLog.Error("websocket-encode-failed", "session", id, "err", err)
+			return false
+		}
+		if s.metrics {
+			started := time.Now()
+			if err := ws.WriteBinaryOwned(body); err != nil {
+				appLog.WarnRate("server_websocket_write_failed", 10*time.Second, "websocket-write-failed", "session", id, "remote", remoteAddr, "err", err)
+				return false
+			}
+			wsLane.observeDownlink(len(chunk), len(body))
+			s.observeWSWrite(time.Since(started))
+			continue
+		}
+		if err := ws.WriteBinaryOwned(body); err != nil {
+			appLog.WarnRate("server_websocket_write_failed", 10*time.Second, "websocket-write-failed", "session", id, "remote", remoteAddr, "err", err)
+			return false
+		}
+		wsLane.observeDownlink(len(chunk), len(body))
+	}
+	return true
+}
+
 func (s *server) getSession(id string) (*session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -475,7 +639,7 @@ func (s *server) getSession(id string) (*session, error) {
 	if queueCap < 1 {
 		queueCap = 65536
 	}
-	sess := &session{id: id, udp: udp, queue: make(chan relay.Frame, queueCap), done: make(chan struct{}), touchEvery: touchInterval(s.idle), ws: make(map[*relay.WebSocketConn]*serverWSLane)}
+	sess := &session{id: id, udp: udp, queue: make(chan relay.Frame, queueCap), batchQ: make(chan []relay.Frame, queueCap), done: make(chan struct{}), touchEvery: touchInterval(s.idle), ws: make(map[*relay.WebSocketConn]*serverWSLane)}
 	sess.touch()
 	s.sessions[id] = sess
 	s.countSessionMade()
@@ -556,44 +720,76 @@ func (s *server) snapshot() map[string]any {
 	active := len(s.sessions)
 	queueDepth := 0
 	queueCapacity := 0
+	batchQDepth := 0
+	batchQCapacity := 0
+	batchQPacketDepth := 0
+	expandHintsPendingSessions := 0
+	expandHintsInflightSessions := 0
 	wsLanes := []map[string]any{}
 	for _, sess := range s.sessions {
 		queueDepth += len(sess.queue)
 		queueCapacity += cap(sess.queue)
+		if sess.batchQ != nil {
+			batchQDepth += len(sess.batchQ)
+			batchQCapacity += cap(sess.batchQ)
+			batchSize := 1
+			if s.batchSize > 1 {
+				batchSize = s.batchSize
+			}
+			batchQPacketDepth += len(sess.batchQ) * batchSize
+		}
+		if sess.expandHintPending.Load() {
+			expandHintsPendingSessions++
+		}
+		if sess.expandHintInFlight.Load() {
+			expandHintsInflightSessions++
+		}
 		wsLanes = append(wsLanes, sess.wsSnapshots()...)
 	}
 	s.mu.Unlock()
 	return map[string]any{
-		"event":             "proxy-server-metrics",
-		"ts":                time.Now().Format(time.RFC3339Nano),
-		"active_sessions":   active,
-		"unattached_ws":     s.stats.unattachedWS.Load(),
-		"sessions_created":  s.stats.sessionsMade.Load(),
-		"sessions_closed":   s.stats.sessionsClosed.Load(),
-		"requests":          s.stats.requests.Load(),
-		"post_requests":     s.stats.postRequests.Load(),
-		"get_requests":      s.stats.getRequests.Load(),
-		"delete_requests":   s.stats.deleteRequests.Load(),
-		"status_200":        s.stats.status200.Load(),
-		"status_204":        s.stats.status204.Load(),
-		"status_400":        s.stats.status400.Load(),
-		"status_404":        s.stats.status404.Load(),
-		"status_410":        s.stats.status410.Load(),
-		"status_413":        s.stats.status413.Load(),
-		"status_500":        s.stats.status500.Load(),
-		"status_502":        s.stats.status502.Load(),
-		"udp_up_packets":    s.stats.udpUpPackets.Load(),
-		"udp_up_bytes":      s.stats.udpUpBytes.Load(),
-		"udp_down_packets":  s.stats.udpDownPackets.Load(),
-		"udp_down_bytes":    s.stats.udpDownBytes.Load(),
-		"queue_depth":       queueDepth,
-		"queue_capacity":    queueCapacity,
-		"queue_drops":       s.stats.queueDrops.Load(),
-		"queue_wait_max_ms": float64(s.stats.queueWaitMaxUS.Load()) / 1000,
-		"queue_wait_count":  s.stats.queueWaitCount.Load(),
-		"ws_write_max_ms":   float64(s.stats.wsWriteMaxUS.Load()) / 1000,
-		"ws_write_count":    s.stats.wsWriteCount.Load(),
-		"ws_lanes":          wsLanes,
+		"event":                          "proxy-server-metrics",
+		"ts":                             time.Now().Format(time.RFC3339Nano),
+		"active_sessions":                active,
+		"unattached_ws":                  s.stats.unattachedWS.Load(),
+		"sessions_created":               s.stats.sessionsMade.Load(),
+		"sessions_closed":                s.stats.sessionsClosed.Load(),
+		"requests":                       s.stats.requests.Load(),
+		"post_requests":                  s.stats.postRequests.Load(),
+		"get_requests":                   s.stats.getRequests.Load(),
+		"delete_requests":                s.stats.deleteRequests.Load(),
+		"status_200":                     s.stats.status200.Load(),
+		"status_204":                     s.stats.status204.Load(),
+		"status_400":                     s.stats.status400.Load(),
+		"status_404":                     s.stats.status404.Load(),
+		"status_410":                     s.stats.status410.Load(),
+		"status_413":                     s.stats.status413.Load(),
+		"status_500":                     s.stats.status500.Load(),
+		"status_502":                     s.stats.status502.Load(),
+		"udp_up_packets":                 s.stats.udpUpPackets.Load(),
+		"udp_up_bytes":                   s.stats.udpUpBytes.Load(),
+		"udp_down_packets":               s.stats.udpDownPackets.Load(),
+		"udp_down_bytes":                 s.stats.udpDownBytes.Load(),
+		"queue_depth":                    queueDepth,
+		"queue_capacity":                 queueCapacity,
+		"queue_drops":                    s.stats.queueDrops.Load(),
+		"batchq_depth":                   batchQDepth,
+		"batchq_capacity":                batchQCapacity,
+		"batchq_drops":                   s.stats.batchQDrops.Load(),
+		"batchq_packet_depth":            batchQPacketDepth,
+		"queue_wait_max_ms":              float64(s.stats.queueWaitMaxUS.Load()) / 1000,
+		"queue_wait_count":               s.stats.queueWaitCount.Load(),
+		"batchq_wait_max_ms":             float64(s.stats.batchQWaitMaxUS.Load()) / 1000,
+		"batchq_wait_count":              s.stats.batchQWaitCount.Load(),
+		"ws_write_max_ms":                float64(s.stats.wsWriteMaxUS.Load()) / 1000,
+		"ws_write_count":                 s.stats.wsWriteCount.Load(),
+		"expand_hints_pending_sessions":  expandHintsPendingSessions,
+		"expand_hints_inflight_sessions": expandHintsInflightSessions,
+		"expand_hints_sent":              s.stats.expandHintsSent.Load(),
+		"expand_hints_write_failed":      s.stats.expandHintsWriteFailed.Load(),
+		"expand_hints_expired":           s.stats.expandHintsExpired.Load(),
+		"expand_hints_skipped_max_lanes": s.stats.expandHintsSkippedMaxLanes.Load(),
+		"ws_lanes":                       wsLanes,
 	}
 }
 
@@ -604,12 +800,52 @@ func (s *server) queueFrame(f relay.Frame) relay.Frame {
 	return f
 }
 
+func (s *server) markBatchQueued(frames []relay.Frame) {
+	if !s.metrics {
+		return
+	}
+	now := time.Now()
+	for i := range frames {
+		frames[i].QueuedAt = now
+	}
+}
+
+func enqueueFrameBatchDropOldest(ch chan []relay.Frame, frames []relay.Frame) int {
+	select {
+	case ch <- frames:
+		return 0
+	default:
+	}
+
+	dropped := 0
+	select {
+	case old := <-ch:
+		dropped = len(old)
+	default:
+	}
+
+	select {
+	case ch <- frames:
+		return dropped
+	default:
+		return dropped + len(frames)
+	}
+}
+
 func (s *server) observeQueueWait(f relay.Frame) {
 	if !s.metrics || f.QueuedAt.IsZero() {
 		return
 	}
 	s.stats.queueWaitCount.Add(1)
 	updateMax(&s.stats.queueWaitMaxUS, time.Since(f.QueuedAt).Microseconds())
+}
+
+func (s *server) observeBatchQueueWait(frames []relay.Frame) {
+	if !s.metrics || len(frames) == 0 || frames[0].QueuedAt.IsZero() {
+		return
+	}
+	s.stats.batchQWaitCount.Add(int64(len(frames)))
+	updateMax(&s.stats.batchQWaitMaxUS, time.Since(frames[0].QueuedAt).Microseconds())
 }
 
 func (s *server) observeWSWrite(d time.Duration) {
@@ -623,6 +859,36 @@ func (s *server) observeWSWrite(d time.Duration) {
 func (s *server) countQueueDrops(n int) {
 	if s.metrics && n > 0 {
 		s.stats.queueDrops.Add(int64(n))
+	}
+}
+
+func (s *server) countBatchQueueDrops(n int) {
+	if s.metrics && n > 0 {
+		s.stats.batchQDrops.Add(int64(n))
+	}
+}
+
+func (s *server) countExpandHintSent() {
+	if s.metrics {
+		s.stats.expandHintsSent.Add(1)
+	}
+}
+
+func (s *server) countExpandHintWriteFailed() {
+	if s.metrics {
+		s.stats.expandHintsWriteFailed.Add(1)
+	}
+}
+
+func (s *server) countExpandHintExpired() {
+	if s.metrics {
+		s.stats.expandHintsExpired.Add(1)
+	}
+}
+
+func (s *server) countExpandHintSkippedMaxLanes() {
+	if s.metrics {
+		s.stats.expandHintsSkippedMaxLanes.Add(1)
 	}
 }
 
@@ -776,10 +1042,16 @@ func (s *session) close() {
 			select {
 			case <-s.queue:
 			default:
-				if s.udp != nil {
-					_ = s.udp.Close()
+				for {
+					select {
+					case <-s.batchQ:
+					default:
+						if s.udp != nil {
+							_ = s.udp.Close()
+						}
+						return
+					}
 				}
-				return
 			}
 		}
 	})
@@ -800,6 +1072,8 @@ func (s *session) addWebSocket(ws *relay.WebSocketConn) (*serverWSLane, bool) {
 	}
 	ln := &serverWSLane{id: s.wsNext.Add(1)}
 	s.ws[ws] = ln
+	s.expandHintInFlight.Store(false)
+	s.expandHintInFlightAt.Store(0)
 	return ln, true
 }
 
@@ -807,6 +1081,12 @@ func (s *session) removeWebSocket(ws *relay.WebSocketConn) {
 	s.wsMu.Lock()
 	delete(s.ws, ws)
 	s.wsMu.Unlock()
+}
+
+func (s *session) wsCount() int {
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+	return len(s.ws)
 }
 
 func (s *session) wsSnapshots() []map[string]any {
@@ -853,7 +1133,7 @@ func (s *session) readLoop(parent *server) {
 	}
 }
 
-func applyServerPluginEnv(env PluginEnv.Env, listen, upstream, cert, key, token, metricsOut, logLevel *string, requireH3, benchEcho, metrics, useSyslog *bool, idle *time.Duration, udpBuffer, downQueue *int) error {
+func applyServerPluginEnv(env PluginEnv.Env, listen, upstream, cert, key, token, metricsOut, logLevel *string, requireH3, benchEcho, metrics, useSyslog *bool, idle, batchDelay, downExpandHintTimeout *time.Duration, udpBuffer, downQueue, batchSize, downExpandLanesMax *int) error {
 	opts := env.Options
 	warnUnknownPluginEnvOptions(opts, knownServerPluginEnvOptions)
 
@@ -881,10 +1161,22 @@ func applyServerPluginEnv(env PluginEnv.Env, listen, upstream, cert, key, token,
 	if err := applyDurationOption(opts, "idle", idle); err != nil {
 		return err
 	}
+	if err := applyDurationOption(opts, "batch-delay", batchDelay); err != nil {
+		return err
+	}
+	if err := applyDurationOption(opts, "down-expand-hint-timeout", downExpandHintTimeout); err != nil {
+		return err
+	}
 	if err := applyIntOption(opts, "udp-buffer", udpBuffer); err != nil {
 		return err
 	}
 	if err := applyIntOption(opts, "down-queue", downQueue); err != nil {
+		return err
+	}
+	if err := applyIntOption(opts, "batch-size", batchSize); err != nil {
+		return err
+	}
+	if err := applyIntOption(opts, "down-expand-lanes-max", downExpandLanesMax); err != nil {
 		return err
 	}
 	host, hasHost := opts.Get("host")
@@ -981,7 +1273,7 @@ func applyDurationOption(opts PluginEnv.Options, key string, dst *time.Duration)
 
 var knownServerPluginEnvOptions = map[string]struct{}{
 	"server": {}, "host": {}, "token": {}, "cert": {}, "key": {},
-	"require-h3": {}, "bench-echo": {}, "metrics": {}, "metrics-out": {}, "log-level": {}, "use-syslog": {}, "idle": {}, "udp-buffer": {}, "down-queue": {},
+	"require-h3": {}, "bench-echo": {}, "metrics": {}, "metrics-out": {}, "log-level": {}, "use-syslog": {}, "idle": {}, "udp-buffer": {}, "down-queue": {}, "batch-size": {}, "batch-delay": {}, "down-expand-lanes-max": {}, "down-expand-hint-timeout": {},
 }
 
 func warnUnknownPluginEnvOptions(opts PluginEnv.Options, known map[string]struct{}) {
