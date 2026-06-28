@@ -481,6 +481,40 @@ func TestWebSocketBacklogPacketsIncludesBatchQueue(t *testing.T) {
 	}
 }
 
+func TestClientSnapshotReportsSendAndBatchQueueMetricsSeparately(t *testing.T) {
+	stats := &clientStats{started: time.Now()}
+	stats.queueDrops.Store(5)
+	stats.sendQDrops.Store(2)
+	stats.batchQDrops.Store(3)
+	c := &clientState{
+		batchSize: 3,
+		stats:     stats,
+		sessions:  map[string]*session{},
+	}
+	sess := &session{
+		id:     "session-1",
+		state:  c,
+		sendQ:  make(chan []byte, 4),
+		batchQ: make(chan []relay.Frame, 5),
+	}
+	sess.sendQ <- []byte("raw-1")
+	sess.sendQ <- []byte("raw-2")
+	sess.batchQ <- []relay.Frame{{PacketID: 1}, {PacketID: 2}, {PacketID: 3}}
+	sess.batchQ <- []relay.Frame{{PacketID: 4}}
+	c.sessions["peer"] = sess
+
+	snap := c.snapshot()
+	if snap["sendq_depth"] != 2 || snap["sendq_capacity"] != 4 || snap["sendq_drops"] != int64(2) {
+		t.Fatalf("sendq metrics=%#v/%#v/%#v, want 2/4/2", snap["sendq_depth"], snap["sendq_capacity"], snap["sendq_drops"])
+	}
+	if snap["batchq_depth"] != 2 || snap["batchq_capacity"] != 5 || snap["batchq_drops"] != int64(3) || snap["batchq_packet_depth"] != 6 {
+		t.Fatalf("batchq metrics depth=%#v cap=%#v drops=%#v packets=%#v, want 2/5/3/6", snap["batchq_depth"], snap["batchq_capacity"], snap["batchq_drops"], snap["batchq_packet_depth"])
+	}
+	if snap["send_queue_depth"] != 8 || snap["send_queue_capacity"] != 9 || snap["send_queue_drops"] != int64(5) {
+		t.Fatalf("compat queue metrics depth=%#v cap=%#v drops=%#v, want 8/9/5", snap["send_queue_depth"], snap["send_queue_capacity"], snap["send_queue_drops"])
+	}
+}
+
 func TestWebSocketWriteBatchReturnsBatchWhenLaneClosesWhileWaitingForPostSlot(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
