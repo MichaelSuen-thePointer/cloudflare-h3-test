@@ -57,6 +57,7 @@ type batchResult struct {
 func main() {
 	var rawURL, out, onlyMode, onlyLabel, connectIPOverride string
 	var count, concurrency int
+	var maxBytes int64
 	var timeout time.Duration
 	flag.StringVar(&rawURL, "url", "https://relay.example.com:2087/50M.txt", "download URL")
 	flag.StringVar(&out, "out", "", "optional JSONL output path")
@@ -65,6 +66,7 @@ func main() {
 	flag.StringVar(&connectIPOverride, "connect-ip", "", "optional single connect IP override")
 	flag.IntVar(&count, "count", 1, "requests per selected target/mode")
 	flag.IntVar(&concurrency, "concurrency", 1, "parallel requests when count is greater than 1")
+	flag.Int64Var(&maxBytes, "max-bytes", 0, "maximum response bytes to read per request, 0 reads the full response")
 	flag.DurationVar(&timeout, "timeout", 90*time.Second, "request timeout")
 	flag.Parse()
 
@@ -103,10 +105,10 @@ func main() {
 				continue
 			}
 			if count <= 1 {
-				res := run(rawURL, mode, target.label, target.ip, timeout)
+				res := run(rawURL, mode, target.label, target.ip, timeout, maxBytes)
 				_ = enc.Encode(res)
 			} else {
-				res := runBatch(rawURL, mode, target.label, target.ip, timeout, count, concurrency)
+				res := runBatch(rawURL, mode, target.label, target.ip, timeout, count, concurrency, maxBytes)
 				_ = enc.Encode(res)
 			}
 			time.Sleep(time.Second)
@@ -114,7 +116,7 @@ func main() {
 	}
 }
 
-func runBatch(rawURL, mode, label, connectIP string, timeout time.Duration, count, concurrency int) batchResult {
+func runBatch(rawURL, mode, label, connectIP string, timeout time.Duration, count, concurrency int, maxBytes int64) batchResult {
 	if concurrency < 1 {
 		concurrency = 1
 	}
@@ -141,7 +143,7 @@ func runBatch(rawURL, mode, label, connectIP string, timeout time.Duration, coun
 		go func() {
 			defer wg.Done()
 			for range jobs {
-				n, err := fetchOnce(client, rawURL)
+				n, err := fetchOnce(client, rawURL, maxBytes)
 				if err != nil {
 					atomic.AddInt64(&errs, 1)
 					continue
@@ -170,7 +172,7 @@ func runBatch(rawURL, mode, label, connectIP string, timeout time.Duration, coun
 	return res
 }
 
-func fetchOnce(client *http.Client, rawURL string) (int64, error) {
+func fetchOnce(client *http.Client, rawURL string, maxBytes int64) (int64, error) {
 	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil {
 		return 0, err
@@ -181,7 +183,11 @@ func fetchOnce(client *http.Client, rawURL string) (int64, error) {
 		return 0, err
 	}
 	defer resp.Body.Close()
-	n, err := io.Copy(io.Discard, resp.Body)
+	var reader io.Reader = resp.Body
+	if maxBytes > 0 {
+		reader = io.LimitReader(resp.Body, maxBytes)
+	}
+	n, err := io.Copy(io.Discard, reader)
 	if err != nil {
 		return n, err
 	}
@@ -191,7 +197,7 @@ func fetchOnce(client *http.Client, rawURL string) (int64, error) {
 	return n, nil
 }
 
-func run(rawURL, mode, label, connectIP string, timeout time.Duration) result {
+func run(rawURL, mode, label, connectIP string, timeout time.Duration, maxBytes int64) result {
 	started := time.Now()
 	res := result{Label: label, Mode: mode, URL: rawURL, ConnectIP: connectIP, Started: started.Format(time.RFC3339Nano)}
 	client, closeFn, err := newClient(rawURL, mode, connectIP, timeout)
@@ -224,7 +230,11 @@ func run(rawURL, mode, label, connectIP string, timeout time.Duration) result {
 		return res
 	}
 	defer resp.Body.Close()
-	n, err := io.Copy(io.Discard, resp.Body)
+	var reader io.Reader = resp.Body
+	if maxBytes > 0 {
+		reader = io.LimitReader(resp.Body, maxBytes)
+	}
+	n, err := io.Copy(io.Discard, reader)
 	finished := time.Now()
 	res.RemoteAddr = remoteAddr
 	res.Proto = resp.Proto
