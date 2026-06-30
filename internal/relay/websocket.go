@@ -32,7 +32,16 @@ type WebSocketConn struct {
 	writeTimeout time.Duration
 }
 
+type WebSocketSocketOptions struct {
+	SendBuffer    int
+	ReceiveBuffer int
+}
+
 func DialWebSocket(ctx context.Context, rawURL, connectIP, token string, timeout time.Duration) (*WebSocketConn, error) {
+	return DialWebSocketWithOptions(ctx, rawURL, connectIP, token, timeout, WebSocketSocketOptions{})
+}
+
+func DialWebSocketWithOptions(ctx context.Context, rawURL, connectIP, token string, timeout time.Duration, socketOptions WebSocketSocketOptions) (*WebSocketConn, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, err
@@ -50,6 +59,10 @@ func DialWebSocket(ctx context.Context, rawURL, connectIP, token string, timeout
 	dialer := &net.Dialer{Timeout: timeout}
 	raw, err := dialer.DialContext(ctx, "tcp", dialAddr)
 	if err != nil {
+		return nil, err
+	}
+	if err := configureWebSocketSocket(raw, socketOptions); err != nil {
+		raw.Close()
 		return nil, err
 	}
 	conn := raw
@@ -145,6 +158,10 @@ func AttachWebSocketSession(ctx context.Context, ws *WebSocketConn, sessionID st
 }
 
 func AcceptWebSocket(w http.ResponseWriter, r *http.Request) (*WebSocketConn, error) {
+	return AcceptWebSocketWithOptions(w, r, WebSocketSocketOptions{})
+}
+
+func AcceptWebSocketWithOptions(w http.ResponseWriter, r *http.Request, socketOptions WebSocketSocketOptions) (*WebSocketConn, error) {
 	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") || !headerHasToken(r.Header.Get("Connection"), "upgrade") {
 		return nil, errors.New("not websocket upgrade")
 	}
@@ -162,6 +179,10 @@ func AcceptWebSocket(w http.ResponseWriter, r *http.Request) (*WebSocketConn, er
 	if err != nil {
 		return nil, err
 	}
+	if err := configureWebSocketSocket(conn, socketOptions); err != nil {
+		conn.Close()
+		return nil, err
+	}
 	resp := "HTTP/1.1 101 Switching Protocols\r\n" +
 		"Upgrade: websocket\r\n" +
 		"Connection: Upgrade\r\n" +
@@ -175,6 +196,38 @@ func AcceptWebSocket(w http.ResponseWriter, r *http.Request) (*WebSocketConn, er
 		return nil, err
 	}
 	return &WebSocketConn{conn: conn, reader: rw.Reader, mask: false, writeTimeout: DefaultWebSocketWriteTimeout}, nil
+}
+
+func configureWebSocketSocket(conn net.Conn, options WebSocketSocketOptions) error {
+	tcp := tcpConnForWebSocket(conn)
+	if tcp == nil {
+		return nil
+	}
+	if err := tcp.SetNoDelay(true); err != nil {
+		return err
+	}
+	if options.SendBuffer > 0 {
+		if err := tcp.SetWriteBuffer(options.SendBuffer); err != nil {
+			return err
+		}
+	}
+	if options.ReceiveBuffer > 0 {
+		if err := tcp.SetReadBuffer(options.ReceiveBuffer); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func tcpConnForWebSocket(conn net.Conn) *net.TCPConn {
+	switch c := conn.(type) {
+	case *net.TCPConn:
+		return c
+	case interface{ NetConn() net.Conn }:
+		return tcpConnForWebSocket(c.NetConn())
+	default:
+		return nil
+	}
 }
 
 func (c *WebSocketConn) Close() error {

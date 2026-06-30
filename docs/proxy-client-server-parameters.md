@@ -144,6 +144,8 @@ ws 相关参数：
 |---|---:|---|
 | `-ws-lanes` | `12` | 默认策略下每 session 一次性获取的 lane 数；也是 standby pool 目标空闲数。 |
 | `-ws-lanes-incremental` | `false` | 增量策略。初始只拿 1 条 lane；之后每 10ms 检查一次 batchQ，积压超过 1 个 batch 时后台申请新 lane，最多到 `-ws-lanes`。 |
+| `-ws-socket-send-buffer` | `0` | WebSocket TCP socket send buffer bytes；`0` 保持系统默认。 |
+| `-ws-socket-recv-buffer` | `0` | WebSocket TCP socket receive buffer bytes；`0` 保持系统默认。 |
 | `-batch-size` | `3` | 一个 WebSocket binary message 最多合并多少个 UDP 包。 |
 | `-batch-delay` | `1ms` | 等待凑 batch 的最长时间。 |
 | `-max-inflight-posts` | `20` | WebSocket send batch 并发上限，也复用 posts 信号量。 |
@@ -221,6 +223,8 @@ ws 相关参数：
 | `-down-queue` | `65536` | 每 session 下行 queue 容量；满时 drop oldest。 |
 | `-batch-size` | `3` | WebSocket 下行 batch 最多合并多少个 UDP 包。 |
 | `-batch-delay` | `1ms` | WebSocket 下行等待凑 batch 的最长时间。 |
+| `-ws-socket-send-buffer` | `0` | WebSocket TCP socket send buffer bytes；`0` 保持系统默认。 |
+| `-ws-socket-recv-buffer` | `0` | WebSocket TCP socket receive buffer bytes；`0` 保持系统默认。 |
 | `-down-expand-lanes-max` | `12` | server 下行积压 hint 的 lane 上限；当前 attached WS lane 数达到该值时不再发 hint。 |
 | `-down-expand-hint-timeout` | `15s` | server 发出扩 lane hint 后等待新 lane attach 的超时时间；超时后允许重发。 |
 

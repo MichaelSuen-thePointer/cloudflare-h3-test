@@ -69,6 +69,7 @@ type server struct {
 	downQueue             int
 	batchSize             int
 	batchDelay            time.Duration
+	wsSocketOptions       relay.WebSocketSocketOptions
 	downExpandLanesMax    int
 	downExpandHintTimeout time.Duration
 	metrics               bool
@@ -113,7 +114,7 @@ type serverStats struct {
 
 func Main(args []string) {
 	var listen, cert, key, token, upstream, metricsOut, logLevel string
-	var udpBuffer, downQueue, batchSize, downExpandLanesMax int
+	var udpBuffer, downQueue, batchSize, downExpandLanesMax, wsSocketSendBuffer, wsSocketReceiveBuffer int
 	var requireH3, benchEcho, metrics, useSyslog bool
 	var idle, batchDelay, downExpandHintTimeout time.Duration
 	fs := flag.NewFlagSet("proxy-server", flag.ExitOnError)
@@ -133,6 +134,8 @@ func Main(args []string) {
 	fs.IntVar(&downQueue, "down-queue", 65536, "per-session downlink queue capacity")
 	fs.IntVar(&batchSize, "batch-size", 3, "maximum UDP packets per WebSocket downlink batch")
 	fs.DurationVar(&batchDelay, "batch-delay", time.Millisecond, "maximum time to wait for a partially filled WebSocket downlink batch")
+	fs.IntVar(&wsSocketSendBuffer, "ws-socket-send-buffer", 0, "WebSocket TCP socket send buffer bytes, 0 keeps OS default")
+	fs.IntVar(&wsSocketReceiveBuffer, "ws-socket-recv-buffer", 0, "WebSocket TCP socket receive buffer bytes, 0 keeps OS default")
 	fs.IntVar(&downExpandLanesMax, "down-expand-lanes-max", 12, "maximum attached WebSocket lanes before suppressing server downlink expand hints")
 	fs.DurationVar(&downExpandHintTimeout, "down-expand-hint-timeout", 15*time.Second, "time to wait for a hinted WebSocket lane before sending another downlink expand hint")
 	fs.Parse(args)
@@ -157,7 +160,7 @@ func Main(args []string) {
 		if err := configureLogger("proxy-server", logLevel, useSyslog); err != nil {
 			log.Fatal(err)
 		}
-		if err := applyServerPluginEnv(pluginEnv, &listen, &upstream, &cert, &key, &token, &metricsOut, &logLevel, &requireH3, &benchEcho, &metrics, &useSyslog, &idle, &batchDelay, &downExpandHintTimeout, &udpBuffer, &downQueue, &batchSize, &downExpandLanesMax); err != nil {
+		if err := applyServerPluginEnv(pluginEnv, &listen, &upstream, &cert, &key, &token, &metricsOut, &logLevel, &requireH3, &benchEcho, &metrics, &useSyslog, &idle, &batchDelay, &downExpandHintTimeout, &udpBuffer, &downQueue, &batchSize, &downExpandLanesMax, &wsSocketSendBuffer, &wsSocketReceiveBuffer); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -173,12 +176,19 @@ func Main(args []string) {
 	if downExpandHintTimeout <= 0 {
 		downExpandHintTimeout = 15 * time.Second
 	}
+	if wsSocketSendBuffer < 0 {
+		wsSocketSendBuffer = 0
+	}
+	if wsSocketReceiveBuffer < 0 {
+		wsSocketReceiveBuffer = 0
+	}
 	addr, err := net.ResolveUDPAddr("udp", upstream)
 	if err != nil {
 		log.Fatal(err)
 	}
 	metrics = metrics || metricsOut != ""
-	s := &server{token: token, requireH3: requireH3, upstream: addr, benchEcho: benchEcho, idle: idle, udpBuffer: udpBuffer, downQueue: downQueue, batchSize: batchSize, batchDelay: batchDelay, downExpandLanesMax: downExpandLanesMax, downExpandHintTimeout: downExpandHintTimeout, metrics: metrics, sessions: map[string]*session{}}
+	wsSocketOptions := relay.WebSocketSocketOptions{SendBuffer: wsSocketSendBuffer, ReceiveBuffer: wsSocketReceiveBuffer}
+	s := &server{token: token, requireH3: requireH3, upstream: addr, benchEcho: benchEcho, idle: idle, udpBuffer: udpBuffer, downQueue: downQueue, batchSize: batchSize, batchDelay: batchDelay, wsSocketOptions: wsSocketOptions, downExpandLanesMax: downExpandLanesMax, downExpandHintTimeout: downExpandHintTimeout, metrics: metrics, sessions: map[string]*session{}}
 	go s.cleanupLoop()
 	if metricsOut != "" {
 		go s.writeMetrics(metricsOut, 5*time.Second)
@@ -187,7 +197,7 @@ func Main(args []string) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handle)
-	appLog.Info("proxy-server-start", "listen", listen, "upstream", upstream, "require_h3", requireH3, "bench_echo", benchEcho, "metrics", metrics, "batch_size", batchSize, "batch_delay", batchDelay, "down_expand_lanes_max", downExpandLanesMax, "down_expand_hint_timeout", downExpandHintTimeout)
+	appLog.Info("proxy-server-start", "listen", listen, "upstream", upstream, "require_h3", requireH3, "bench_echo", benchEcho, "metrics", metrics, "batch_size", batchSize, "batch_delay", batchDelay, "ws_socket_send_buffer", wsSocketSendBuffer, "ws_socket_recv_buffer", wsSocketReceiveBuffer, "down_expand_lanes_max", downExpandLanesMax, "down_expand_hint_timeout", downExpandHintTimeout)
 	httpServer := &http.Server{Addr: listen, Handler: mux, ErrorLog: appLog.StdLogger(diaglog.Warn, "http-server-error")}
 	if cert == "" && key == "" {
 		log.Fatal(httpServer.ListenAndServe())
@@ -241,7 +251,7 @@ func (s *server) handle(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	ws, err := relay.AcceptWebSocket(w, r)
+	ws, err := relay.AcceptWebSocketWithOptions(w, r, s.wsSocketOptions)
 	if err != nil {
 		appLog.WarnRate("websocket_accept_failed", 10*time.Second, "websocket-accept-failed", "remote", r.RemoteAddr, "err", err)
 		return
@@ -1136,7 +1146,7 @@ func (s *session) readLoop(parent *server) {
 	}
 }
 
-func applyServerPluginEnv(env PluginEnv.Env, listen, upstream, cert, key, token, metricsOut, logLevel *string, requireH3, benchEcho, metrics, useSyslog *bool, idle, batchDelay, downExpandHintTimeout *time.Duration, udpBuffer, downQueue, batchSize, downExpandLanesMax *int) error {
+func applyServerPluginEnv(env PluginEnv.Env, listen, upstream, cert, key, token, metricsOut, logLevel *string, requireH3, benchEcho, metrics, useSyslog *bool, idle, batchDelay, downExpandHintTimeout *time.Duration, udpBuffer, downQueue, batchSize, downExpandLanesMax, wsSocketSendBuffer, wsSocketReceiveBuffer *int) error {
 	opts := env.Options
 	warnUnknownPluginEnvOptions(opts, knownServerPluginEnvOptions)
 
@@ -1180,6 +1190,12 @@ func applyServerPluginEnv(env PluginEnv.Env, listen, upstream, cert, key, token,
 		return err
 	}
 	if err := applyIntOption(opts, "down-expand-lanes-max", downExpandLanesMax); err != nil {
+		return err
+	}
+	if err := applyIntOption(opts, "ws-socket-send-buffer", wsSocketSendBuffer); err != nil {
+		return err
+	}
+	if err := applyIntOption(opts, "ws-socket-recv-buffer", wsSocketReceiveBuffer); err != nil {
 		return err
 	}
 	host, hasHost := opts.Get("host")
@@ -1276,7 +1292,7 @@ func applyDurationOption(opts PluginEnv.Options, key string, dst *time.Duration)
 
 var knownServerPluginEnvOptions = map[string]struct{}{
 	"server": {}, "host": {}, "token": {}, "cert": {}, "key": {},
-	"require-h3": {}, "bench-echo": {}, "metrics": {}, "metrics-out": {}, "log-level": {}, "use-syslog": {}, "idle": {}, "udp-buffer": {}, "down-queue": {}, "batch-size": {}, "batch-delay": {}, "down-expand-lanes-max": {}, "down-expand-hint-timeout": {},
+	"require-h3": {}, "bench-echo": {}, "metrics": {}, "metrics-out": {}, "log-level": {}, "use-syslog": {}, "idle": {}, "udp-buffer": {}, "down-queue": {}, "batch-size": {}, "batch-delay": {}, "down-expand-lanes-max": {}, "down-expand-hint-timeout": {}, "ws-socket-send-buffer": {}, "ws-socket-recv-buffer": {},
 }
 
 func warnUnknownPluginEnvOptions(opts PluginEnv.Options, known map[string]struct{}) {

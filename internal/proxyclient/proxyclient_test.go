@@ -758,7 +758,7 @@ func TestWebSocketPoolAcquireAttachesSession(t *testing.T) {
 		}
 	}()
 
-	pool := newWSPool("http://"+ln.Addr().String()+"/", "", "example-token", 1, time.Second)
+	pool := newWSPool("http://"+ln.Addr().String()+"/", "", "example-token", 1, time.Second, relay.WebSocketSocketOptions{})
 	defer pool.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -776,7 +776,7 @@ func TestWebSocketPoolAcquireAttachesSession(t *testing.T) {
 }
 
 func TestApplyClientPluginEnvMapsAddressesAndOptions(t *testing.T) {
-	opts, err := PluginEnv.ParseOptions("host=relay.example;path=ray;token=example-secret;transport=ws;log-level=warn;use-syslog;ws-lanes=8;ws-lanes-incremental;batch-delay=2ms;http-timeout=3s")
+	opts, err := PluginEnv.ParseOptions("host=relay.example;path=ray;token=example-secret;transport=ws;log-level=warn;use-syslog;ws-lanes=8;ws-lanes-incremental;batch-delay=2ms;http-timeout=3s;ws-socket-send-buffer=262144;ws-socket-recv-buffer=131072")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -799,6 +799,8 @@ func TestApplyClientPluginEnvMapsAddressesAndOptions(t *testing.T) {
 	maxInflightPosts := 20
 	batchSize := 3
 	sendQueue := 4096
+	wsSocketSendBuffer := 0
+	wsSocketReceiveBuffer := 0
 	wsLanesIncremental := false
 	metrics := false
 	useSyslog := false
@@ -808,7 +810,7 @@ func TestApplyClientPluginEnvMapsAddressesAndOptions(t *testing.T) {
 	idle := 120 * time.Second
 	metricsOut := ""
 
-	err = applyClientPluginEnv(env, &listen, &remote, &token, &connectIP, &transport, &logLevel, &lanesN, &wsLanesN, &wsLanesMax, &wsLanesUpgradeQueue, &polls, &maxInflightPosts, &batchSize, &sendQueue, &wsLanesAuto, &wsLanesIncremental, &metrics, &useSyslog, &timeout, &metricsInterval, &batchDelay, &idle, &metricsOut)
+	err = applyClientPluginEnv(env, &listen, &remote, &token, &connectIP, &transport, &logLevel, &wsLanesN, &polls, &maxInflightPosts, &batchSize, &sendQueue, &wsSocketSendBuffer, &wsSocketReceiveBuffer, &wsLanesIncremental, &metrics, &useSyslog, &timeout, &metricsInterval, &batchDelay, &idle, &metricsOut)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -821,8 +823,8 @@ func TestApplyClientPluginEnvMapsAddressesAndOptions(t *testing.T) {
 	if connectIP != "203.0.113.10" {
 		t.Fatalf("connectIP=%q, want 203.0.113.10", connectIP)
 	}
-	if token != "example-secret" || transport != "ws" || logLevel != "warn" || !useSyslog || wsLanesN != 8 || !wsLanesIncremental || batchDelay != 2*time.Millisecond || timeout != 3*time.Second {
-		t.Fatalf("mapped token=%q transport=%q logLevel=%q useSyslog=%v wsLanes=%d incremental=%v batchDelay=%v timeout=%v", token, transport, logLevel, useSyslog, wsLanesN, wsLanesIncremental, batchDelay, timeout)
+	if token != "example-secret" || transport != "ws" || logLevel != "warn" || !useSyslog || wsLanesN != 8 || !wsLanesIncremental || batchDelay != 2*time.Millisecond || timeout != 3*time.Second || wsSocketSendBuffer != 262144 || wsSocketReceiveBuffer != 131072 {
+		t.Fatalf("mapped token=%q transport=%q logLevel=%q useSyslog=%v wsLanes=%d incremental=%v batchDelay=%v timeout=%v wsSendBuf=%d wsRecvBuf=%d", token, transport, logLevel, useSyslog, wsLanesN, wsLanesIncremental, batchDelay, timeout, wsSocketSendBuffer, wsSocketReceiveBuffer)
 	}
 }
 
@@ -835,12 +837,13 @@ func TestApplyClientPluginEnvTLSFalse(t *testing.T) {
 	listen, remote, token, connectIP, transport := "", "", "", "", "ws"
 	logLevel := "info"
 	wsLanesN, polls, maxInflightPosts, batchSize, sendQueue := 12, 2, 20, 3, 4096
+	wsSocketSendBuffer, wsSocketReceiveBuffer := 0, 0
 	wsLanesIncremental, metrics := false, false
 	useSyslog := false
 	timeout, metricsInterval, batchDelay, idle := 15*time.Second, time.Second, time.Millisecond, 120*time.Second
 	metricsOut := ""
 
-	if err := applyClientPluginEnv(env, &listen, &remote, &token, &connectIP, &transport, &logLevel, &lanesN, &wsLanesN, &wsLanesMax, &wsLanesUpgradeQueue, &polls, &maxInflightPosts, &batchSize, &sendQueue, &wsLanesAuto, &wsLanesIncremental, &metrics, &useSyslog, &timeout, &metricsInterval, &batchDelay, &idle, &metricsOut); err != nil {
+	if err := applyClientPluginEnv(env, &listen, &remote, &token, &connectIP, &transport, &logLevel, &wsLanesN, &polls, &maxInflightPosts, &batchSize, &sendQueue, &wsSocketSendBuffer, &wsSocketReceiveBuffer, &wsLanesIncremental, &metrics, &useSyslog, &timeout, &metricsInterval, &batchDelay, &idle, &metricsOut); err != nil {
 		t.Fatal(err)
 	}
 	if remote != "http://example.com:80/" {
