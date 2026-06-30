@@ -15,11 +15,12 @@ const (
 )
 
 type wsPool struct {
-	remote    string
-	connectIP string
-	token     string
-	target    int
-	timeout   time.Duration
+	remote        string
+	connectIP     string
+	token         string
+	target        int
+	timeout       time.Duration
+	socketOptions relay.WebSocketSocketOptions
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -35,17 +36,18 @@ type pooledWebSocket struct {
 	conn *relay.WebSocketConn
 }
 
-func newWSPool(remote, connectIP, token string, target int, timeout time.Duration) *wsPool {
+func newWSPool(remote, connectIP, token string, target int, timeout time.Duration, socketOptions relay.WebSocketSocketOptions) *wsPool {
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &wsPool{
-		remote:    remote,
-		connectIP: connectIP,
-		token:     token,
-		target:    target,
-		timeout:   timeout,
-		ctx:       ctx,
-		cancel:    cancel,
-		idle:      make(chan pooledWebSocket, target),
+		remote:        remote,
+		connectIP:     connectIP,
+		token:         token,
+		target:        target,
+		timeout:       timeout,
+		socketOptions: socketOptions,
+		ctx:           ctx,
+		cancel:        cancel,
+		idle:          make(chan pooledWebSocket, target),
 	}
 	p.refill()
 	go p.run()
@@ -187,7 +189,7 @@ func (p *wsPool) dialIdle() {
 }
 
 func (p *wsPool) dial(ctx context.Context, token string) (*relay.WebSocketConn, error) {
-	return relay.DialWebSocket(ctx, p.remote, p.connectIP, token, p.timeout)
+	return relay.DialWebSocketWithOptions(ctx, p.remote, p.connectIP, token, p.timeout, p.socketOptions)
 }
 
 func attachWebSocket(ctx context.Context, ws *relay.WebSocketConn, sessionID string) error {
