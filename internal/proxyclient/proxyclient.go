@@ -12,8 +12,10 @@ import (
 	"log"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -110,7 +112,7 @@ var (
 )
 
 func Main(args []string) {
-	var listen, remote, token, connectIP, metricsOut, transport, logLevel string
+	var listen, remote, token, connectIP, metricsOut, transport, logLevel, pprofAddr string
 	var wsLanesN, polls, maxInflightPosts, batchSize, sendQueue, wsSocketSendBuffer, wsSocketReceiveBuffer int
 	var wsLanesIncremental, metrics, useSyslog bool
 	var timeout, metricsInterval, batchDelay, idle time.Duration
@@ -134,6 +136,7 @@ func Main(args []string) {
 	fs.BoolVar(&metrics, "metrics", false, "enable in-memory metrics counters")
 	fs.DurationVar(&metricsInterval, "metrics-interval", 1*time.Second, "metrics snapshot interval")
 	fs.StringVar(&metricsOut, "metrics-out", "", "optional JSONL metrics output path")
+	fs.StringVar(&pprofAddr, "pprof", "", "optional local pprof listen address, for example 127.0.0.1:6060")
 	fs.StringVar(&logLevel, "log-level", "info", "diagnostic log level: debug, info, warn, or error")
 	fs.BoolVar(&useSyslog, "use-syslog", false, "write diagnostic logs to syslog instead of stderr")
 	fs.Parse(args)
@@ -189,6 +192,16 @@ func Main(args []string) {
 	}
 	if idle <= 0 {
 		idle = 120 * time.Second
+	}
+	if pprofAddr != "" {
+		runtime.SetBlockProfileRate(1)
+		runtime.SetMutexProfileFraction(10)
+		go func() {
+			appLog.Info("proxy-client-pprof-start", "listen", pprofAddr)
+			if err := http.ListenAndServe(pprofAddr, nil); err != nil {
+				appLog.Warn("proxy-client-pprof-failed", "listen", pprofAddr, "err", err)
+			}
+		}()
 	}
 	addr, err := net.ResolveUDPAddr("udp", listen)
 	if err != nil {
