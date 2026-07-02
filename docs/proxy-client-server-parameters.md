@@ -96,8 +96,8 @@ h3 相关参数：
 
 | 参数 | 默认值 | 含义 |
 |---|---:|---|
-| `-ws-lanes` | `16` | h3/ws 共用的每 session lane 数。h3 中每条 lane 维护一个 streaming GET，并用同 lane header 发上行 POST。 |
-| `-ws-lanes-incremental` | `true` | ws 增量建 lane 策略。 |
+| `-ws-lanes` | `1` | h3/ws 共用的每 session lane 数。h3 中每条 lane 维护一个 streaming GET，并用同 lane header 发上行 POST。 |
+| `-ws-lanes-incremental` | `false` | ws 增量建 lane 策略。 |
 | `-send-queue` | `16384` | 每 session 上行队列容量；满时 drop oldest。h3 高速测试建议 `65536`。 |
 
 h3 推荐组合：
@@ -139,11 +139,11 @@ ws 相关参数：
 
 | 参数 | 默认值 | 含义 |
 |---|---:|---|
-| `-ws-lanes` | `16` | 每 session WebSocket lane 上限；也是 standby pool 目标空闲数。 |
-| `-ws-lanes-incremental` | `true` | 增量策略。初始只拿 1 条 lane；之后每 10ms 检查一次 batchQ，积压超过 1 个 batch 时后台申请新 lane，最多到 `-ws-lanes`。 |
+| `-ws-lanes` | `1` | 每 session WebSocket lane 上限；也是 standby pool 目标空闲数。 |
+| `-ws-lanes-incremental` | `false` | 增量策略。初始只拿 1 条 lane；之后每 10ms 检查一次 batchQ，积压超过 1 个 batch 时后台申请新 lane，最多到 `-ws-lanes`。 |
 | `-ws-socket-send-buffer` | `0` | WebSocket TCP socket send buffer bytes；`0` 保持系统默认。 |
 | `-ws-socket-recv-buffer` | `0` | WebSocket TCP socket receive buffer bytes；`0` 保持系统默认。 |
-| `-batch-size` | `16` | 一个 WebSocket binary message 最多合并多少个 UDP 包。 |
+| `-batch-size` | `20` | 一个 WebSocket binary message 最多合并多少个 UDP 包。 |
 | `-batch-delay` | `0s` | 等待凑 batch 的最长时间。 |
 | `-max-inflight-posts` | `20` | HTTP POST/H3 POST 并发上限；WebSocket 模式不使用。 |
 
@@ -196,7 +196,7 @@ ws 相关参数：
 
 - 当前增长触发条件是 `len(batchQ) > 1`，不是“sendQ 非空”。
 - 如果已有 lane 足够及时消费 batchQ，可能不会增长到 `-ws-lanes`。
-- 早期同 IP 小 sweep 中，全 12 lane 延迟优于当时的 incremental；当前默认已按后续压测改为 incremental + 16 lane 上限。
+- 早期多 lane/incremental 组合在部分场景有优势；当前默认已按后续压测改为单 lane 非 incremental。
 - 旧实验参数 `-ws-lanes-auto`、`-ws-lanes-max`、`-ws-lanes-upgrade-queue` 已移除；迁移时改用 `-ws-lanes-incremental` 和 `-ws-lanes`。
 
 ## 3. proxy-server 参数
@@ -219,11 +219,11 @@ ws 相关参数：
 | `-idle` | `120s` | server session 空闲超时。 |
 | `-udp-buffer` | `4194304` | upstream UDP socket read/write buffer。 |
 | `-down-queue` | `65536` | 每 session 下行 queue 容量；满时 drop oldest。 |
-| `-batch-size` | `16` | WebSocket 下行 batch 最多合并多少个 UDP 包。 |
+| `-batch-size` | `20` | WebSocket 下行 batch 最多合并多少个 UDP 包。 |
 | `-batch-delay` | `0s` | WebSocket 下行等待凑 batch 的最长时间。 |
 | `-ws-socket-send-buffer` | `0` | WebSocket TCP socket send buffer bytes；`0` 保持系统默认。 |
 | `-ws-socket-recv-buffer` | `0` | WebSocket TCP socket receive buffer bytes；`0` 保持系统默认。 |
-| `-down-expand-lanes-max` | `16` | server 下行积压 hint 的 lane 上限；当前 attached WS lane 数达到该值时不再发 hint。 |
+| `-down-expand-lanes-max` | `1` | server 下行积压 hint 的 lane 上限；当前 attached WS lane 数达到该值时不再发 hint。 |
 | `-down-expand-hint-timeout` | `15s` | server 发出扩 lane hint 后等待新 lane attach 的超时时间；超时后允许重发。 |
 
 TLS 行为：
@@ -343,9 +343,9 @@ WebSocket 请求不走 `X-Relay-Session` 握手 header。server 流程：
 
 特点：
 
-- 默认启用 incremental，初始获取 1 lane，积压后增长到最多 16 lane。
-- 使用 `batch-size=16`、`batch-delay=0s`、`send-queue=16384` 的当前压测最佳组合。
-- 如需旧的一次性全 lane 策略，显式设置 `-ws-lanes-incremental=false`。
+- 默认单 lane 非 incremental，不启动扩 lane 检查。
+- 使用 `batch-size=20`、`batch-delay=0s`、`ws-lanes=1`、`ws-lanes-incremental=false` 的当前压测最佳组合。
+- 如需多 lane 增长，显式设置 `-ws-lanes` 大于 1 并开启 `-ws-lanes-incremental`。
 
 ### 4.3 Cloudflare WS 增量建联组合
 
