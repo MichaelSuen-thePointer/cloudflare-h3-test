@@ -132,11 +132,11 @@ func Main(args []string) {
 	fs.DurationVar(&idle, "idle", 120*time.Second, "session idle timeout")
 	fs.IntVar(&udpBuffer, "udp-buffer", 4<<20, "UDP socket read/write buffer bytes")
 	fs.IntVar(&downQueue, "down-queue", 65536, "per-session downlink queue capacity")
-	fs.IntVar(&batchSize, "batch-size", 16, "maximum UDP packets per WebSocket downlink batch")
+	fs.IntVar(&batchSize, "batch-size", 20, "maximum UDP packets per WebSocket downlink batch")
 	fs.DurationVar(&batchDelay, "batch-delay", 0, "maximum time to wait for a partially filled WebSocket downlink batch")
 	fs.IntVar(&wsSocketSendBuffer, "ws-socket-send-buffer", 0, "WebSocket TCP socket send buffer bytes, 0 keeps OS default")
 	fs.IntVar(&wsSocketReceiveBuffer, "ws-socket-recv-buffer", 0, "WebSocket TCP socket receive buffer bytes, 0 keeps OS default")
-	fs.IntVar(&downExpandLanesMax, "down-expand-lanes-max", 16, "maximum attached WebSocket lanes before suppressing server downlink expand hints")
+	fs.IntVar(&downExpandLanesMax, "down-expand-lanes-max", 1, "maximum attached WebSocket lanes before suppressing server downlink expand hints")
 	fs.DurationVar(&downExpandHintTimeout, "down-expand-hint-timeout", 15*time.Second, "time to wait for a hinted WebSocket lane before sending another downlink expand hint")
 	fs.Parse(args)
 
