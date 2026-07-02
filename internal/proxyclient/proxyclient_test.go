@@ -322,7 +322,7 @@ func TestIncrementalWebSocketLaneDoesNotAddLaneForSingleQueuedBatch(t *testing.T
 
 func TestWebSocketExpandHintSetsPending(t *testing.T) {
 	stats := &clientStats{started: time.Now()}
-	c := &clientState{metrics: true, stats: stats}
+	c := &clientState{wsLanesN: 2, metrics: true, stats: stats}
 	sess := &session{id: "hint-session", metrics: true, stats: stats}
 	body, err := relay.EncodeControl(relay.ControlOpExpandLanesHint, nil)
 	if err != nil {
@@ -334,6 +334,26 @@ func TestWebSocketExpandHintSetsPending(t *testing.T) {
 	}
 	if !sess.expandHintPending.Load() {
 		t.Fatal("expandHintPending=false, want true")
+	}
+	if got := stats.wsExpandHintsReceived.Load(); got != 1 {
+		t.Fatalf("wsExpandHintsReceived=%d, want 1", got)
+	}
+}
+
+func TestWebSocketExpandHintIgnoredWhenMaxLaneOne(t *testing.T) {
+	stats := &clientStats{started: time.Now()}
+	c := &clientState{wsLanesN: 1, metrics: true, stats: stats}
+	sess := &session{id: "hint-session", metrics: true, stats: stats}
+	body, err := relay.EncodeControl(relay.ControlOpExpandLanesHint, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !sess.handleWSControlMessage(c, 0, body) {
+		t.Fatal("control message was not handled")
+	}
+	if sess.expandHintPending.Load() {
+		t.Fatal("expandHintPending=true, want false")
 	}
 	if got := stats.wsExpandHintsReceived.Load(); got != 1 {
 		t.Fatalf("wsExpandHintsReceived=%d, want 1", got)
@@ -371,7 +391,7 @@ func TestWebSocketExpandHintDoesNotTriggerWhenIncrementalDisabled(t *testing.T) 
 	}
 }
 
-func TestWebSocketExpandHintSkippedWhenFull(t *testing.T) {
+func TestWebSocketExpandHintShortCircuitsWhenMaxLaneOne(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	stats := &clientStats{started: time.Now()}
@@ -396,11 +416,11 @@ func TestWebSocketExpandHintSkippedWhenFull(t *testing.T) {
 
 	sess.maybeAcquireIncrementalWebSocketLane()
 
-	if sess.expandHintPending.Load() {
-		t.Fatal("expandHintPending=true, want cleared")
+	if !sess.expandHintPending.Load() {
+		t.Fatal("expandHintPending=false, want unchanged")
 	}
-	if got := stats.wsIncrementalAcquireSkippedFull.Load(); got != 1 {
-		t.Fatalf("wsIncrementalAcquireSkippedFull=%d, want 1", got)
+	if got := stats.wsIncrementalAcquireSkippedFull.Load(); got != 0 {
+		t.Fatalf("wsIncrementalAcquireSkippedFull=%d, want 0", got)
 	}
 }
 
