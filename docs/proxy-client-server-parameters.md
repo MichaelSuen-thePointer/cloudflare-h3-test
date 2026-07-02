@@ -51,9 +51,6 @@
   -remote https://relay.example.com:2083/ `
   -connect-ip 172.64.90.55 `
   -transport ws `
-  -ws-lanes 12 `
-  -batch-size 3 `
-  -batch-delay 1ms `
   -http-timeout 15s `
   -token change-me-token
 ```
@@ -99,16 +96,16 @@ h3 相关参数：
 
 | 参数 | 默认值 | 含义 |
 |---|---:|---|
-| `-ws-lanes` | `12` | h3/ws 共用的每 session lane 数。h3 中每条 lane 维护一个 streaming GET，并用同 lane header 发上行 POST。 |
-| `-ws-lanes-incremental` | `false` | ws 增量建 lane 策略。 |
-| `-send-queue` | `4096` | 每 session 上行队列容量；满时 drop oldest。h3 高速测试建议 `65536`。 |
+| `-ws-lanes` | `16` | h3/ws 共用的每 session lane 数。h3 中每条 lane 维护一个 streaming GET，并用同 lane header 发上行 POST。 |
+| `-ws-lanes-incremental` | `true` | ws 增量建 lane 策略。 |
+| `-send-queue` | `16384` | 每 session 上行队列容量；满时 drop oldest。h3 高速测试建议 `65536`。 |
 
 h3 推荐组合：
 
 ```powershell
 .\bin\proxy-client.exe `
   -transport h3 `
-  -ws-lanes 12 `
+  -ws-lanes 16 `
   -send-queue 65536 `
   -http-timeout 15s
 ```
@@ -142,22 +139,23 @@ ws 相关参数：
 
 | 参数 | 默认值 | 含义 |
 |---|---:|---|
-| `-ws-lanes` | `12` | 默认策略下每 session 一次性获取的 lane 数；也是 standby pool 目标空闲数。 |
-| `-ws-lanes-incremental` | `false` | 增量策略。初始只拿 1 条 lane；之后每 10ms 检查一次 batchQ，积压超过 1 个 batch 时后台申请新 lane，最多到 `-ws-lanes`。 |
+| `-ws-lanes` | `16` | 每 session WebSocket lane 上限；也是 standby pool 目标空闲数。 |
+| `-ws-lanes-incremental` | `true` | 增量策略。初始只拿 1 条 lane；之后每 10ms 检查一次 batchQ，积压超过 1 个 batch 时后台申请新 lane，最多到 `-ws-lanes`。 |
 | `-ws-socket-send-buffer` | `0` | WebSocket TCP socket send buffer bytes；`0` 保持系统默认。 |
 | `-ws-socket-recv-buffer` | `0` | WebSocket TCP socket receive buffer bytes；`0` 保持系统默认。 |
-| `-batch-size` | `3` | 一个 WebSocket binary message 最多合并多少个 UDP 包。 |
-| `-batch-delay` | `1ms` | 等待凑 batch 的最长时间。 |
+| `-batch-size` | `16` | 一个 WebSocket binary message 最多合并多少个 UDP 包。 |
+| `-batch-delay` | `0s` | 等待凑 batch 的最长时间。 |
 | `-max-inflight-posts` | `20` | HTTP POST/H3 POST 并发上限；WebSocket 模式不使用。 |
 
-默认全 lane 策略：
+显式全 lane 策略：
 
 ```powershell
 .\bin\proxy-client.exe `
   -transport ws `
-  -ws-lanes 12 `
-  -batch-size 3 `
-  -batch-delay 1ms `
+  -ws-lanes-incremental=false `
+  -ws-lanes 16 `
+  -batch-size 16 `
+  -batch-delay 0s `
   -http-timeout 15s
 ```
 
@@ -173,10 +171,10 @@ ws 相关参数：
 ```powershell
 .\bin\proxy-client.exe `
   -transport ws `
-  -ws-lanes 12 `
+  -ws-lanes 16 `
   -ws-lanes-incremental `
-  -batch-size 3 `
-  -batch-delay 1ms `
+  -batch-size 16 `
+  -batch-delay 0s `
   -http-timeout 15s
 ```
 
@@ -198,7 +196,7 @@ ws 相关参数：
 
 - 当前增长触发条件是 `len(batchQ) > 1`，不是“sendQ 非空”。
 - 如果已有 lane 足够及时消费 batchQ，可能不会增长到 `-ws-lanes`。
-- 之前同 IP 小 sweep 中，全 12 lane 延迟优于 incremental；incremental 主要价值是抗建联失败和降低冷启动压力。
+- 早期同 IP 小 sweep 中，全 12 lane 延迟优于当时的 incremental；当前默认已按后续压测改为 incremental + 16 lane 上限。
 - 旧实验参数 `-ws-lanes-auto`、`-ws-lanes-max`、`-ws-lanes-upgrade-queue` 已移除；迁移时改用 `-ws-lanes-incremental` 和 `-ws-lanes`。
 
 ## 3. proxy-server 参数
@@ -221,11 +219,11 @@ ws 相关参数：
 | `-idle` | `120s` | server session 空闲超时。 |
 | `-udp-buffer` | `4194304` | upstream UDP socket read/write buffer。 |
 | `-down-queue` | `65536` | 每 session 下行 queue 容量；满时 drop oldest。 |
-| `-batch-size` | `3` | WebSocket 下行 batch 最多合并多少个 UDP 包。 |
-| `-batch-delay` | `1ms` | WebSocket 下行等待凑 batch 的最长时间。 |
+| `-batch-size` | `16` | WebSocket 下行 batch 最多合并多少个 UDP 包。 |
+| `-batch-delay` | `0s` | WebSocket 下行等待凑 batch 的最长时间。 |
 | `-ws-socket-send-buffer` | `0` | WebSocket TCP socket send buffer bytes；`0` 保持系统默认。 |
 | `-ws-socket-recv-buffer` | `0` | WebSocket TCP socket receive buffer bytes；`0` 保持系统默认。 |
-| `-down-expand-lanes-max` | `12` | server 下行积压 hint 的 lane 上限；当前 attached WS lane 数达到该值时不再发 hint。 |
+| `-down-expand-lanes-max` | `16` | server 下行积压 hint 的 lane 上限；当前 attached WS lane 数达到该值时不再发 hint。 |
 | `-down-expand-hint-timeout` | `15s` | server 发出扩 lane hint 后等待新 lane attach 的超时时间；超时后允许重发。 |
 
 TLS 行为：
@@ -339,18 +337,15 @@ WebSocket 请求不走 `X-Relay-Session` 握手 header。server 流程：
   -remote https://relay.example.com:2083/ `
   -connect-ip <preferred-cf-ip> `
   -transport ws `
-  -ws-lanes 12 `
-  -batch-size 3 `
-  -batch-delay 1ms `
   -http-timeout 15s `
   -token change-me-token
 ```
 
 特点：
 
-- 初始获取 12 lane。
-- 吞吐和延迟通常比 incremental 更稳。
-- 缺点是初始 12 条里任意失败会导致 session 初始失败。
+- 默认启用 incremental，初始获取 1 lane，积压后增长到最多 16 lane。
+- 使用 `batch-size=16`、`batch-delay=0s`、`send-queue=16384` 的当前压测最佳组合。
+- 如需旧的一次性全 lane 策略，显式设置 `-ws-lanes-incremental=false`。
 
 ### 4.3 Cloudflare WS 增量建联组合
 
@@ -360,10 +355,10 @@ WebSocket 请求不走 `X-Relay-Session` 握手 header。server 流程：
   -remote https://relay.example.com:2083/ `
   -connect-ip <preferred-cf-ip> `
   -transport ws `
-  -ws-lanes 12 `
+  -ws-lanes 16 `
   -ws-lanes-incremental `
-  -batch-size 3 `
-  -batch-delay 1ms `
+  -batch-size 16 `
+  -batch-delay 0s `
   -http-timeout 15s `
   -token change-me-token
 ```
@@ -371,8 +366,8 @@ WebSocket 请求不走 `X-Relay-Session` 握手 header。server 流程：
 特点：
 
 - 初始只要 1 lane 成功就能建立 session。
-- 后续按 lane busy 情况增长。
-- 适合建联不稳定 edge，但最终 lane 数可能低于 12。
+- 后续按 batchQ 积压和 server hint 增长。
+- 适合建联不稳定 edge，但最终 lane 数可能低于 16。
 
 ### 4.4 Cloudflare h3 行为验证组合
 
@@ -382,7 +377,7 @@ WebSocket 请求不走 `X-Relay-Session` 握手 header。server 流程：
   -remote https://relay.example.com:2083/ `
   -connect-ip <preferred-cf-ip> `
   -transport h3 `
-  -ws-lanes 12 `
+  -ws-lanes 16 `
   -send-queue 65536 `
   -http-timeout 15s `
   -token change-me-token
