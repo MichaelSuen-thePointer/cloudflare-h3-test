@@ -579,6 +579,9 @@ func (sess *session) downBatchLoop(parent *server) {
 }
 
 func (s *server) writePendingExpandHint(ws *relay.WebSocketConn, sess *session, id, remoteAddr string) bool {
+	if s.downExpandLanesMax <= 1 {
+		return true
+	}
 	if !sess.expandHintPending.CompareAndSwap(true, false) {
 		return true
 	}

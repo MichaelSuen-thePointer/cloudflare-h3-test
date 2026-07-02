@@ -478,7 +478,7 @@ func (c *clientState) getSession(peer *net.UDPAddr) *session {
 		c.sessions[key] = sess
 		c.countSession()
 		sess.goRun(func() { sess.sendLoop(c.batchSize, c.batchDelay) })
-		if c.wsLanesIncremental {
+		if c.wsLanesIncremental && c.wsLanesN > 1 {
 			sess.goRun(func() { sess.wsIncrementalLoop() })
 		}
 		sess.goRun(func() { c.connectWebSocketLanes(sess, key) })
@@ -651,10 +651,6 @@ func (s *session) maybeAcquireIncrementalWebSocketLane() {
 		return
 	}
 	if s.state.wsLanesN <= 1 {
-		if s.expandHintPending.Load() {
-			s.expandHintPending.Store(false)
-			s.state.countWSIncrementalAcquireSkippedFull()
-		}
 		return
 	}
 	localBacklog := s.batchQ != nil && len(s.batchQ) > 1
@@ -1170,10 +1166,13 @@ func (s *session) handleWSControlMessage(c *clientState, laneIndex int, body []b
 		if len(payload) != 0 {
 			appLog.WarnRate("websocket_expand_hint_payload", 10*time.Second, "websocket-expand-hint-payload", "session", s.id, "lane", laneIndex, "payload_bytes", len(payload))
 		}
-		s.expandHintPending.Store(true)
 		if c != nil {
 			c.countWSExpandHintReceived()
+			if c.wsLanesN <= 1 {
+				return true
+			}
 		}
+		s.expandHintPending.Store(true)
 	default:
 		appLog.WarnRate("websocket_unknown_control", 10*time.Second, "websocket-unknown-control", "session", s.id, "lane", laneIndex, "op", op)
 	}

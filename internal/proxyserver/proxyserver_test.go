@@ -301,7 +301,7 @@ func TestServerExpandHintInFlightExpires(t *testing.T) {
 }
 
 func TestServerWritePendingExpandHintWritesControl(t *testing.T) {
-	s := &server{metrics: true}
+	s := &server{metrics: true, downExpandLanesMax: 2}
 	sess := &session{
 		id:     "hint-session",
 		queue:  make(chan relay.Frame, 1),
@@ -353,6 +353,29 @@ func TestServerWritePendingExpandHintWritesControl(t *testing.T) {
 	}
 	if got := s.stats.expandHintsSent.Load(); got != 1 {
 		t.Fatalf("expandHintsSent=%d, want 1", got)
+	}
+}
+
+func TestServerWritePendingExpandHintSkippedWhenMaxLaneOne(t *testing.T) {
+	s := &server{metrics: true, downExpandLanesMax: 1}
+	sess := &session{
+		id:     "hint-session",
+		queue:  make(chan relay.Frame, 1),
+		batchQ: make(chan []relay.Frame, 1),
+		done:   make(chan struct{}),
+		ws:     make(map[*relay.WebSocketConn]*serverWSLane),
+	}
+	defer sess.close()
+	sess.expandHintPending.Store(true)
+
+	if !s.writePendingExpandHint(nil, sess, sess.id, "remote") {
+		t.Fatal("writePendingExpandHint=false, want true")
+	}
+	if !sess.expandHintPending.Load() {
+		t.Fatal("expandHintPending=false, want unchanged")
+	}
+	if got := s.stats.expandHintsSent.Load(); got != 0 {
+		t.Fatalf("expandHintsSent=%d, want 0", got)
 	}
 }
 
