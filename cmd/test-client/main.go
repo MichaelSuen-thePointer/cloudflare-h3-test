@@ -29,6 +29,11 @@ type stageResult struct {
 	LossRate        float64       `json:"loss_rate"`
 	GoodputMBps     float64       `json:"goodput_MBps"`
 	GoodputMbps     float64       `json:"goodput_Mbps"`
+	EffectivePPS    float64       `json:"effective_pps"`
+	EffectiveInPPS  float64       `json:"effective_in_pps"`
+	EffectiveOutPPS float64       `json:"effective_out_pps"`
+	EffectiveInSec  float64       `json:"effective_in_window_sec"`
+	EffectiveOutSec float64       `json:"effective_out_window_sec"`
 	OutOfOrder      int           `json:"out_of_order"`
 	ReorderRate     float64       `json:"reorder_rate"`
 	Duplicates      int           `json:"duplicates"`
@@ -63,6 +68,8 @@ type receiverState struct {
 	maxSeq      uint64
 	outOfOrder  int
 	duplicates  int
+	firstRecv   time.Time
+	lastRecv    time.Time
 }
 
 func main() {
@@ -193,6 +200,8 @@ func runStage(conn *net.UDPConn, addr *net.UDPAddr, packets, size, pps int, targ
 	}
 	started := time.Now()
 	nextSend := started
+	firstSend := time.Time{}
+	lastSend := time.Time{}
 	for i := 0; i < packets; i++ {
 		if interval > 0 {
 			sleep := time.Until(nextSend)
@@ -208,8 +217,13 @@ func runStage(conn *net.UDPConn, addr *net.UDPAddr, packets, size, pps int, targ
 			payload[j] = byte((int(id) + j) & 0xff)
 		}
 		rs.mu.Lock()
-		rs.sendAt[id] = time.Now()
+		now := time.Now()
+		rs.sendAt[id] = now
 		rs.mu.Unlock()
+		if firstSend.IsZero() {
+			firstSend = now
+		}
+		lastSend = now
 		if _, err := conn.WriteToUDP(payload, addr); err != nil {
 			log.Fatal(err)
 		}
@@ -231,6 +245,8 @@ func runStage(conn *net.UDPConn, addr *net.UDPAddr, packets, size, pps int, targ
 	st.RTT = relay.Summarize(rs.rtts)
 	st.OutOfOrder = rs.outOfOrder
 	st.Duplicates = rs.duplicates
+	firstRecv := rs.firstRecv
+	lastRecv := rs.lastRecv
 	rs.mu.Unlock()
 	st.Finished = finished.Format(time.RFC3339)
 	st.Received = received
@@ -244,8 +260,30 @@ func runStage(conn *net.UDPConn, addr *net.UDPAddr, packets, size, pps int, targ
 	elapsed := finished.Sub(started).Seconds()
 	st.GoodputMBps = float64(received*size) / elapsed / 1_000_000
 	st.GoodputMbps = st.GoodputMBps * 8
+	st.EffectiveInSec = activeWindowSeconds(firstSend, lastSend, elapsed)
+	st.EffectiveOutSec = activeWindowSeconds(firstRecv, lastRecv, elapsed)
+	st.EffectiveInPPS = ratePerSecond(packets, st.EffectiveInSec)
+	st.EffectiveOutPPS = ratePerSecond(received, st.EffectiveOutSec)
+	st.EffectivePPS = st.EffectiveOutPPS
 	st.Sustainable, st.UnsustainReason = sustainable(st, lossThreshold, p95Threshold, reorderThreshold, allowReorder)
 	return st
+}
+
+func activeWindowSeconds(first, last time.Time, fallback float64) float64 {
+	if first.IsZero() || last.IsZero() {
+		return 0
+	}
+	if last.After(first) {
+		return last.Sub(first).Seconds()
+	}
+	return fallback
+}
+
+func ratePerSecond(count int, seconds float64) float64 {
+	if count <= 0 || seconds <= 0 {
+		return 0
+	}
+	return float64(count) / seconds
 }
 
 func receiveLoop(conn *net.UDPConn, rs *receiverState, done <-chan struct{}) {
@@ -279,8 +317,13 @@ func receiveLoop(conn *net.UDPConn, rs *receiverState, done <-chan struct{}) {
 		if id > rs.maxSeq {
 			rs.maxSeq = id
 		}
+		now := time.Now()
+		if rs.firstRecv.IsZero() {
+			rs.firstRecv = now
+		}
+		rs.lastRecv = now
 		t := rs.sendAt[id]
-		rs.rtts = append(rs.rtts, time.Since(t))
+		rs.rtts = append(rs.rtts, now.Sub(t))
 		delete(rs.sendAt, id)
 		rs.mu.Unlock()
 	}
