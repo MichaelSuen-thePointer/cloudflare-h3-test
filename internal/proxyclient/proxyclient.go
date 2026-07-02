@@ -1001,9 +1001,7 @@ func (s *session) writeBatchSync(frames []relay.Frame) {
 		return
 	case <-s.closed:
 		return
-	case s.posts <- struct{}{}:
 	}
-	defer func() { <-s.posts }()
 
 	chunks, err := relay.SplitFramesByEncodedLimit(frames, relay.MaxMessageBytes)
 	if err != nil {
@@ -1062,9 +1060,7 @@ func (s *session) writeBatchOnLane(c *clientState, ln *wsLane, frames []relay.Fr
 	case <-ln.done:
 		s.returnBatch(frames)
 		return
-	case s.posts <- struct{}{}:
 	}
-	defer func() { <-s.posts }()
 
 	if ln.closed.Load() {
 		s.returnBatch(frames)

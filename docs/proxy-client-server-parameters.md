@@ -148,7 +148,7 @@ ws 相关参数：
 | `-ws-socket-recv-buffer` | `0` | WebSocket TCP socket receive buffer bytes；`0` 保持系统默认。 |
 | `-batch-size` | `3` | 一个 WebSocket binary message 最多合并多少个 UDP 包。 |
 | `-batch-delay` | `1ms` | 等待凑 batch 的最长时间。 |
-| `-max-inflight-posts` | `20` | WebSocket send batch 并发上限，也复用 posts 信号量。 |
+| `-max-inflight-posts` | `20` | HTTP POST/H3 POST 并发上限；WebSocket 模式不使用。 |
 
 默认全 lane 策略：
 

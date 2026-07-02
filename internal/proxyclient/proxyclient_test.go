@@ -685,7 +685,7 @@ func TestClientSnapshotReportsSendAndBatchQueueMetricsSeparately(t *testing.T) {
 	}
 }
 
-func TestWebSocketWriteBatchReturnsBatchWhenLaneClosesWhileWaitingForPostSlot(t *testing.T) {
+func TestWebSocketWriteBatchReturnsBatchWhenLaneAlreadyClosed(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sess := &session{
@@ -693,21 +693,17 @@ func TestWebSocketWriteBatchReturnsBatchWhenLaneClosesWhileWaitingForPostSlot(t 
 		ctx:    ctx,
 		cancel: cancel,
 		closed: make(chan struct{}),
-		posts:  make(chan struct{}, 1),
 		batchQ: make(chan []relay.Frame, 1),
 	}
-	sess.posts <- struct{}{}
 	ln := newWSLane(0, nil)
+	ln.closed.Store(true)
+	ln.closeWorker()
 	frames := []relay.Frame{{PacketID: 1, Payload: []byte("payload")}}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		sess.writeBatchOnLane(&clientState{}, ln, frames)
 	}()
-
-	ln.closed.Store(true)
-	ln.closeWorker()
-	<-sess.posts
 
 	select {
 	case <-done:
