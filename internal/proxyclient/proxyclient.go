@@ -1001,6 +1001,7 @@ func (s *session) writeBatchSync(frames []relay.Frame) {
 		return
 	case <-s.closed:
 		return
+	default:
 	}
 
 	chunks, err := relay.SplitFramesByEncodedLimit(frames, relay.MaxMessageBytes)
@@ -1060,6 +1061,7 @@ func (s *session) writeBatchOnLane(c *clientState, ln *wsLane, frames []relay.Fr
 	case <-ln.done:
 		s.returnBatch(frames)
 		return
+	default:
 	}
 
 	if ln.closed.Load() {
