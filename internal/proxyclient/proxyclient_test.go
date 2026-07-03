@@ -79,6 +79,29 @@ func TestEnsureWebSocketLanesDoesNotAppendAfterClose(t *testing.T) {
 	}
 }
 
+func TestDrainSendBatchWithoutDelay(t *testing.T) {
+	sess := &session{
+		sendQ: make(chan []byte, 4),
+	}
+	sess.sendQ <- []byte("two")
+	sess.sendQ <- []byte("three")
+	sess.sendQ <- []byte("four")
+
+	batch := sess.drainSendBatch([]relay.Frame{{PacketID: sess.next.Add(1), Payload: []byte("one")}}, 3)
+
+	if len(batch) != 3 {
+		t.Fatalf("batch len=%d, want 3", len(batch))
+	}
+	for i, want := range []string{"one", "two", "three"} {
+		if string(batch[i].Payload) != want {
+			t.Fatalf("batch[%d]=%q, want %q", i, batch[i].Payload, want)
+		}
+	}
+	if got := len(sess.sendQ); got != 1 {
+		t.Fatalf("sendQ len=%d, want 1", got)
+	}
+}
+
 func TestInitialWebSocketConnectFailureClosesSession(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -792,7 +815,7 @@ func TestWebSocketPoolAcquireAttachesSession(t *testing.T) {
 }
 
 func TestApplyClientPluginEnvMapsAddressesAndOptions(t *testing.T) {
-	opts, err := PluginEnv.ParseOptions("host=relay.example;path=ray;token=example-secret;transport=ws;log-level=warn;use-syslog;ws-lanes=8;ws-lanes-incremental;batch-delay=2ms;http-timeout=3s;ws-socket-send-buffer=262144;ws-socket-recv-buffer=131072")
+	opts, err := PluginEnv.ParseOptions("host=relay.example;path=ray;token=example-secret;transport=ws;log-level=warn;use-syslog;ws-lanes=8;ws-lanes-incremental;batch-delay=250us;http-timeout=3s;ws-socket-send-buffer=262144;ws-socket-recv-buffer=131072")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -839,7 +862,7 @@ func TestApplyClientPluginEnvMapsAddressesAndOptions(t *testing.T) {
 	if connectIP != "203.0.113.10" {
 		t.Fatalf("connectIP=%q, want 203.0.113.10", connectIP)
 	}
-	if token != "example-secret" || transport != "ws" || logLevel != "warn" || !useSyslog || wsLanesN != 8 || !wsLanesIncremental || batchDelay != 2*time.Millisecond || timeout != 3*time.Second || wsSocketSendBuffer != 262144 || wsSocketReceiveBuffer != 131072 {
+	if token != "example-secret" || transport != "ws" || logLevel != "warn" || !useSyslog || wsLanesN != 8 || !wsLanesIncremental || batchDelay != 250*time.Microsecond || timeout != 3*time.Second || wsSocketSendBuffer != 262144 || wsSocketReceiveBuffer != 131072 {
 		t.Fatalf("mapped token=%q transport=%q logLevel=%q useSyslog=%v wsLanes=%d incremental=%v batchDelay=%v timeout=%v wsSendBuf=%d wsRecvBuf=%d", token, transport, logLevel, useSyslog, wsLanesN, wsLanesIncremental, batchDelay, timeout, wsSocketSendBuffer, wsSocketReceiveBuffer)
 	}
 }

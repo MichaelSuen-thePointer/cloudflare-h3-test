@@ -133,7 +133,7 @@ func Main(args []string) {
 	fs.IntVar(&udpBuffer, "udp-buffer", 4<<20, "UDP socket read/write buffer bytes")
 	fs.IntVar(&downQueue, "down-queue", 65536, "per-session downlink queue capacity")
 	fs.IntVar(&batchSize, "batch-size", 20, "maximum UDP packets per WebSocket downlink batch")
-	fs.DurationVar(&batchDelay, "batch-delay", 0, "maximum time to wait for a partially filled WebSocket downlink batch")
+	fs.DurationVar(&batchDelay, "batch-delay", 250*time.Microsecond, "maximum time to wait for a partially filled WebSocket downlink batch")
 	fs.IntVar(&wsSocketSendBuffer, "ws-socket-send-buffer", 0, "WebSocket TCP socket send buffer bytes, 0 keeps OS default")
 	fs.IntVar(&wsSocketReceiveBuffer, "ws-socket-recv-buffer", 0, "WebSocket TCP socket receive buffer bytes, 0 keeps OS default")
 	fs.IntVar(&downExpandLanesMax, "down-expand-lanes-max", 1, "maximum attached WebSocket lanes before suppressing server downlink expand hints")
@@ -538,6 +538,16 @@ func (sess *session) downBatchLoop(parent *server) {
 			}
 			parent.observeQueueWait(first)
 			batch := []relay.Frame{first}
+			if parent.batchDelay <= 0 {
+				var ok bool
+				batch, ok = sess.drainDownBatch(parent, batch, batchSize)
+				if !ok {
+					return
+				}
+				parent.markBatchQueued(batch)
+				parent.countBatchQueueDrops(enqueueFrameBatchDropOldest(sess.batchQ, batch))
+				continue
+			}
 			timer := time.NewTimer(parent.batchDelay)
 		collect:
 			for len(batch) < batchSize {
@@ -576,6 +586,22 @@ func (sess *session) downBatchLoop(parent *server) {
 			parent.countBatchQueueDrops(enqueueFrameBatchDropOldest(sess.batchQ, batch))
 		}
 	}
+}
+
+func (sess *session) drainDownBatch(parent *server, batch []relay.Frame, batchSize int) ([]relay.Frame, bool) {
+	for len(batch) < batchSize {
+		select {
+		case f := <-sess.queue:
+			if sess.isClosed() {
+				return batch, false
+			}
+			parent.observeQueueWait(f)
+			batch = append(batch, f)
+		default:
+			return batch, true
+		}
+	}
+	return batch, true
 }
 
 func (s *server) writePendingExpandHint(ws *relay.WebSocketConn, sess *session, id, remoteAddr string) bool {
