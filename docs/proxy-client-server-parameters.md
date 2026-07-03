@@ -144,7 +144,7 @@ ws 相关参数：
 | `-ws-socket-send-buffer` | `0` | WebSocket TCP socket send buffer bytes；`0` 保持系统默认。 |
 | `-ws-socket-recv-buffer` | `0` | WebSocket TCP socket receive buffer bytes；`0` 保持系统默认。 |
 | `-batch-size` | `20` | 一个 WebSocket binary message 最多合并多少个 UDP 包。 |
-| `-batch-delay` | `0s` | 等待凑 batch 的最长时间。 |
+| `-batch-delay` | `250us` | 等待凑 batch 的最长时间；支持 Go duration 单位，如 `50us`、`1ms`。`0s` 直接 drain 当前队列，不启动 timer。 |
 | `-max-inflight-posts` | `20` | HTTP POST/H3 POST 并发上限；WebSocket 模式不使用。 |
 
 显式全 lane 策略：
@@ -155,7 +155,7 @@ ws 相关参数：
   -ws-lanes-incremental=false `
   -ws-lanes 16 `
   -batch-size 16 `
-  -batch-delay 0s `
+  -batch-delay 250us `
   -http-timeout 15s
 ```
 
@@ -174,7 +174,7 @@ ws 相关参数：
   -ws-lanes 16 `
   -ws-lanes-incremental `
   -batch-size 16 `
-  -batch-delay 0s `
+  -batch-delay 250us `
   -http-timeout 15s
 ```
 
@@ -220,7 +220,7 @@ ws 相关参数：
 | `-udp-buffer` | `4194304` | upstream UDP socket read/write buffer。 |
 | `-down-queue` | `65536` | 每 session 下行 queue 容量；满时 drop oldest。 |
 | `-batch-size` | `20` | WebSocket 下行 batch 最多合并多少个 UDP 包。 |
-| `-batch-delay` | `0s` | WebSocket 下行等待凑 batch 的最长时间。 |
+| `-batch-delay` | `250us` | WebSocket 下行等待凑 batch 的最长时间；支持 Go duration 单位，如 `50us`、`1ms`。`0s` 直接 drain 当前队列，不启动 timer。 |
 | `-ws-socket-send-buffer` | `0` | WebSocket TCP socket send buffer bytes；`0` 保持系统默认。 |
 | `-ws-socket-recv-buffer` | `0` | WebSocket TCP socket receive buffer bytes；`0` 保持系统默认。 |
 | `-down-expand-lanes-max` | `1` | server 下行积压 hint 的 lane 上限；当前 attached WS lane 数达到该值时不再发 hint。 |
@@ -344,7 +344,7 @@ WebSocket 请求不走 `X-Relay-Session` 握手 header。server 流程：
 特点：
 
 - 默认单 lane 非 incremental，不启动扩 lane 检查。
-- 使用 `batch-size=20`、`batch-delay=0s`、`ws-lanes=1`、`ws-lanes-incremental=false` 的当前压测最佳组合。
+- 使用 `batch-size=20`、`batch-delay=250us`、`ws-lanes=1`、`ws-lanes-incremental=false` 的当前压测最佳组合。
 - 如需多 lane 增长，显式设置 `-ws-lanes` 大于 1 并开启 `-ws-lanes-incremental`。
 
 ### 4.3 Cloudflare WS 增量建联组合
@@ -358,7 +358,7 @@ WebSocket 请求不走 `X-Relay-Session` 握手 header。server 流程：
   -ws-lanes 16 `
   -ws-lanes-incremental `
   -batch-size 16 `
-  -batch-delay 0s `
+  -batch-delay 250us `
   -http-timeout 15s `
   -token change-me-token
 ```

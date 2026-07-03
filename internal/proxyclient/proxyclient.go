@@ -129,7 +129,7 @@ func Main(args []string) {
 	fs.IntVar(&polls, "down-polls", 2, "downlink long-poll workers")
 	fs.IntVar(&maxInflightPosts, "max-inflight-posts", 20, "maximum in-flight POST requests per session")
 	fs.IntVar(&batchSize, "batch-size", 20, "maximum UDP packets per POST")
-	fs.DurationVar(&batchDelay, "batch-delay", 0, "maximum time to wait for a partially filled POST batch")
+	fs.DurationVar(&batchDelay, "batch-delay", 250*time.Microsecond, "maximum time to wait for a partially filled POST batch")
 	fs.IntVar(&sendQueue, "send-queue", 16384, "per-session UDP packet queue before POST batching")
 	fs.DurationVar(&timeout, "http-timeout", 15*time.Second, "HTTP request timeout")
 	fs.DurationVar(&idle, "idle", 120*time.Second, "local UDP session idle timeout")
@@ -784,6 +784,11 @@ func (s *session) sendLoop(batchSize int, batchDelay time.Duration) {
 		case first := <-s.sendQ:
 			currentBatchSize := batchSize
 			batch := []relay.Frame{{PacketID: s.next.Add(1), Payload: first}}
+			if batchDelay <= 0 {
+				batch = s.drainSendBatch(batch, currentBatchSize)
+				s.sendBatch(batch)
+				continue
+			}
 			timer := time.NewTimer(batchDelay)
 		collect:
 			for len(batch) < currentBatchSize {
@@ -807,6 +812,18 @@ func (s *session) sendLoop(batchSize int, batchDelay time.Duration) {
 			s.sendBatch(batch)
 		}
 	}
+}
+
+func (s *session) drainSendBatch(batch []relay.Frame, batchSize int) []relay.Frame {
+	for len(batch) < batchSize {
+		select {
+		case payload := <-s.sendQ:
+			batch = append(batch, relay.Frame{PacketID: s.next.Add(1), Payload: payload})
+		default:
+			return batch
+		}
+	}
+	return batch
 }
 
 func (s *session) shouldSendBatchSync() bool {

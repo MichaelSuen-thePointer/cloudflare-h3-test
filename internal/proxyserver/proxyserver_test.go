@@ -146,6 +146,38 @@ func TestServerDownBatchLoopAggregatesFrames(t *testing.T) {
 	}
 }
 
+func TestServerDownBatchLoopDrainsWithoutDelay(t *testing.T) {
+	s := &server{batchSize: 3, batchDelay: 0}
+	sess := &session{
+		id:     "batch-session",
+		queue:  make(chan relay.Frame, 4),
+		batchQ: make(chan []relay.Frame, 3),
+		done:   make(chan struct{}),
+		ws:     make(map[*relay.WebSocketConn]*serverWSLane),
+	}
+	defer sess.close()
+	go sess.downBatchLoop(s)
+
+	sess.queue <- relay.Frame{PacketID: 1, Payload: []byte("one")}
+	sess.queue <- relay.Frame{PacketID: 2, Payload: []byte("two")}
+	sess.queue <- relay.Frame{PacketID: 3, Payload: []byte("three")}
+	sess.queue <- relay.Frame{PacketID: 4, Payload: []byte("four")}
+
+	select {
+	case batch := <-sess.batchQ:
+		if len(batch) != 3 {
+			t.Fatalf("batch len=%d, want 3", len(batch))
+		}
+		for i, f := range batch {
+			if f.PacketID != uint64(i+1) {
+				t.Fatalf("batch[%d].PacketID=%d, want %d", i, f.PacketID, i+1)
+			}
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for downlink batch")
+	}
+}
+
 func TestServerDownBatchQueueDropOldestCountsDroppedFrames(t *testing.T) {
 	s := &server{metrics: true}
 	ch := make(chan []relay.Frame, 1)
@@ -531,7 +563,7 @@ func TestWebSocketPingBeforeAttach(t *testing.T) {
 }
 
 func TestApplyServerPluginEnvMapsAddressesAndOptions(t *testing.T) {
-	opts, err := PluginEnv.ParseOptions("server;token=example-secret;cert=/tmp/cert.pem;key=/tmp/key.pem;require-h3=false;bench-echo;metrics;metrics-out=/tmp/metrics.jsonl;log-level=error;use-syslog;idle=30s;udp-buffer=8192;down-queue=4096;batch-size=5;batch-delay=2ms;down-expand-lanes-max=8;down-expand-hint-timeout=15s;ws-socket-send-buffer=262144;ws-socket-recv-buffer=131072")
+	opts, err := PluginEnv.ParseOptions("server;token=example-secret;cert=/tmp/cert.pem;key=/tmp/key.pem;require-h3=false;bench-echo;metrics;metrics-out=/tmp/metrics.jsonl;log-level=error;use-syslog;idle=30s;udp-buffer=8192;down-queue=4096;batch-size=5;batch-delay=250us;down-expand-lanes-max=8;down-expand-hint-timeout=15s;ws-socket-send-buffer=262144;ws-socket-recv-buffer=131072")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -571,7 +603,7 @@ func TestApplyServerPluginEnvMapsAddressesAndOptions(t *testing.T) {
 	if listen != "0.0.0.0:2083" || upstream != "127.0.0.1:8388" {
 		t.Fatalf("listen=%q upstream=%q, want mapped PluginEnv addresses", listen, upstream)
 	}
-	if token != "example-secret" || cert != "/tmp/cert.pem" || key != "/tmp/key.pem" || metricsOut != "/tmp/metrics.jsonl" || logLevel != "error" || !useSyslog || requireH3 || !benchEcho || !metrics || idle != 30*time.Second || udpBuffer != 8192 || downQueue != 4096 || batchSize != 5 || batchDelay != 2*time.Millisecond || downExpandLanesMax != 8 || downExpandHintTimeout != 15*time.Second || wsSocketSendBuffer != 262144 || wsSocketReceiveBuffer != 131072 {
+	if token != "example-secret" || cert != "/tmp/cert.pem" || key != "/tmp/key.pem" || metricsOut != "/tmp/metrics.jsonl" || logLevel != "error" || !useSyslog || requireH3 || !benchEcho || !metrics || idle != 30*time.Second || udpBuffer != 8192 || downQueue != 4096 || batchSize != 5 || batchDelay != 250*time.Microsecond || downExpandLanesMax != 8 || downExpandHintTimeout != 15*time.Second || wsSocketSendBuffer != 262144 || wsSocketReceiveBuffer != 131072 {
 		t.Fatalf("mapped token=%q cert=%q key=%q metricsOut=%q logLevel=%q useSyslog=%v requireH3=%v benchEcho=%v metrics=%v idle=%v udpBuffer=%d downQueue=%d batchSize=%d batchDelay=%v downExpandLanesMax=%d downExpandHintTimeout=%v wsSendBuf=%d wsRecvBuf=%d", token, cert, key, metricsOut, logLevel, useSyslog, requireH3, benchEcho, metrics, idle, udpBuffer, downQueue, batchSize, batchDelay, downExpandLanesMax, downExpandHintTimeout, wsSocketSendBuffer, wsSocketReceiveBuffer)
 	}
 }
