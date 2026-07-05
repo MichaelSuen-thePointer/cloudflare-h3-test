@@ -608,12 +608,8 @@ func (s *session) sendLoop(batchSize int, batchDelay time.Duration) {
 			currentBatchSize := batchSize
 			batch := make([]relay.Frame, 0, currentBatchSize)
 			batch = append(batch, relay.Frame{PacketID: s.next.Add(1), Payload: first})
-			batch = s.drainSendBatch(batch, currentBatchSize)
-			if len(batch) >= currentBatchSize {
-				s.sendBatch(batch)
-				continue
-			}
 			if batchDelay <= 0 {
+				batch = s.drainSendBatch(batch, currentBatchSize)
 				s.sendBatch(batch)
 				continue
 			}
