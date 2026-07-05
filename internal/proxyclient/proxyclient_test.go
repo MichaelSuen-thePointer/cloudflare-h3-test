@@ -775,6 +775,19 @@ func TestWebSocketWriteBatchReturnsBatchWhenLaneAlreadyClosed(t *testing.T) {
 	}
 }
 
+func TestWebSocketLaneRetainsEncodeBufferWithinCap(t *testing.T) {
+	ln := newWSLane(0, nil)
+	body := make([]byte, 128)
+	ln.retainEncodeBuffer(body)
+	if ln.encodeBuf == nil || len(ln.encodeBuf) != 0 || cap(ln.encodeBuf) != cap(body) {
+		t.Fatalf("encodeBuf len=%d cap=%d, want retained cap %d", len(ln.encodeBuf), cap(ln.encodeBuf), cap(body))
+	}
+	ln.retainEncodeBuffer(make([]byte, wsEncodeBufferRetainLimit+1))
+	if ln.encodeBuf != nil {
+		t.Fatalf("encodeBuf retained oversized cap=%d, want nil", cap(ln.encodeBuf))
+	}
+}
+
 func TestTouchIntervalDefaultsToIdleOver500(t *testing.T) {
 	if got := touchInterval(120 * time.Second); got != 240*time.Millisecond {
 		t.Fatalf("touchInterval=%v, want 240ms", got)

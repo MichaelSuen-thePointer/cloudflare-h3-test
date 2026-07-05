@@ -118,6 +118,25 @@ func TestHandlePostBenchEcho(t *testing.T) {
 	}
 }
 
+func TestBenchEchoCopiesViewBackedPayloadBeforeQueue(t *testing.T) {
+	s := &server{benchEcho: true}
+	sess := &session{
+		id:    "echo-session",
+		queue: make(chan relay.Frame, 1),
+		done:  make(chan struct{}),
+		ws:    make(map[*relay.WebSocketConn]*serverWSLane),
+	}
+	payload := []byte("payload")
+	if err := s.handleInboundFrame(sess, relay.Frame{PacketID: 9, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	copy(payload, "changed")
+	got := <-sess.queue
+	if got.PacketID != 9 || string(got.Payload) != "payload" {
+		t.Fatalf("queued frame id=%d payload=%q, want stable payload", got.PacketID, got.Payload)
+	}
+}
+
 func TestServerDownBatchLoopAggregatesFrames(t *testing.T) {
 	s := &server{batchSize: 3, batchDelay: 50 * time.Millisecond}
 	sess := &session{
@@ -426,6 +445,19 @@ func TestServerWritePendingExpandHintSkippedWhenMaxLaneOne(t *testing.T) {
 	}
 	if got := s.stats.expandHintsSent.Load(); got != 0 {
 		t.Fatalf("expandHintsSent=%d, want 0", got)
+	}
+}
+
+func TestServerWSLaneRetainsEncodeBufferWithinCap(t *testing.T) {
+	ln := &serverWSLane{}
+	body := make([]byte, 128)
+	ln.retainEncodeBuffer(body)
+	if ln.encodeBuf == nil || len(ln.encodeBuf) != 0 || cap(ln.encodeBuf) != cap(body) {
+		t.Fatalf("encodeBuf len=%d cap=%d, want retained cap %d", len(ln.encodeBuf), cap(ln.encodeBuf), cap(body))
+	}
+	ln.retainEncodeBuffer(make([]byte, wsEncodeBufferRetainLimit+1))
+	if ln.encodeBuf != nil {
+		t.Fatalf("encodeBuf retained oversized cap=%d, want nil", cap(ln.encodeBuf))
 	}
 }
 

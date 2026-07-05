@@ -33,14 +33,22 @@ type Frame struct {
 }
 
 func EncodeFrames(frames []Frame) ([]byte, error) {
+	return EncodeFramesInto(nil, frames)
+}
+
+func EncodeFramesWithinLimit(frames []Frame, limit int) ([]byte, bool, error) {
+	return EncodeFramesWithinLimitInto(nil, frames, limit)
+}
+
+func EncodeFramesInto(dst []byte, frames []Frame) ([]byte, error) {
 	n, err := EncodedFramesLen(frames)
 	if err != nil {
 		return nil, err
 	}
-	return encodeFramesWithLen(frames, n), nil
+	return encodeFramesWithLen(dst, frames, n), nil
 }
 
-func EncodeFramesWithinLimit(frames []Frame, limit int) ([]byte, bool, error) {
+func EncodeFramesWithinLimitInto(dst []byte, frames []Frame, limit int) ([]byte, bool, error) {
 	n, err := EncodedFramesLen(frames)
 	if err != nil {
 		return nil, false, err
@@ -48,11 +56,16 @@ func EncodeFramesWithinLimit(frames []Frame, limit int) ([]byte, bool, error) {
 	if n > limit {
 		return nil, false, nil
 	}
-	return encodeFramesWithLen(frames, n), true, nil
+	return encodeFramesWithLen(dst, frames, n), true, nil
 }
 
-func encodeFramesWithLen(frames []Frame, n int) []byte {
-	b := make([]byte, n)
+func encodeFramesWithLen(dst []byte, frames []Frame, n int) []byte {
+	if cap(dst) < n {
+		dst = make([]byte, n)
+	} else {
+		dst = dst[:n]
+	}
+	b := dst
 	copy(b, Magic[:])
 	b[4] = Version
 	binary.BigEndian.PutUint16(b[5:7], uint16(len(frames)))

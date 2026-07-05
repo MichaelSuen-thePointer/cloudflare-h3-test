@@ -113,6 +113,10 @@ func (c *H3StreamConn) ReadBinary() ([]byte, error) {
 	}
 }
 
+func (c *H3StreamConn) ReadBinaryView() ([]byte, error) {
+	return c.ReadBinary()
+}
+
 func (c *H3StreamConn) Close() error {
 	if c.closed.CompareAndSwap(false, true) {
 		c.cancel()
