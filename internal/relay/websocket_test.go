@@ -56,6 +56,82 @@ func TestWebSocketReadRejectsBadMaskDirection(t *testing.T) {
 	}
 }
 
+func TestWebSocketReadBinaryViewReusesBuffer(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		ws := &WebSocketConn{conn: client, reader: bufio.NewReader(client), mask: true}
+		if err := ws.WriteBinary([]byte("alpha")); err != nil {
+			errCh <- err
+			return
+		}
+		errCh <- ws.WriteBinary([]byte("bravo"))
+	}()
+
+	ws := &WebSocketConn{conn: server, reader: bufio.NewReader(server), mask: false}
+	first, err := ws.ReadBinaryView()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first) != "alpha" {
+		t.Fatalf("first=%q, want alpha", first)
+	}
+	second, err := ws.ReadBinaryView()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(second) != "bravo" {
+		t.Fatalf("second=%q, want bravo", second)
+	}
+	if string(first) != "bravo" {
+		t.Fatalf("first view after second read=%q, want reused buffer with bravo", first)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("write: %v", err)
+	}
+}
+
+func TestWebSocketReadBinaryKeepsPayloadStable(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		ws := &WebSocketConn{conn: client, reader: bufio.NewReader(client), mask: true}
+		if err := ws.WriteBinary([]byte("alpha")); err != nil {
+			errCh <- err
+			return
+		}
+		errCh <- ws.WriteBinary([]byte("bravo"))
+	}()
+
+	ws := &WebSocketConn{conn: server, reader: bufio.NewReader(server), mask: false}
+	first, err := ws.ReadBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first) != "alpha" {
+		t.Fatalf("first=%q, want alpha", first)
+	}
+	second, err := ws.ReadBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(second) != "bravo" {
+		t.Fatalf("second=%q, want bravo", second)
+	}
+	if string(first) != "alpha" {
+		t.Fatalf("first after second read=%q, want stable alpha", first)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("write: %v", err)
+	}
+}
+
 func TestWebSocketClientControlFramesAreMasked(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()

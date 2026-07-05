@@ -23,6 +23,7 @@ import (
 
 const (
 	maxFramesPerDownlinkMessage = relay.MaxPayloadFramesPerMessage
+	wsEncodeBufferRetainLimit   = 512 << 10
 )
 
 var (
@@ -52,10 +53,11 @@ type session struct {
 }
 
 type serverWSLane struct {
-	id     int64
-	writes atomic.Int64
-	frames atomic.Int64
-	bytes  atomic.Int64
+	id        int64
+	encodeBuf []byte
+	writes    atomic.Int64
+	frames    atomic.Int64
+	bytes     atomic.Int64
 }
 
 type server struct {
@@ -131,7 +133,7 @@ func Main(args []string) {
 	fs.DurationVar(&idle, "idle", 120*time.Second, "session idle timeout")
 	fs.IntVar(&udpBuffer, "udp-buffer", 4<<20, "UDP socket read/write buffer bytes")
 	fs.IntVar(&downQueue, "down-queue", 65536, "per-session downlink queue capacity")
-	fs.IntVar(&batchSize, "batch-size", 20, "maximum UDP packets per WebSocket downlink batch")
+	fs.IntVar(&batchSize, "batch-size", 8, "maximum UDP packets per WebSocket downlink batch")
 	fs.DurationVar(&batchDelay, "batch-delay", 250*time.Microsecond, "maximum time to wait for a partially filled WebSocket downlink batch")
 	fs.IntVar(&wsSocketSendBuffer, "ws-socket-send-buffer", 0, "WebSocket TCP socket send buffer bytes, 0 keeps OS default")
 	fs.IntVar(&wsSocketReceiveBuffer, "ws-socket-recv-buffer", 0, "WebSocket TCP socket receive buffer bytes, 0 keeps OS default")
@@ -320,7 +322,7 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	for {
-		body, err := ws.ReadBinary()
+		body, err := ws.ReadBinaryView()
 		if err != nil {
 			return
 		}
@@ -400,6 +402,7 @@ func (s *server) handleInboundFrame(sess *session, f relay.Frame) error {
 	}
 	sess.touch()
 	if s.benchEcho {
+		f.Payload = append([]byte(nil), f.Payload...)
 		f = s.queueFrame(f)
 		s.countQueueDrops(relay.EnqueueDropOldest(sess.queue, f))
 		return nil
@@ -638,7 +641,7 @@ func (s *server) writePendingExpandHint(ws *relay.WebSocketConn, sess *session, 
 }
 
 func (s *server) writeDownBatch(ws *relay.WebSocketConn, wsLane *serverWSLane, id, remoteAddr string, frames []relay.Frame) bool {
-	if body, ok, err := relay.EncodeFramesWithinLimit(frames, relay.MaxMessageBytes); err != nil {
+	if body, ok, err := relay.EncodeFramesWithinLimitInto(wsLane.encodeBuf, frames, relay.MaxMessageBytes); err != nil {
 		appLog.Error("websocket-encode-failed", "session", id, "err", err)
 		return false
 	} else if ok {
@@ -651,7 +654,7 @@ func (s *server) writeDownBatch(ws *relay.WebSocketConn, wsLane *serverWSLane, i
 		return false
 	}
 	for _, chunk := range chunks {
-		body, err := relay.EncodeFrames(chunk)
+		body, err := relay.EncodeFramesInto(wsLane.encodeBuf, chunk)
 		if err != nil {
 			appLog.Error("websocket-encode-failed", "session", id, "err", err)
 			return false
@@ -664,6 +667,7 @@ func (s *server) writeDownBatch(ws *relay.WebSocketConn, wsLane *serverWSLane, i
 }
 
 func (s *server) writeDownEncodedChunk(ws *relay.WebSocketConn, wsLane *serverWSLane, id, remoteAddr string, frames []relay.Frame, body []byte) bool {
+	defer wsLane.retainEncodeBuffer(body)
 	s.observeBatchQueueWait(frames)
 	if metricsBuild && s.metrics {
 		started := time.Now()
@@ -681,6 +685,14 @@ func (s *server) writeDownEncodedChunk(ws *relay.WebSocketConn, wsLane *serverWS
 	}
 	wsLane.observeDownlink(len(frames), len(body))
 	return true
+}
+
+func (l *serverWSLane) retainEncodeBuffer(body []byte) {
+	if cap(body) > wsEncodeBufferRetainLimit {
+		l.encodeBuf = nil
+		return
+	}
+	l.encodeBuf = body[:0]
 }
 
 func (s *server) getSession(id string) (*session, error) {

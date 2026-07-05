@@ -108,6 +108,53 @@ func TestEncodeFramesWithinLimit(t *testing.T) {
 	}
 }
 
+func TestEncodeFramesIntoReusesBuffer(t *testing.T) {
+	frames := []Frame{
+		{PacketID: 1, Payload: []byte("one")},
+		{PacketID: 2, Payload: []byte("two")},
+	}
+	want, err := EncodeFrames(frames)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := make([]byte, 0, len(want)+16)
+	got, err := EncodeFramesInto(dst, frames)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("EncodeFramesInto body differs from EncodeFrames")
+	}
+	if cap(got) != cap(dst) {
+		t.Fatalf("cap=%d, want reuse cap %d", cap(got), cap(dst))
+	}
+}
+
+func TestEncodeFramesWithinLimitIntoReusesBuffer(t *testing.T) {
+	frames := []Frame{{PacketID: 1, Payload: []byte("payload")}}
+	want, err := EncodeFrames(frames)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := make([]byte, 0, len(want)+8)
+	got, ok, err := EncodeFramesWithinLimitInto(dst, frames, len(want))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("EncodeFramesWithinLimitInto ok=false, want true")
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("EncodeFramesWithinLimitInto body differs from EncodeFrames")
+	}
+	if cap(got) != cap(dst) {
+		t.Fatalf("cap=%d, want reuse cap %d", cap(got), cap(dst))
+	}
+	if got, ok, err := EncodeFramesWithinLimitInto(dst, frames, len(want)-1); err != nil || ok || got != nil {
+		t.Fatalf("under limit got len=%d ok=%v err=%v, want nil/false/nil", len(got), ok, err)
+	}
+}
+
 func TestStreamMessageRoundTrip(t *testing.T) {
 	var buf bytes.Buffer
 	in := [][]byte{[]byte("one"), []byte("two")}

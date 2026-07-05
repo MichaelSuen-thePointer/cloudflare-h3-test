@@ -23,6 +23,7 @@ const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 const MaxWebSocketPayloadBytes = MaxMessageBytes
 const DefaultWebSocketWriteTimeout = 15 * time.Second
+const websocketReadBufferRetainLimit = 512 << 10
 
 type WebSocketConn struct {
 	conn         net.Conn
@@ -30,6 +31,7 @@ type WebSocketConn struct {
 	mu           sync.Mutex
 	mask         bool
 	writeTimeout time.Duration
+	readBuf      []byte
 }
 
 type WebSocketSocketOptions struct {
@@ -305,7 +307,15 @@ func (c *WebSocketConn) Ping(payload []byte) error {
 }
 
 func (c *WebSocketConn) ReadMessage() (byte, []byte, error) {
-	opcode, payload, err := c.readFrame()
+	return c.readMessage(false)
+}
+
+func (c *WebSocketConn) ReadMessageView() (byte, []byte, error) {
+	return c.readMessage(true)
+}
+
+func (c *WebSocketConn) readMessage(view bool) (byte, []byte, error) {
+	opcode, payload, err := c.readFrame(view)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -332,7 +342,24 @@ func (c *WebSocketConn) ReadBinary() ([]byte, error) {
 	}
 }
 
-func (c *WebSocketConn) readFrame() (byte, []byte, error) {
+// ReadBinaryView returns a binary message backed by a connection-owned buffer
+// when possible. The returned slice is only valid until the next read on c.
+func (c *WebSocketConn) ReadBinaryView() ([]byte, error) {
+	for {
+		opcode, payload, err := c.ReadMessageView()
+		if err != nil {
+			return nil, err
+		}
+		switch opcode {
+		case 0x2:
+			return payload, nil
+		case 0x8:
+			return nil, io.EOF
+		}
+	}
+}
+
+func (c *WebSocketConn) readFrame(view bool) (byte, []byte, error) {
 	var hdr [2]byte
 	if _, err := io.ReadFull(c.reader, hdr[:]); err != nil {
 		return 0, nil, err
@@ -381,7 +408,19 @@ func (c *WebSocketConn) readFrame() (byte, []byte, error) {
 			return 0, nil, err
 		}
 	}
-	payload := make([]byte, int(n))
+	var payload []byte
+	if view {
+		if int(n) > websocketReadBufferRetainLimit {
+			payload = make([]byte, int(n))
+		} else if cap(c.readBuf) < int(n) {
+			c.readBuf = make([]byte, int(n))
+			payload = c.readBuf
+		} else {
+			payload = c.readBuf[:int(n)]
+		}
+	} else {
+		payload = make([]byte, int(n))
+	}
 	if _, err := io.ReadFull(c.reader, payload); err != nil {
 		return 0, nil, err
 	}
