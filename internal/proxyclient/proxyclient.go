@@ -783,9 +783,14 @@ func (s *session) sendLoop(batchSize int, batchDelay time.Duration) {
 			return
 		case first := <-s.sendQ:
 			currentBatchSize := batchSize
-			batch := []relay.Frame{{PacketID: s.next.Add(1), Payload: first}}
+			batch := make([]relay.Frame, 0, currentBatchSize)
+			batch = append(batch, relay.Frame{PacketID: s.next.Add(1), Payload: first})
+			batch = s.drainSendBatch(batch, currentBatchSize)
+			if len(batch) >= currentBatchSize {
+				s.sendBatch(batch)
+				continue
+			}
 			if batchDelay <= 0 {
-				batch = s.drainSendBatch(batch, currentBatchSize)
 				s.sendBatch(batch)
 				continue
 			}
@@ -800,6 +805,7 @@ func (s *session) sendLoop(batchSize int, batchDelay time.Duration) {
 				case payload := <-s.sendQ:
 					batch = append(batch, relay.Frame{PacketID: s.next.Add(1), Payload: payload})
 				case <-timer.C:
+					batch = s.drainSendBatch(batch, currentBatchSize)
 					break collect
 				}
 			}
@@ -1017,6 +1023,19 @@ func (s *session) writeBatchSync(frames []relay.Frame) {
 	default:
 	}
 
+	if body, ok, err := relay.EncodeFramesWithinLimit(frames, relay.MaxMessageBytes); err != nil {
+		appLog.Error("frame-encode-failed", "session", s.id, "err", err)
+		return
+	} else if ok {
+		ln := s.firstOpenWSLane()
+		if ln == nil {
+			appLog.WarnRate("websocket_lane_unavailable", 10*time.Second, "websocket-lane-unavailable", "session", s.id)
+			return
+		}
+		s.writeEncodedFrameChunk(ln, frames, body)
+		return
+	}
+
 	chunks, err := relay.SplitFramesByEncodedLimit(frames, relay.MaxMessageBytes)
 	if err != nil {
 		appLog.Error("frame-split-failed", "session", s.id, "err", err)
@@ -1088,6 +1107,16 @@ func (s *session) writeBatchOnLane(c *clientState, ln *wsLane, frames []relay.Fr
 	default:
 	}
 
+	if body, ok, err := relay.EncodeFramesWithinLimit(frames, relay.MaxMessageBytes); err != nil {
+		appLog.Error("frame-encode-failed", "session", s.id, "err", err)
+		return
+	} else if ok {
+		if !s.writeEncodedFrameChunk(ln, frames, body) {
+			return
+		}
+		return
+	}
+
 	chunks, err := relay.SplitFramesByEncodedLimit(frames, relay.MaxMessageBytes)
 	if err != nil {
 		appLog.Error("frame-split-failed", "session", s.id, "err", err)
@@ -1107,6 +1136,13 @@ func (s *session) writeFrameChunk(ln *wsLane, frames []relay.Frame) bool {
 	body, err := relay.EncodeFrames(frames)
 	if err != nil {
 		appLog.Error("frame-encode-failed", "session", s.id, "err", err)
+		return false
+	}
+	return s.writeEncodedFrameChunk(ln, frames, body)
+}
+
+func (s *session) writeEncodedFrameChunk(ln *wsLane, frames []relay.Frame, body []byte) bool {
+	if s.isClosed() {
 		return false
 	}
 	s.countWSPostStart(ln)

@@ -84,6 +84,30 @@ func TestEncodeFramesRejectsPayloadTooLarge(t *testing.T) {
 	}
 }
 
+func TestEncodeFramesWithinLimit(t *testing.T) {
+	frames := []Frame{
+		{PacketID: 1, Payload: []byte("one")},
+		{PacketID: 2, Payload: []byte("two")},
+	}
+	want, err := EncodeFrames(frames)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := EncodeFramesWithinLimit(frames, len(want))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("EncodeFramesWithinLimit ok=false, want true")
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("EncodeFramesWithinLimit body differs from EncodeFrames")
+	}
+	if got, ok, err := EncodeFramesWithinLimit(frames, len(want)-1); err != nil || ok || got != nil {
+		t.Fatalf("under limit got len=%d ok=%v err=%v, want nil/false/nil", len(got), ok, err)
+	}
+}
+
 func TestStreamMessageRoundTrip(t *testing.T) {
 	var buf bytes.Buffer
 	in := [][]byte{[]byte("one"), []byte("two")}
