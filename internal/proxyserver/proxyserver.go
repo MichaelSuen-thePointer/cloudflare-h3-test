@@ -537,13 +537,19 @@ func (sess *session) downBatchLoop(parent *server) {
 				return
 			}
 			parent.observeQueueWait(first)
-			batch := []relay.Frame{first}
+			batch := make([]relay.Frame, 0, batchSize)
+			batch = append(batch, first)
+			var ok bool
+			batch, ok = sess.drainDownBatch(parent, batch, batchSize)
+			if !ok {
+				return
+			}
+			if len(batch) >= batchSize {
+				parent.markBatchQueued(batch)
+				parent.countBatchQueueDrops(enqueueFrameBatchDropOldest(sess.batchQ, batch))
+				continue
+			}
 			if parent.batchDelay <= 0 {
-				var ok bool
-				batch, ok = sess.drainDownBatch(parent, batch, batchSize)
-				if !ok {
-					return
-				}
 				parent.markBatchQueued(batch)
 				parent.countBatchQueueDrops(enqueueFrameBatchDropOldest(sess.batchQ, batch))
 				continue
@@ -573,6 +579,11 @@ func (sess *session) downBatchLoop(parent *server) {
 					parent.observeQueueWait(f)
 					batch = append(batch, f)
 				case <-timer.C:
+					var ok bool
+					batch, ok = sess.drainDownBatch(parent, batch, batchSize)
+					if !ok {
+						return
+					}
 					break collect
 				}
 			}
@@ -628,34 +639,48 @@ func (s *server) writePendingExpandHint(ws *relay.WebSocketConn, sess *session, 
 }
 
 func (s *server) writeDownBatch(ws *relay.WebSocketConn, wsLane *serverWSLane, id, remoteAddr string, frames []relay.Frame) bool {
+	if body, ok, err := relay.EncodeFramesWithinLimit(frames, relay.MaxMessageBytes); err != nil {
+		appLog.Error("websocket-encode-failed", "session", id, "err", err)
+		return false
+	} else if ok {
+		return s.writeDownEncodedChunk(ws, wsLane, id, remoteAddr, frames, body)
+	}
+
 	chunks, err := relay.SplitFramesByEncodedLimit(frames, relay.MaxMessageBytes)
 	if err != nil {
 		appLog.Error("frame-split-failed", "session", id, "err", err)
 		return false
 	}
 	for _, chunk := range chunks {
-		s.observeBatchQueueWait(chunk)
 		body, err := relay.EncodeFrames(chunk)
 		if err != nil {
 			appLog.Error("websocket-encode-failed", "session", id, "err", err)
 			return false
 		}
-		if s.metrics {
-			started := time.Now()
-			if err := ws.WriteBinaryOwned(body); err != nil {
-				appLog.WarnRate("server_websocket_write_failed", 10*time.Second, "websocket-write-failed", "session", id, "remote", remoteAddr, "err", err)
-				return false
-			}
-			wsLane.observeDownlink(len(chunk), len(body))
-			s.observeWSWrite(time.Since(started))
-			continue
+		if !s.writeDownEncodedChunk(ws, wsLane, id, remoteAddr, chunk, body) {
+			return false
 		}
+	}
+	return true
+}
+
+func (s *server) writeDownEncodedChunk(ws *relay.WebSocketConn, wsLane *serverWSLane, id, remoteAddr string, frames []relay.Frame, body []byte) bool {
+	s.observeBatchQueueWait(frames)
+	if s.metrics {
+		started := time.Now()
 		if err := ws.WriteBinaryOwned(body); err != nil {
 			appLog.WarnRate("server_websocket_write_failed", 10*time.Second, "websocket-write-failed", "session", id, "remote", remoteAddr, "err", err)
 			return false
 		}
-		wsLane.observeDownlink(len(chunk), len(body))
+		wsLane.observeDownlink(len(frames), len(body))
+		s.observeWSWrite(time.Since(started))
+		return true
 	}
+	if err := ws.WriteBinaryOwned(body); err != nil {
+		appLog.WarnRate("server_websocket_write_failed", 10*time.Second, "websocket-write-failed", "session", id, "remote", remoteAddr, "err", err)
+		return false
+	}
+	wsLane.observeDownlink(len(frames), len(body))
 	return true
 }
 

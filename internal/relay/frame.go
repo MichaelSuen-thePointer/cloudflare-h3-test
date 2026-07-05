@@ -37,6 +37,21 @@ func EncodeFrames(frames []Frame) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	return encodeFramesWithLen(frames, n), nil
+}
+
+func EncodeFramesWithinLimit(frames []Frame, limit int) ([]byte, bool, error) {
+	n, err := EncodedFramesLen(frames)
+	if err != nil {
+		return nil, false, err
+	}
+	if n > limit {
+		return nil, false, nil
+	}
+	return encodeFramesWithLen(frames, n), true, nil
+}
+
+func encodeFramesWithLen(frames []Frame, n int) []byte {
 	b := make([]byte, n)
 	copy(b, Magic[:])
 	b[4] = Version
@@ -49,7 +64,7 @@ func EncodeFrames(frames []Frame) ([]byte, error) {
 		copy(b[pos:pos+len(f.Payload)], f.Payload)
 		pos += len(f.Payload)
 	}
-	return b, nil
+	return b
 }
 
 func EncodedFramesLen(frames []Frame) (int, error) {
