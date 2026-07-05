@@ -344,6 +344,9 @@ func TestIncrementalWebSocketLaneDoesNotAddLaneForSingleQueuedBatch(t *testing.T
 }
 
 func TestWebSocketExpandHintSetsPending(t *testing.T) {
+	if !metricsBuild {
+		t.Skip("metrics counters require -tags metrics")
+	}
 	stats := &clientStats{started: time.Now()}
 	c := &clientState{wsLanesN: 2, metrics: true, stats: stats}
 	sess := &session{id: "hint-session", metrics: true, stats: stats}
@@ -364,6 +367,9 @@ func TestWebSocketExpandHintSetsPending(t *testing.T) {
 }
 
 func TestWebSocketExpandHintIgnoredWhenMaxLaneOne(t *testing.T) {
+	if !metricsBuild {
+		t.Skip("metrics counters require -tags metrics")
+	}
 	stats := &clientStats{started: time.Now()}
 	c := &clientState{wsLanesN: 1, metrics: true, stats: stats}
 	sess := &session{id: "hint-session", metrics: true, stats: stats}
@@ -448,6 +454,9 @@ func TestWebSocketExpandHintShortCircuitsWhenMaxLaneOne(t *testing.T) {
 }
 
 func TestWebSocketExpandHintTriggersIncrementalLane(t *testing.T) {
+	if !metricsBuild {
+		t.Skip("metrics counters require -tags metrics")
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -695,6 +704,9 @@ func TestEnqueueFrameBatchDropOldestCountsDroppedFrames(t *testing.T) {
 }
 
 func TestClientSnapshotReportsSendAndBatchQueueMetricsSeparately(t *testing.T) {
+	if !metricsBuild {
+		t.Skip("metrics snapshot requires -tags metrics")
+	}
 	stats := &clientStats{started: time.Now()}
 	stats.queueDrops.Store(5)
 	stats.sendQDrops.Store(2)

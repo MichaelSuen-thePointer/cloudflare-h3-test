@@ -65,6 +65,9 @@ func TestHandleGetClosedSessionWithQueuedPacketReturnsGone(t *testing.T) {
 }
 
 func TestServerSnapshotIncludesWebSocketLaneDownlinkStats(t *testing.T) {
+	if !metricsBuild {
+		t.Skip("metrics snapshot requires -tags metrics")
+	}
 	s := &server{sessions: map[string]*session{}}
 	sess := &session{
 		id:    "session-1",
@@ -179,6 +182,9 @@ func TestServerDownBatchLoopDrainsWithoutDelay(t *testing.T) {
 }
 
 func TestServerDownBatchQueueDropOldestCountsDroppedFrames(t *testing.T) {
+	if !metricsBuild {
+		t.Skip("metrics counters require -tags metrics")
+	}
 	s := &server{metrics: true}
 	ch := make(chan []relay.Frame, 1)
 	s.countBatchQueueDrops(enqueueFrameBatchDropOldest(ch, []relay.Frame{{PacketID: 1}, {PacketID: 2}}))
@@ -194,6 +200,9 @@ func TestServerDownBatchQueueDropOldestCountsDroppedFrames(t *testing.T) {
 }
 
 func TestServerBatchQueueWaitMetrics(t *testing.T) {
+	if !metricsBuild {
+		t.Skip("metrics counters require -tags metrics")
+	}
 	s := &server{metrics: true}
 	frames := []relay.Frame{{PacketID: 1}, {PacketID: 2}}
 	s.markBatchQueued(frames)
@@ -281,6 +290,9 @@ func TestServerExpandHintNotQueuedForSingleBatch(t *testing.T) {
 }
 
 func TestServerExpandHintSkippedAtMaxLanes(t *testing.T) {
+	if !metricsBuild {
+		t.Skip("metrics counters require -tags metrics")
+	}
 	s := &server{metrics: true, downExpandLanesMax: 1, downExpandHintTimeout: 15 * time.Second}
 	sess := &session{
 		id:     "hint-session",
@@ -304,6 +316,9 @@ func TestServerExpandHintSkippedAtMaxLanes(t *testing.T) {
 }
 
 func TestServerExpandHintInFlightExpires(t *testing.T) {
+	if !metricsBuild {
+		t.Skip("metrics counters require -tags metrics")
+	}
 	s := &server{metrics: true, downExpandLanesMax: 2, downExpandHintTimeout: 15 * time.Second}
 	sess := &session{
 		id:     "hint-session",
@@ -333,6 +348,9 @@ func TestServerExpandHintInFlightExpires(t *testing.T) {
 }
 
 func TestServerWritePendingExpandHintWritesControl(t *testing.T) {
+	if !metricsBuild {
+		t.Skip("metrics counters require -tags metrics")
+	}
 	s := &server{metrics: true, downExpandLanesMax: 2}
 	sess := &session{
 		id:     "hint-session",
