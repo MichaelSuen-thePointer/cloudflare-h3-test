@@ -543,17 +543,12 @@ func (sess *session) downBatchLoop(parent *server) {
 			parent.observeQueueWait(first)
 			batch := make([]relay.Frame, 0, batchSize)
 			batch = append(batch, first)
-			var ok bool
-			batch, ok = sess.drainDownBatch(parent, batch, batchSize)
-			if !ok {
-				return
-			}
-			if len(batch) >= batchSize {
-				parent.markBatchQueued(batch)
-				parent.countBatchQueueDrops(enqueueFrameBatchDropOldest(sess.batchQ, batch))
-				continue
-			}
 			if parent.batchDelay <= 0 {
+				var ok bool
+				batch, ok = sess.drainDownBatch(parent, batch, batchSize)
+				if !ok {
+					return
+				}
 				parent.markBatchQueued(batch)
 				parent.countBatchQueueDrops(enqueueFrameBatchDropOldest(sess.batchQ, batch))
 				continue
