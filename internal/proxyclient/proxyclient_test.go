@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -120,16 +121,17 @@ func TestInitialWebSocketConnectFailureClosesSession(t *testing.T) {
 		posts:  make(chan struct{}, 1),
 		sendQ:  make(chan []byte, 1),
 	}
+	peerKey := netip.MustParseAddrPort("127.0.0.1:12345")
 	c := &clientState{
 		remote:   "http://" + addr + "/",
 		token:    "example-token",
 		wsLanesN: 1,
 		timeout:  50 * time.Millisecond,
-		sessions: map[string]*session{"peer": sess},
+		sessions: map[netip.AddrPort]*session{peerKey: sess},
 	}
 	sess.state = c
 
-	c.connectWebSocketLanes(sess, "peer")
+	c.connectWebSocketLanes(sess, peerKey, "peer")
 
 	select {
 	case <-sess.ready:
@@ -139,7 +141,7 @@ func TestInitialWebSocketConnectFailureClosesSession(t *testing.T) {
 	deadline := time.After(time.Second)
 	for {
 		c.mu.Lock()
-		_, exists := c.sessions["peer"]
+		_, exists := c.sessions[peerKey]
 		c.mu.Unlock()
 		if !exists && sess.isClosed() {
 			return
@@ -181,7 +183,7 @@ func TestInitialIncrementalWebSocketConnectsOneLane(t *testing.T) {
 	}
 	sess.state = c
 
-	c.connectWebSocketLanes(sess, "peer")
+	c.connectWebSocketLanes(sess, netip.AddrPort{}, "peer")
 
 	if got := sess.wsCount(); got != 1 {
 		t.Fatalf("wsCount=%d, want 1", got)
@@ -542,7 +544,7 @@ func TestIncrementalWebSocketOneLaneUsesAsyncSend(t *testing.T) {
 	sess.ws = append(sess.ws, &wsLane{index: 0})
 	publishTestWSSnapshot(sess)
 
-	if sess.shouldSendBatchSync() {
+	if _, ok := sess.singleWSLaneForSync(); ok {
 		t.Fatal("incremental websocket session with one lane should dispatch sendBatch asynchronously")
 	}
 }
@@ -714,7 +716,7 @@ func TestClientSnapshotReportsSendAndBatchQueueMetricsSeparately(t *testing.T) {
 	c := &clientState{
 		batchSize: 3,
 		stats:     stats,
-		sessions:  map[string]*session{},
+		sessions:  map[netip.AddrPort]*session{},
 	}
 	sess := &session{
 		id:     "session-1",
@@ -726,7 +728,7 @@ func TestClientSnapshotReportsSendAndBatchQueueMetricsSeparately(t *testing.T) {
 	sess.sendQ <- []byte("raw-2")
 	sess.batchQ <- []relay.Frame{{PacketID: 1}, {PacketID: 2}, {PacketID: 3}}
 	sess.batchQ <- []relay.Frame{{PacketID: 4}}
-	c.sessions["peer"] = sess
+	c.sessions[netip.MustParseAddrPort("127.0.0.1:12345")] = sess
 
 	snap := c.snapshot()
 	if snap["sendq_depth"] != 2 || snap["sendq_capacity"] != 4 || snap["sendq_drops"] != int64(2) {

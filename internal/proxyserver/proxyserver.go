@@ -336,7 +336,7 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 		sess.touch()
 		for _, f := range frames {
-			if err := s.handleInboundFrame(sess, f); err != nil {
+			if err := s.handleInboundFrameAfterTouch(sess, f); err != nil {
 				if !sess.isClosed() {
 					appLog.WarnRate("websocket_udp_write_failed", 10*time.Second, "websocket-udp-write-failed", "session", id, "remote", r.RemoteAddr, "err", err)
 				}
@@ -401,6 +401,13 @@ func (s *server) handleInboundFrame(sess *session, f relay.Frame) error {
 		return errSessionClosed
 	}
 	sess.touch()
+	return s.handleInboundFrameAfterTouch(sess, f)
+}
+
+func (s *server) handleInboundFrameAfterTouch(sess *session, f relay.Frame) error {
+	if sess.isClosed() {
+		return errSessionClosed
+	}
 	if s.benchEcho {
 		f.Payload = append([]byte(nil), f.Payload...)
 		f = s.queueFrame(f)
