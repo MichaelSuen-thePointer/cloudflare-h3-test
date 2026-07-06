@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	_ "net/http/pprof"
+	"net/netip"
 	"net/url"
 	"runtime"
 	"strings"
@@ -222,7 +223,7 @@ func Main(args []string) {
 	}
 	stats := &clientStats{started: time.Now()}
 	wsSocketOptions := relay.WebSocketSocketOptions{SendBuffer: wsSocketSendBuffer, ReceiveBuffer: wsSocketReceiveBuffer}
-	state := &clientState{remote: remote, token: token, connectIP: connectIP, transport: transport, wsLanesN: wsLanesN, wsLanesIncremental: wsLanesIncremental, wsSocketOptions: wsSocketOptions, polls: polls, maxInflightPosts: maxInflightPosts, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, idle: idle, udp: udp, sessions: map[string]*session{}, stats: stats, metrics: metrics}
+	state := &clientState{remote: remote, token: token, connectIP: connectIP, transport: transport, wsLanesN: wsLanesN, wsLanesIncremental: wsLanesIncremental, wsSocketOptions: wsSocketOptions, polls: polls, maxInflightPosts: maxInflightPosts, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, idle: idle, udp: udp, sessions: map[netip.AddrPort]*session{}, stats: stats, metrics: metrics}
 	if transport == "ws" {
 		state.wsPool = newWSPool(remote, connectIP, token, wsLanesN, timeout, wsSocketOptions)
 		defer state.wsPool.Close()
@@ -238,8 +239,13 @@ func Main(args []string) {
 		if err != nil {
 			log.Fatal(err)
 		}
+		key, ok := udpPeerKeyFromAddr(peer)
+		if !ok {
+			appLog.WarnRate("udp_peer_key_failed", 10*time.Second, "udp-peer-key-failed", "peer", peer.String())
+			continue
+		}
 		payload := append([]byte(nil), buf[:n]...)
-		sess := state.getSession(peer)
+		sess := state.getSession(key, peer)
 		sess.enqueue(payload)
 	}
 }
@@ -261,7 +267,7 @@ type clientState struct {
 	idle               time.Duration
 	udp                *net.UDPConn
 	mu                 sync.Mutex
-	sessions           map[string]*session
+	sessions           map[netip.AddrPort]*session
 	wsPool             *wsPool
 	stats              *clientStats
 	metrics            bool
@@ -287,14 +293,22 @@ type clientStats struct {
 	wsIncrementalAcquireSkippedFull atomic.Int64
 }
 
-func (c *clientState) getSession(peer *net.UDPAddr) *session {
-	key := peer.String()
+func udpPeerKeyFromAddr(addr *net.UDPAddr) (netip.AddrPort, bool) {
+	ip, ok := netip.AddrFromSlice(addr.IP)
+	if !ok {
+		return netip.AddrPort{}, false
+	}
+	return netip.AddrPortFrom(ip.Unmap(), uint16(addr.Port)), true
+}
+
+func (c *clientState) getSession(key netip.AddrPort, peer *net.UDPAddr) *session {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if sess := c.sessions[key]; sess != nil {
 		sess.touch()
 		return sess
 	}
+	peerLabel := key.String()
 	id := randomID()
 	ctx, cancel := context.WithCancel(context.Background())
 	sess := &session{id: id, peer: peer, remote: c.remote, token: c.token, state: c, ctx: ctx, cancel: cancel, closed: make(chan struct{}), ready: make(chan struct{}), wsChanged: make(chan struct{}, 1), lastActive: atomic.Int64{}, touchEvery: touchInterval(c.idle), stats: c.stats, metrics: c.metrics, posts: make(chan struct{}, c.maxInflightPosts), sendQ: make(chan []byte, c.sendQueue), batchQ: make(chan []relay.Frame, c.sendQueue)}
@@ -307,8 +321,8 @@ func (c *clientState) getSession(peer *net.UDPAddr) *session {
 		if c.wsLanesIncremental && c.wsLanesN > 1 {
 			sess.goRun(func() { sess.wsIncrementalLoop() })
 		}
-		sess.goRun(func() { c.connectWebSocketLanes(sess, key) })
-		appLog.Debug("binary-session-create", "session", id, "peer", key, "transport", c.transport, "lanes", c.wsLanesN, "connecting", true)
+		sess.goRun(func() { c.connectWebSocketLanes(sess, key, peerLabel) })
+		appLog.Debug("binary-session-create", "session", id, "peer", peerLabel, "transport", c.transport, "lanes", c.wsLanesN, "connecting", true)
 		return sess
 	}
 	log.Fatalf("invalid transport %q", c.transport)
@@ -321,14 +335,14 @@ func (c *clientState) cleanupLoop() {
 	for range ticker.C {
 		cutoff := time.Now().Add(-c.idle)
 		var expired []struct {
-			key  string
+			key  netip.AddrPort
 			sess *session
 		}
 		c.mu.Lock()
 		for key, sess := range c.sessions {
 			if sess.idleBefore(cutoff) {
 				expired = append(expired, struct {
-					key  string
+					key  netip.AddrPort
 					sess *session
 				}{key: key, sess: sess})
 			}
@@ -340,7 +354,7 @@ func (c *clientState) cleanupLoop() {
 	}
 }
 
-func (c *clientState) closeSession(key string, sess *session) {
+func (c *clientState) closeSession(key netip.AddrPort, sess *session) {
 	c.mu.Lock()
 	if c.sessions[key] != sess {
 		c.mu.Unlock()
@@ -369,7 +383,7 @@ func (c *clientState) acquireBinaryConn(ctx context.Context, sessionID string, l
 	return ws, nil
 }
 
-func (c *clientState) connectWebSocketLanes(sess *session, key string) {
+func (c *clientState) connectWebSocketLanes(sess *session, key netip.AddrPort, peerLabel string) {
 	defer close(sess.ready)
 	target := c.wsLanesN
 	if c.wsLanesIncremental {
@@ -377,7 +391,7 @@ func (c *clientState) connectWebSocketLanes(sess *session, key string) {
 	}
 	if err := c.ensureWebSocketLanes(sess, target); err != nil {
 		if !errors.Is(err, errSessionClosed) {
-			appLog.WarnRate("websocket_initial_connect_failed", 10*time.Second, "websocket-initial-connect-failed", "session", sess.id, "peer", key, "err", err)
+			appLog.WarnRate("websocket_initial_connect_failed", 10*time.Second, "websocket-initial-connect-failed", "session", sess.id, "peer", peerLabel, "err", err)
 			if sess.state != nil {
 				go sess.state.closeSession(key, sess)
 			} else {
@@ -386,7 +400,7 @@ func (c *clientState) connectWebSocketLanes(sess *session, key string) {
 		}
 		return
 	}
-	appLog.Debug("websocket-session-ready", "session", sess.id, "peer", key, "lanes", sess.wsCount())
+	appLog.Debug("websocket-session-ready", "session", sess.id, "peer", peerLabel, "lanes", sess.wsCount())
 }
 
 func (c *clientState) ensureWebSocketLanes(sess *session, target int) error {
@@ -596,7 +610,6 @@ func (s *session) enqueue(payload []byte) {
 	if s.isClosed() {
 		return
 	}
-	s.touch()
 	s.countSendQueueDrops(relay.EnqueueDropOldest(s.sendQ, payload))
 }
 
@@ -654,8 +667,15 @@ func (s *session) drainSendBatch(batch []relay.Frame, batchSize int) []relay.Fra
 	return batch
 }
 
-func (s *session) shouldSendBatchSync() bool {
-	return s.wsCount() == 1 && (s.state == nil || !s.state.wsLanesIncremental)
+func (s *session) singleWSLaneForSync() (*wsLane, bool) {
+	if s.state != nil && s.state.wsLanesIncremental {
+		return nil, false
+	}
+	lanes := s.currentWSSnapshot()
+	if len(lanes) != 1 {
+		return nil, false
+	}
+	return lanes[0], true
 }
 
 func (s *session) wsIncrementalLoop() {
@@ -799,8 +819,8 @@ func (s *session) sendBatch(frames []relay.Frame) {
 			return
 		}
 	}
-	if s.shouldSendBatchSync() {
-		s.writeBatchSync(frames)
+	if ln, ok := s.singleWSLaneForSync(); ok {
+		s.writeBatchSync(ln, frames)
 		return
 	}
 	s.enqueueBatch(frames)
@@ -836,7 +856,7 @@ func enqueueFrameBatchDropOldest(ch chan []relay.Frame, frames []relay.Frame) in
 	}
 }
 
-func (s *session) writeBatchSync(frames []relay.Frame) {
+func (s *session) writeBatchSync(ln *wsLane, frames []relay.Frame) {
 	select {
 	case <-s.ctx.Done():
 		return
@@ -845,8 +865,7 @@ func (s *session) writeBatchSync(frames []relay.Frame) {
 	default:
 	}
 
-	ln := s.firstOpenWSLane()
-	if ln == nil {
+	if ln == nil || ln.closed.Load() {
 		appLog.WarnRate("websocket_lane_unavailable", 10*time.Second, "websocket-lane-unavailable", "session", s.id)
 		return
 	}
