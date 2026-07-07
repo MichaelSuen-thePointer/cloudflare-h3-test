@@ -200,24 +200,6 @@ func TestServerDownBatchLoopDrainsWithoutDelay(t *testing.T) {
 	}
 }
 
-func TestServerDownBatchQueueDropOldestCountsDroppedFrames(t *testing.T) {
-	if !metricsBuild {
-		t.Skip("metrics counters require -tags metrics")
-	}
-	s := &server{metrics: true}
-	ch := make(chan []relay.Frame, 1)
-	s.countBatchQueueDrops(enqueueFrameBatchDropOldest(ch, []relay.Frame{{PacketID: 1}, {PacketID: 2}}))
-	s.countBatchQueueDrops(enqueueFrameBatchDropOldest(ch, []relay.Frame{{PacketID: 3}}))
-
-	if got := s.stats.batchQDrops.Load(); got != 2 {
-		t.Fatalf("batchQDrops=%d, want 2", got)
-	}
-	batch := <-ch
-	if len(batch) != 1 || batch[0].PacketID != 3 {
-		t.Fatalf("remaining batch=%+v, want packet 3", batch)
-	}
-}
-
 func TestServerBatchQueueWaitMetrics(t *testing.T) {
 	if !metricsBuild {
 		t.Skip("metrics counters require -tags metrics")
@@ -233,6 +215,25 @@ func TestServerBatchQueueWaitMetrics(t *testing.T) {
 	}
 	if got := s.stats.batchQWaitMaxUS.Load(); got <= 0 {
 		t.Fatalf("batchQWaitMaxUS=%d, want > 0", got)
+	}
+}
+
+func TestServerBatchQueueCapacityUsesRawQueueBudget(t *testing.T) {
+	tests := []struct {
+		queueSize int
+		batchSize int
+		want      int
+	}{
+		{queueSize: 16384, batchSize: 8, want: 2048},
+		{queueSize: 20, batchSize: 8, want: 2},
+		{queueSize: 7, batchSize: 8, want: 1},
+		{queueSize: 0, batchSize: 8, want: 1},
+		{queueSize: 8, batchSize: 0, want: 8},
+	}
+	for _, tt := range tests {
+		if got := batchQueueCapacity(tt.queueSize, tt.batchSize); got != tt.want {
+			t.Fatalf("batchQueueCapacity(%d, %d)=%d, want %d", tt.queueSize, tt.batchSize, got, tt.want)
+		}
 	}
 }
 

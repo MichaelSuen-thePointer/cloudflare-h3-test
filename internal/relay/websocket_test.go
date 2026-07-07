@@ -3,11 +3,16 @@ package relay
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestWebSocketReadRejectsOversizedPayload(t *testing.T) {
@@ -53,6 +58,84 @@ func TestWebSocketReadRejectsBadMaskDirection(t *testing.T) {
 	}
 	if err := <-errCh; err != nil {
 		t.Fatalf("write header: %v", err)
+	}
+}
+
+func TestDialWebSocketDoesNotOfferExtensions(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer conn.Close()
+		key, extensions, err := readTestWebSocketRequest(conn)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		if extensions != "" {
+			errCh <- errors.New("client offered websocket extensions")
+			return
+		}
+		_, err = io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\n"+
+			"Upgrade: websocket\r\n"+
+			"Connection: Upgrade\r\n"+
+			"Sec-WebSocket-Accept: "+websocketAccept(key)+"\r\n\r\n")
+		errCh <- err
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ws, err := DialWebSocket(ctx, "ws://"+ln.Addr().String()+"/", "", "token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = ws.Close()
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAcceptWebSocketDoesNotNegotiateExtensions(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := AcceptWebSocket(w, r)
+		if err != nil {
+			return
+		}
+		_ = ws.Close()
+	}))
+	defer ts.Close()
+	addr := strings.TrimPrefix(ts.URL, "http://")
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	key := "dGhlIHNhbXBsZSBub25jZQ=="
+	_, err = io.WriteString(conn, "GET / HTTP/1.1\r\n"+
+		"Host: "+addr+"\r\n"+
+		"Upgrade: websocket\r\n"+
+		"Connection: Upgrade\r\n"+
+		"Sec-WebSocket-Version: 13\r\n"+
+		"Sec-WebSocket-Key: "+key+"\r\n"+
+		"Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if got := resp.Header.Get("Sec-WebSocket-Extensions"); got != "" {
+		t.Fatalf("Sec-WebSocket-Extensions=%q, want empty", got)
 	}
 }
 
@@ -259,6 +342,27 @@ func TestWebSocketWriteBinaryOwnedRejectsOversizedPayload(t *testing.T) {
 	err := ws.WriteBinaryOwned(make([]byte, MaxWebSocketPayloadBytes+1))
 	if err == nil || !strings.Contains(err.Error(), "websocket payload too large") {
 		t.Fatalf("err=%v, want payload too large", err)
+	}
+}
+
+func readTestWebSocketRequest(conn net.Conn) (key string, extensions string, err error) {
+	br := bufio.NewReader(conn)
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return "", "", err
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			return key, extensions, nil
+		}
+		lower := strings.ToLower(line)
+		switch {
+		case strings.HasPrefix(lower, "sec-websocket-key:"):
+			key = strings.TrimSpace(line[len("sec-websocket-key:"):])
+		case strings.HasPrefix(lower, "sec-websocket-extensions:"):
+			extensions = strings.TrimSpace(line[len("sec-websocket-extensions:"):])
+		}
 	}
 }
 
