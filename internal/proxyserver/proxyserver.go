@@ -132,9 +132,9 @@ func Main(args []string) {
 	fs.BoolVar(&useSyslog, "use-syslog", false, "write diagnostic logs to syslog instead of stderr")
 	fs.DurationVar(&idle, "idle", 120*time.Second, "session idle timeout")
 	fs.IntVar(&udpBuffer, "udp-buffer", 4<<20, "UDP socket read/write buffer bytes")
-	fs.IntVar(&downQueue, "down-queue", 65536, "per-session downlink queue capacity")
-	fs.IntVar(&batchSize, "batch-size", 8, "maximum UDP packets per WebSocket downlink batch")
-	fs.DurationVar(&batchDelay, "batch-delay", 250*time.Microsecond, "maximum time to wait for a partially filled WebSocket downlink batch")
+	fs.IntVar(&downQueue, "down-queue", 1024, "per-session downlink queue capacity")
+	fs.IntVar(&batchSize, "batch-size", 4, "maximum UDP packets per WebSocket downlink batch")
+	fs.DurationVar(&batchDelay, "batch-delay", 125*time.Microsecond, "maximum time to wait for a partially filled WebSocket downlink batch")
 	fs.IntVar(&wsSocketSendBuffer, "ws-socket-send-buffer", 0, "WebSocket TCP socket send buffer bytes, 0 keeps OS default")
 	fs.IntVar(&wsSocketReceiveBuffer, "ws-socket-recv-buffer", 0, "WebSocket TCP socket receive buffer bytes, 0 keeps OS default")
 	fs.IntVar(&downExpandLanesMax, "down-expand-lanes-max", 1, "maximum attached WebSocket lanes before suppressing server downlink expand hints")
@@ -559,8 +559,7 @@ func (sess *session) downBatchLoop(parent *server) {
 				if !ok {
 					return
 				}
-				parent.markBatchQueued(batch)
-				parent.countBatchQueueDrops(enqueueFrameBatchDropOldest(sess.batchQ, batch))
+				sess.enqueueDownBatch(parent, batch)
 				continue
 			}
 			timer := time.NewTimer(parent.batchDelay)
@@ -602,10 +601,34 @@ func (sess *session) downBatchLoop(parent *server) {
 				default:
 				}
 			}
-			parent.markBatchQueued(batch)
-			parent.countBatchQueueDrops(enqueueFrameBatchDropOldest(sess.batchQ, batch))
+			sess.enqueueDownBatch(parent, batch)
 		}
 	}
+}
+
+func (sess *session) enqueueDownBatch(parent *server, batch []relay.Frame) {
+	if len(batch) == 0 || sess.batchQ == nil {
+		return
+	}
+	parent.markBatchQueued(batch)
+	select {
+	case sess.batchQ <- batch:
+	case <-sess.done:
+	}
+}
+
+func batchQueueCapacity(queueSize, batchSize int) int {
+	if queueSize < 1 {
+		queueSize = 1
+	}
+	if batchSize < 1 {
+		batchSize = 1
+	}
+	capacity := queueSize / batchSize
+	if capacity < 1 {
+		return 1
+	}
+	return capacity
 }
 
 func (sess *session) drainDownBatch(parent *server, batch []relay.Frame, batchSize int) ([]relay.Frame, bool) {
@@ -724,7 +747,7 @@ func (s *server) getSession(id string) (*session, error) {
 	if queueCap < 1 {
 		queueCap = 65536
 	}
-	sess := &session{id: id, udp: udp, queue: make(chan relay.Frame, queueCap), batchQ: make(chan []relay.Frame, queueCap), done: make(chan struct{}), touchEvery: touchInterval(s.idle), ws: make(map[*relay.WebSocketConn]*serverWSLane)}
+	sess := &session{id: id, udp: udp, queue: make(chan relay.Frame, queueCap), batchQ: make(chan []relay.Frame, batchQueueCapacity(queueCap, s.batchSize)), done: make(chan struct{}), touchEvery: touchInterval(s.idle), ws: make(map[*relay.WebSocketConn]*serverWSLane)}
 	sess.touch()
 	s.sessions[id] = sess
 	s.countSessionMade()
@@ -770,28 +793,6 @@ func (s *server) cleanupLoop() {
 		if len(ids) > 0 {
 			appLog.Debug("cleanup", "expired", len(ids))
 		}
-	}
-}
-
-func enqueueFrameBatchDropOldest(ch chan []relay.Frame, frames []relay.Frame) int {
-	select {
-	case ch <- frames:
-		return 0
-	default:
-	}
-
-	dropped := 0
-	select {
-	case old := <-ch:
-		dropped = len(old)
-	default:
-	}
-
-	select {
-	case ch <- frames:
-		return dropped
-	default:
-		return dropped + len(frames)
 	}
 }
 

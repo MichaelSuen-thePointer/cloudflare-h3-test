@@ -115,7 +115,7 @@ const wsEncodeBufferRetainLimit = 512 << 10
 
 func Main(args []string) {
 	var listen, remote, token, connectIP, metricsOut, transport, logLevel, pprofAddr string
-	var wsLanesN, polls, maxInflightPosts, batchSize, sendQueue, wsSocketSendBuffer, wsSocketReceiveBuffer int
+	var wsLanesN, wsPoolSize, polls, maxInflightPosts, batchSize, sendQueue, wsSocketSendBuffer, wsSocketReceiveBuffer int
 	var wsLanesIncremental, metrics, useSyslog bool
 	var timeout, metricsInterval, batchDelay, idle time.Duration
 	fs := flag.NewFlagSet("proxy-client", flag.ExitOnError)
@@ -125,6 +125,7 @@ func Main(args []string) {
 	fs.StringVar(&connectIP, "connect-ip", "", "optional Cloudflare edge IP to connect to instead of DNS")
 	fs.StringVar(&transport, "transport", "ws", "relay transport: ws or h3")
 	fs.IntVar(&wsLanesN, "ws-lanes", 1, "WebSocket lanes")
+	fs.IntVar(&wsPoolSize, "ws-pool-size", 10, "target number of idle preconnected WebSocket connections")
 	fs.BoolVar(&wsLanesIncremental, "ws-lanes-incremental", false, "start WebSocket sessions with one lane and add lanes when batch queue backs up")
 	fs.IntVar(&wsSocketSendBuffer, "ws-socket-send-buffer", 0, "WebSocket TCP socket send buffer bytes, 0 keeps OS default")
 	fs.IntVar(&wsSocketReceiveBuffer, "ws-socket-recv-buffer", 0, "WebSocket TCP socket receive buffer bytes, 0 keeps OS default")
@@ -132,7 +133,7 @@ func Main(args []string) {
 	fs.IntVar(&maxInflightPosts, "max-inflight-posts", 20, "maximum in-flight POST requests per session")
 	fs.IntVar(&batchSize, "batch-size", 8, "maximum UDP packets per POST")
 	fs.DurationVar(&batchDelay, "batch-delay", 250*time.Microsecond, "maximum time to wait for a partially filled POST batch")
-	fs.IntVar(&sendQueue, "send-queue", 16384, "per-session UDP packet queue before POST batching")
+	fs.IntVar(&sendQueue, "send-queue", 1024, "per-session UDP packet queue before POST batching")
 	fs.DurationVar(&timeout, "http-timeout", 15*time.Second, "HTTP request timeout")
 	fs.DurationVar(&idle, "idle", 120*time.Second, "local UDP session idle timeout")
 	fs.BoolVar(&metrics, "metrics", false, "enable in-memory metrics counters")
@@ -163,7 +164,7 @@ func Main(args []string) {
 		if err := configureLogger("proxy-client", logLevel, useSyslog); err != nil {
 			log.Fatal(err)
 		}
-		if err := applyClientPluginEnv(pluginEnv, &listen, &remote, &token, &connectIP, &transport, &logLevel, &wsLanesN, &polls, &maxInflightPosts, &batchSize, &sendQueue, &wsSocketSendBuffer, &wsSocketReceiveBuffer, &wsLanesIncremental, &metrics, &useSyslog, &timeout, &metricsInterval, &batchDelay, &idle, &metricsOut); err != nil {
+		if err := applyClientPluginEnv(pluginEnv, &listen, &remote, &token, &connectIP, &transport, &logLevel, &wsLanesN, &wsPoolSize, &polls, &maxInflightPosts, &batchSize, &sendQueue, &wsSocketSendBuffer, &wsSocketReceiveBuffer, &wsLanesIncremental, &metrics, &useSyslog, &timeout, &metricsInterval, &batchDelay, &idle, &metricsOut); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -173,6 +174,9 @@ func Main(args []string) {
 	}
 	if wsLanesN < 1 {
 		wsLanesN = 1
+	}
+	if wsPoolSize < 0 {
+		wsPoolSize = 0
 	}
 	if maxInflightPosts < 1 {
 		maxInflightPosts = 1
@@ -225,14 +229,14 @@ func Main(args []string) {
 	wsSocketOptions := relay.WebSocketSocketOptions{SendBuffer: wsSocketSendBuffer, ReceiveBuffer: wsSocketReceiveBuffer}
 	state := &clientState{remote: remote, token: token, connectIP: connectIP, transport: transport, wsLanesN: wsLanesN, wsLanesIncremental: wsLanesIncremental, wsSocketOptions: wsSocketOptions, polls: polls, maxInflightPosts: maxInflightPosts, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, idle: idle, udp: udp, sessions: map[netip.AddrPort]*session{}, stats: stats, metrics: metrics}
 	if transport == "ws" {
-		state.wsPool = newWSPool(remote, connectIP, token, wsLanesN, timeout, wsSocketOptions)
+		state.wsPool = newWSPool(remote, connectIP, token, wsPoolSize, timeout, wsSocketOptions)
 		defer state.wsPool.Close()
 	}
 	if metricsBuild && metricsOut != "" {
 		go state.writeMetrics(metricsOut, metricsInterval)
 	}
 	go state.cleanupLoop()
-	appLog.Info("proxy-client-start", "listen", listen, "remote", remote, "connect_ip", connectIP, "transport", transport, "ws_lanes", wsLanesN, "ws_lanes_incremental", wsLanesIncremental, "ws_socket_send_buffer", wsSocketSendBuffer, "ws_socket_recv_buffer", wsSocketReceiveBuffer, "down_polls", polls)
+	appLog.Info("proxy-client-start", "listen", listen, "remote", remote, "connect_ip", connectIP, "transport", transport, "ws_lanes", wsLanesN, "ws_pool_size", wsPoolSize, "ws_lanes_incremental", wsLanesIncremental, "ws_socket_send_buffer", wsSocketSendBuffer, "ws_socket_recv_buffer", wsSocketReceiveBuffer, "down_polls", polls)
 	buf := make([]byte, 65535)
 	for {
 		n, peer, err := udp.ReadFromUDP(buf)
@@ -311,7 +315,7 @@ func (c *clientState) getSession(key netip.AddrPort, peer *net.UDPAddr) *session
 	peerLabel := key.String()
 	id := randomID()
 	ctx, cancel := context.WithCancel(context.Background())
-	sess := &session{id: id, peer: peer, remote: c.remote, token: c.token, state: c, ctx: ctx, cancel: cancel, closed: make(chan struct{}), ready: make(chan struct{}), wsChanged: make(chan struct{}, 1), lastActive: atomic.Int64{}, touchEvery: touchInterval(c.idle), stats: c.stats, metrics: c.metrics, posts: make(chan struct{}, c.maxInflightPosts), sendQ: make(chan []byte, c.sendQueue), batchQ: make(chan []relay.Frame, c.sendQueue)}
+	sess := &session{id: id, peer: peer, remote: c.remote, token: c.token, state: c, ctx: ctx, cancel: cancel, closed: make(chan struct{}), ready: make(chan struct{}), wsChanged: make(chan struct{}, 1), lastActive: atomic.Int64{}, touchEvery: touchInterval(c.idle), stats: c.stats, metrics: c.metrics, posts: make(chan struct{}, c.maxInflightPosts), sendQ: make(chan []byte, c.sendQueue), batchQ: make(chan []relay.Frame, batchQueueCapacity(c.sendQueue, c.batchSize))}
 	sess.touch()
 	if c.transport == "ws" || c.transport == "h3" {
 		sess.wsMode = true
@@ -667,17 +671,6 @@ func (s *session) drainSendBatch(batch []relay.Frame, batchSize int) []relay.Fra
 	return batch
 }
 
-func (s *session) singleWSLaneForSync() (*wsLane, bool) {
-	if s.state != nil && s.state.wsLanesIncremental {
-		return nil, false
-	}
-	lanes := s.currentWSSnapshot()
-	if len(lanes) != 1 {
-		return nil, false
-	}
-	return lanes[0], true
-}
-
 func (s *session) wsIncrementalLoop() {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
@@ -819,10 +812,6 @@ func (s *session) sendBatch(frames []relay.Frame) {
 			return
 		}
 	}
-	if ln, ok := s.singleWSLaneForSync(); ok {
-		s.writeBatchSync(ln, frames)
-		return
-	}
 	s.enqueueBatch(frames)
 }
 
@@ -830,67 +819,25 @@ func (s *session) enqueueBatch(frames []relay.Frame) {
 	if len(frames) == 0 || s.batchQ == nil {
 		return
 	}
-	dropped := enqueueFrameBatchDropOldest(s.batchQ, frames)
-	s.countBatchQueueDrops(dropped)
-}
-
-func enqueueFrameBatchDropOldest(ch chan []relay.Frame, frames []relay.Frame) int {
 	select {
-	case ch <- frames:
-		return 0
-	default:
-	}
-
-	dropped := 0
-	select {
-	case old := <-ch:
-		dropped = len(old)
-	default:
-	}
-
-	select {
-	case ch <- frames:
-		return dropped
-	default:
-		return dropped + len(frames)
-	}
-}
-
-func (s *session) writeBatchSync(ln *wsLane, frames []relay.Frame) {
-	select {
+	case s.batchQ <- frames:
 	case <-s.ctx.Done():
-		return
 	case <-s.closed:
-		return
-	default:
 	}
+}
 
-	if ln == nil || ln.closed.Load() {
-		appLog.WarnRate("websocket_lane_unavailable", 10*time.Second, "websocket-lane-unavailable", "session", s.id)
-		return
+func batchQueueCapacity(queueSize, batchSize int) int {
+	if queueSize < 1 {
+		queueSize = 1
 	}
-
-	if body, ok, err := relay.EncodeFramesWithinLimitInto(ln.encodeBuf, frames, relay.MaxMessageBytes); err != nil {
-		appLog.Error("frame-encode-failed", "session", s.id, "err", err)
-		return
-	} else if ok {
-		s.writeEncodedFrameChunk(ln, frames, body)
-		return
+	if batchSize < 1 {
+		batchSize = 1
 	}
-
-	chunks, err := relay.SplitFramesByEncodedLimit(frames, relay.MaxMessageBytes)
-	if err != nil {
-		appLog.Error("frame-split-failed", "session", s.id, "err", err)
-		return
+	capacity := queueSize / batchSize
+	if capacity < 1 {
+		return 1
 	}
-	for _, chunk := range chunks {
-		ln := s.firstOpenWSLane()
-		if ln == nil {
-			appLog.WarnRate("websocket_lane_unavailable", 10*time.Second, "websocket-lane-unavailable", "session", s.id)
-			return
-		}
-		s.writeFrameChunk(ln, chunk)
-	}
+	return capacity
 }
 
 func (s *session) wsWriteLoop(c *clientState, ln *wsLane) {
@@ -1229,7 +1176,7 @@ func setHeaders(req *http.Request, token, sessionID string) {
 	req.Header.Set("X-Relay-Session", sessionID)
 }
 
-func applyClientPluginEnv(env PluginEnv.Env, listen, remote, token, connectIP, transport, logLevel *string, wsLanesN, polls, maxInflightPosts, batchSize, sendQueue, wsSocketSendBuffer, wsSocketReceiveBuffer *int, wsLanesIncremental, metrics, useSyslog *bool, timeout, metricsInterval, batchDelay, idle *time.Duration, metricsOut *string) error {
+func applyClientPluginEnv(env PluginEnv.Env, listen, remote, token, connectIP, transport, logLevel *string, wsLanesN, wsPoolSize, polls, maxInflightPosts, batchSize, sendQueue, wsSocketSendBuffer, wsSocketReceiveBuffer *int, wsLanesIncremental, metrics, useSyslog *bool, timeout, metricsInterval, batchDelay, idle *time.Duration, metricsOut *string) error {
 	opts := env.Options
 	warnUnknownPluginEnvOptions(opts, knownClientPluginEnvOptions)
 
@@ -1281,6 +1228,9 @@ func applyClientPluginEnv(env PluginEnv.Env, listen, remote, token, connectIP, t
 		return err
 	}
 	if err := applyIntOption(opts, "ws-lanes", wsLanesN); err != nil {
+		return err
+	}
+	if err := applyIntOption(opts, "ws-pool-size", wsPoolSize); err != nil {
 		return err
 	}
 	if err := applyIntOption(opts, "down-polls", polls); err != nil {
@@ -1358,7 +1308,7 @@ func applyDurationOption(opts PluginEnv.Options, key string, dst *time.Duration)
 var knownClientPluginEnvOptions = map[string]struct{}{
 	"scheme": {}, "tls": {}, "host": {}, "path": {}, "connect-ip": {}, "token": {}, "transport": {}, "metrics-out": {}, "log-level": {}, "use-syslog": {},
 	"ws-lanes": {}, "down-polls": {}, "max-inflight-posts": {}, "batch-size": {}, "send-queue": {},
-	"ws-lanes-incremental": {}, "ws-socket-send-buffer": {}, "ws-socket-recv-buffer": {}, "metrics": {},
+	"ws-pool-size": {}, "ws-lanes-incremental": {}, "ws-socket-send-buffer": {}, "ws-socket-recv-buffer": {}, "metrics": {},
 	"http-timeout": {}, "metrics-interval": {}, "batch-delay": {}, "idle": {},
 }
 

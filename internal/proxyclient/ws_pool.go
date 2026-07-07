@@ -37,6 +37,9 @@ type pooledWebSocket struct {
 }
 
 func newWSPool(remote, connectIP, token string, target int, timeout time.Duration, socketOptions relay.WebSocketSocketOptions) *wsPool {
+	if target < 0 {
+		target = 0
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &wsPool{
 		remote:        remote,
