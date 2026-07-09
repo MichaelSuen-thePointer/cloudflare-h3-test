@@ -345,6 +345,21 @@ func TestIncrementalWebSocketLaneDoesNotAddLaneForSingleQueuedBatch(t *testing.T
 	}
 }
 
+func TestIncrementalWebSocketLaneDirectBacklogUsesSendQueue(t *testing.T) {
+	sess := &session{
+		sendQ: make(chan []byte, 3),
+		state: &clientState{
+			transport: "ws",
+			batchSize: 1,
+		},
+	}
+	sess.sendQ <- []byte("one")
+	sess.sendQ <- []byte("two")
+	if got := sess.wsBacklogDepth(); got != 2 {
+		t.Fatalf("wsBacklogDepth=%d, want 2", got)
+	}
+}
+
 func TestWebSocketExpandHintSetsPending(t *testing.T) {
 	if !metricsBuild {
 		t.Skip("metrics counters require -tags metrics")
@@ -752,6 +767,19 @@ func TestBatchQueueCapacityUsesRawQueueBudget(t *testing.T) {
 		if got := batchQueueCapacity(tt.queueSize, tt.batchSize); got != tt.want {
 			t.Fatalf("batchQueueCapacity(%d, %d)=%d, want %d", tt.queueSize, tt.batchSize, got, tt.want)
 		}
+	}
+}
+
+func TestBatchSizeOneForcesZeroDelayAndDirectWSWrite(t *testing.T) {
+	batchSize := 1
+	batchDelay := 250 * time.Microsecond
+	normalizeBatchSettings(&batchSize, &batchDelay)
+	if batchSize != 1 || batchDelay != 0 {
+		t.Fatalf("batchSize=%d batchDelay=%v, want 1/0", batchSize, batchDelay)
+	}
+	c := &clientState{transport: "ws", batchSize: batchSize}
+	if !c.usesDirectWSWrite() {
+		t.Fatal("usesDirectWSWrite=false, want true")
 	}
 }
 
