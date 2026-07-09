@@ -181,9 +181,7 @@ func Main(args []string) {
 	if maxInflightPosts < 1 {
 		maxInflightPosts = 1
 	}
-	if batchSize < 1 {
-		batchSize = 1
-	}
+	normalizeBatchSettings(&batchSize, &batchDelay)
 	if sendQueue < 1 {
 		sendQueue = 1
 	}
@@ -315,13 +313,19 @@ func (c *clientState) getSession(key netip.AddrPort, peer *net.UDPAddr) *session
 	peerLabel := key.String()
 	id := randomID()
 	ctx, cancel := context.WithCancel(context.Background())
-	sess := &session{id: id, peer: peer, remote: c.remote, token: c.token, state: c, ctx: ctx, cancel: cancel, closed: make(chan struct{}), ready: make(chan struct{}), wsChanged: make(chan struct{}, 1), lastActive: atomic.Int64{}, touchEvery: touchInterval(c.idle), stats: c.stats, metrics: c.metrics, posts: make(chan struct{}, c.maxInflightPosts), sendQ: make(chan []byte, c.sendQueue), batchQ: make(chan []relay.Frame, batchQueueCapacity(c.sendQueue, c.batchSize))}
+	var batchQ chan []relay.Frame
+	if !c.usesDirectWSWrite() {
+		batchQ = make(chan []relay.Frame, batchQueueCapacity(c.sendQueue, c.batchSize))
+	}
+	sess := &session{id: id, peer: peer, remote: c.remote, token: c.token, state: c, ctx: ctx, cancel: cancel, closed: make(chan struct{}), ready: make(chan struct{}), wsChanged: make(chan struct{}, 1), lastActive: atomic.Int64{}, touchEvery: touchInterval(c.idle), stats: c.stats, metrics: c.metrics, posts: make(chan struct{}, c.maxInflightPosts), sendQ: make(chan []byte, c.sendQueue), batchQ: batchQ}
 	sess.touch()
 	if c.transport == "ws" || c.transport == "h3" {
 		sess.wsMode = true
 		c.sessions[key] = sess
 		c.countSession()
-		sess.goRun(func() { sess.sendLoop(c.batchSize, c.batchDelay) })
+		if !c.usesDirectWSWrite() {
+			sess.goRun(func() { sess.sendLoop(c.batchSize, c.batchDelay) })
+		}
 		if c.wsLanesIncremental && c.wsLanesN > 1 {
 			sess.goRun(func() { sess.wsIncrementalLoop() })
 		}
@@ -497,7 +501,7 @@ func (s *session) maybeAcquireIncrementalWebSocketLane() {
 	if s.state.wsLanesN <= 1 {
 		return
 	}
-	localBacklog := s.batchQ != nil && len(s.batchQ) > 1
+	localBacklog := s.wsBacklogDepth() > 1
 	serverHint := s.expandHintPending.Load()
 	if !localBacklog && !serverHint {
 		return
@@ -690,6 +694,16 @@ func (s *session) wsIncrementalLoop() {
 	}
 }
 
+func (s *session) wsBacklogDepth() int {
+	if s.state != nil && s.state.usesDirectWSWrite() {
+		return len(s.sendQ)
+	}
+	if s.batchQ == nil {
+		return 0
+	}
+	return len(s.batchQ)
+}
+
 func (s *session) wsCount() int {
 	return len(s.currentWSSnapshot())
 }
@@ -840,7 +854,24 @@ func batchQueueCapacity(queueSize, batchSize int) int {
 	return capacity
 }
 
+func normalizeBatchSettings(batchSize *int, batchDelay *time.Duration) {
+	if *batchSize < 1 {
+		*batchSize = 1
+	}
+	if *batchSize == 1 {
+		*batchDelay = 0
+	}
+}
+
+func (c *clientState) usesDirectWSWrite() bool {
+	return c.transport == "ws" && c.batchSize == 1
+}
+
 func (s *session) wsWriteLoop(c *clientState, ln *wsLane) {
+	if c.usesDirectWSWrite() {
+		s.wsDirectWriteLoop(c, ln)
+		return
+	}
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -855,6 +886,28 @@ func (s *session) wsWriteLoop(c *clientState, ln *wsLane) {
 				return
 			}
 			s.writeBatchOnLane(c, ln, frames)
+			if ln.closed.Load() {
+				return
+			}
+		}
+	}
+}
+
+func (s *session) wsDirectWriteLoop(c *clientState, ln *wsLane) {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-s.closed:
+			return
+		case <-ln.done:
+			return
+		case payload := <-s.sendQ:
+			if ln.closed.Load() {
+				return
+			}
+			frame := relay.Frame{PacketID: s.next.Add(1), Payload: payload}
+			s.writeBatchOnLane(c, ln, []relay.Frame{frame})
 			if ln.closed.Load() {
 				return
 			}

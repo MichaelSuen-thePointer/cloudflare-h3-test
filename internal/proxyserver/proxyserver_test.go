@@ -237,6 +237,32 @@ func TestServerBatchQueueCapacityUsesRawQueueBudget(t *testing.T) {
 	}
 }
 
+func TestServerBatchSizeOneForcesZeroDelayAndSkipsBatchQueue(t *testing.T) {
+	batchSize := 1
+	batchDelay := 125 * time.Microsecond
+	normalizeBatchSettings(&batchSize, &batchDelay)
+	if batchSize != 1 || batchDelay != 0 {
+		t.Fatalf("batchSize=%d batchDelay=%v, want 1/0", batchSize, batchDelay)
+	}
+	s := &server{
+		benchEcho: true,
+		downQueue: 4,
+		batchSize: batchSize,
+		sessions:  map[string]*session{},
+	}
+	sess, err := s.getSession("direct-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.close()
+	if sess.batchQ != nil {
+		t.Fatalf("batchQ=%v, want nil in direct write mode", sess.batchQ)
+	}
+	if !s.usesDirectWSWrite() {
+		t.Fatal("usesDirectWSWrite=false, want true")
+	}
+}
+
 func TestServerExpandHintQueuedWhenBatchBacklogged(t *testing.T) {
 	s := &server{metrics: true, downExpandLanesMax: 2, downExpandHintTimeout: 15 * time.Second}
 	sess := &session{
@@ -249,6 +275,25 @@ func TestServerExpandHintQueuedWhenBatchBacklogged(t *testing.T) {
 	sess.ws[nil] = &serverWSLane{id: 1}
 	sess.batchQ <- []relay.Frame{{PacketID: 1}}
 	sess.batchQ <- []relay.Frame{{PacketID: 2}}
+
+	sess.maybeQueueExpandHint(s, time.Now())
+
+	if !sess.expandHintPending.Load() {
+		t.Fatal("expandHintPending=false, want true")
+	}
+}
+
+func TestServerExpandHintQueuedWhenDirectQueueBacklogged(t *testing.T) {
+	s := &server{metrics: true, batchSize: 1, downExpandLanesMax: 2, downExpandHintTimeout: 15 * time.Second}
+	sess := &session{
+		id:    "hint-session",
+		queue: make(chan relay.Frame, 2),
+		done:  make(chan struct{}),
+		ws:    make(map[*relay.WebSocketConn]*serverWSLane),
+	}
+	sess.ws[nil] = &serverWSLane{id: 1}
+	sess.queue <- relay.Frame{PacketID: 1}
+	sess.queue <- relay.Frame{PacketID: 2}
 
 	sess.maybeQueueExpandHint(s, time.Now())
 
@@ -423,6 +468,77 @@ func TestServerWritePendingExpandHintWritesControl(t *testing.T) {
 	}
 	if got := s.stats.expandHintsSent.Load(); got != 1 {
 		t.Fatalf("expandHintsSent=%d, want 1", got)
+	}
+}
+
+func TestServerDirectDownlinkWritesPendingExpandHintBeforeData(t *testing.T) {
+	if !metricsBuild {
+		t.Skip("metrics counters require -tags metrics")
+	}
+	s := &server{metrics: true, batchSize: 1, downExpandLanesMax: 2}
+	sess := &session{
+		id:    "direct-hint-session",
+		queue: make(chan relay.Frame, 1),
+		done:  make(chan struct{}),
+		ws:    make(map[*relay.WebSocketConn]*serverWSLane),
+	}
+	defer sess.close()
+	sess.expandHintPending.Store(true)
+	sess.queue <- relay.Frame{PacketID: 7, Payload: []byte("payload")}
+
+	errCh := make(chan error, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := relay.AcceptWebSocket(w, r)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer ws.Close()
+		s.writeDownDirectLoop(ws, &serverWSLane{}, sess, sess.id, r.RemoteAddr, r.Context().Done())
+		errCh <- nil
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ws, err := relay.DialWebSocket(ctx, ts.URL, "", "example-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.Close()
+
+	body, err := ws.ReadBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, payload, err := relay.DecodeControl(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op != relay.ControlOpExpandLanesHint || len(payload) != 0 {
+		t.Fatalf("op=%d payload_len=%d, want expand hint empty", op, len(payload))
+	}
+
+	body, err = ws.ReadBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames, err := relay.DecodeFrames(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frames) != 1 || frames[0].PacketID != 7 || string(frames[0].Payload) != "payload" {
+		t.Fatalf("frames=%+v, want packet 7 payload", frames)
+	}
+	if !sess.expandHintInFlight.Load() {
+		t.Fatal("expandHintInFlight=false, want true")
+	}
+	if got := s.stats.expandHintsSent.Load(); got != 1 {
+		t.Fatalf("expandHintsSent=%d, want 1", got)
+	}
+	sess.close()
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
 	}
 }
 

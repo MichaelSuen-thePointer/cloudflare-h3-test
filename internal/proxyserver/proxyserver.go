@@ -168,9 +168,7 @@ func Main(args []string) {
 	if downQueue < 1 {
 		downQueue = 1
 	}
-	if batchSize < 1 {
-		batchSize = 1
-	}
+	normalizeBatchSettings(&batchSize, &batchDelay)
 	if downExpandLanesMax < 1 {
 		downExpandLanesMax = 1
 	}
@@ -294,11 +292,17 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer sess.removeWebSocket(ws)
 	defer ws.Close()
-	sess.startDownBatchLoop(s)
 	sess.startExpandHintLoop(s)
+	if !s.usesDirectWSWrite() {
+		sess.startDownBatchLoop(s)
+	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		if s.usesDirectWSWrite() {
+			s.writeDownDirectLoop(ws, wsLane, sess, id, r.RemoteAddr, r.Context().Done())
+			return
+		}
 		for {
 			if sess.isClosed() {
 				return
@@ -311,7 +315,7 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				if !s.writePendingExpandHint(ws, sess, id, r.RemoteAddr) {
 					return
 				}
-				if !s.writeDownBatch(ws, wsLane, id, r.RemoteAddr, frames) {
+				if !s.writeDownBatch(ws, wsLane, id, r.RemoteAddr, frames, true) {
 					return
 				}
 			case <-r.Context().Done():
@@ -509,7 +513,7 @@ func (sess *session) expandHintLoop(parent *server) {
 }
 
 func (sess *session) maybeQueueExpandHint(parent *server, now time.Time) {
-	if sess.isClosed() || sess.batchQ == nil || len(sess.batchQ) <= 1 {
+	if sess.isClosed() || sess.downlinkBacklogDepth(parent) <= 1 {
 		return
 	}
 	maxLanes := parent.downExpandLanesMax
@@ -535,6 +539,16 @@ func (sess *session) maybeQueueExpandHint(parent *server, now time.Time) {
 		}
 	}
 	sess.expandHintPending.CompareAndSwap(false, true)
+}
+
+func (sess *session) downlinkBacklogDepth(parent *server) int {
+	if parent.usesDirectWSWrite() {
+		return len(sess.queue)
+	}
+	if sess.batchQ == nil {
+		return 0
+	}
+	return len(sess.batchQ)
 }
 
 func (sess *session) downBatchLoop(parent *server) {
@@ -647,6 +661,44 @@ func (sess *session) drainDownBatch(parent *server, batch []relay.Frame, batchSi
 	return batch, true
 }
 
+func normalizeBatchSettings(batchSize *int, batchDelay *time.Duration) {
+	if *batchSize < 1 {
+		*batchSize = 1
+	}
+	if *batchSize == 1 {
+		*batchDelay = 0
+	}
+}
+
+func (s *server) usesDirectWSWrite() bool {
+	return s.batchSize == 1
+}
+
+func (s *server) writeDownDirectLoop(ws *relay.WebSocketConn, wsLane *serverWSLane, sess *session, id, remoteAddr string, done <-chan struct{}) {
+	for {
+		if sess.isClosed() {
+			return
+		}
+		select {
+		case f := <-sess.queue:
+			if sess.isClosed() {
+				return
+			}
+			s.observeQueueWait(f)
+			if !s.writePendingExpandHint(ws, sess, id, remoteAddr) {
+				return
+			}
+			if !s.writeDownBatch(ws, wsLane, id, remoteAddr, []relay.Frame{f}, false) {
+				return
+			}
+		case <-done:
+			return
+		case <-sess.done:
+			return
+		}
+	}
+}
+
 func (s *server) writePendingExpandHint(ws *relay.WebSocketConn, sess *session, id, remoteAddr string) bool {
 	if s.downExpandLanesMax <= 1 {
 		return true
@@ -670,12 +722,12 @@ func (s *server) writePendingExpandHint(ws *relay.WebSocketConn, sess *session, 
 	return true
 }
 
-func (s *server) writeDownBatch(ws *relay.WebSocketConn, wsLane *serverWSLane, id, remoteAddr string, frames []relay.Frame) bool {
+func (s *server) writeDownBatch(ws *relay.WebSocketConn, wsLane *serverWSLane, id, remoteAddr string, frames []relay.Frame, observeBatchQueue bool) bool {
 	if body, ok, err := relay.EncodeFramesWithinLimitInto(wsLane.encodeBuf, frames, relay.MaxMessageBytes); err != nil {
 		appLog.Error("websocket-encode-failed", "session", id, "err", err)
 		return false
 	} else if ok {
-		return s.writeDownEncodedChunk(ws, wsLane, id, remoteAddr, frames, body)
+		return s.writeDownEncodedChunk(ws, wsLane, id, remoteAddr, frames, body, observeBatchQueue)
 	}
 
 	chunks, err := relay.SplitFramesByEncodedLimit(frames, relay.MaxMessageBytes)
@@ -689,16 +741,18 @@ func (s *server) writeDownBatch(ws *relay.WebSocketConn, wsLane *serverWSLane, i
 			appLog.Error("websocket-encode-failed", "session", id, "err", err)
 			return false
 		}
-		if !s.writeDownEncodedChunk(ws, wsLane, id, remoteAddr, chunk, body) {
+		if !s.writeDownEncodedChunk(ws, wsLane, id, remoteAddr, chunk, body, observeBatchQueue) {
 			return false
 		}
 	}
 	return true
 }
 
-func (s *server) writeDownEncodedChunk(ws *relay.WebSocketConn, wsLane *serverWSLane, id, remoteAddr string, frames []relay.Frame, body []byte) bool {
+func (s *server) writeDownEncodedChunk(ws *relay.WebSocketConn, wsLane *serverWSLane, id, remoteAddr string, frames []relay.Frame, body []byte, observeBatchQueue bool) bool {
 	defer wsLane.retainEncodeBuffer(body)
-	s.observeBatchQueueWait(frames)
+	if observeBatchQueue {
+		s.observeBatchQueueWait(frames)
+	}
 	if metricsBuild && s.metrics {
 		started := time.Now()
 		if err := ws.WriteBinaryOwned(body); err != nil {
@@ -747,7 +801,11 @@ func (s *server) getSession(id string) (*session, error) {
 	if queueCap < 1 {
 		queueCap = 65536
 	}
-	sess := &session{id: id, udp: udp, queue: make(chan relay.Frame, queueCap), batchQ: make(chan []relay.Frame, batchQueueCapacity(queueCap, s.batchSize)), done: make(chan struct{}), touchEvery: touchInterval(s.idle), ws: make(map[*relay.WebSocketConn]*serverWSLane)}
+	var batchQ chan []relay.Frame
+	if !s.usesDirectWSWrite() {
+		batchQ = make(chan []relay.Frame, batchQueueCapacity(queueCap, s.batchSize))
+	}
+	sess := &session{id: id, udp: udp, queue: make(chan relay.Frame, queueCap), batchQ: batchQ, done: make(chan struct{}), touchEvery: touchInterval(s.idle), ws: make(map[*relay.WebSocketConn]*serverWSLane)}
 	sess.touch()
 	s.sessions[id] = sess
 	s.countSessionMade()
