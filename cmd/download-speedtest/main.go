@@ -73,10 +73,18 @@ type batchResult struct {
 	Finished    string  `json:"finished"`
 }
 
+type quicWindowOptions struct {
+	initialStreamReceiveWindow     uint64
+	maxStreamReceiveWindow         uint64
+	initialConnectionReceiveWindow uint64
+	maxConnectionReceiveWindow     uint64
+}
+
 func main() {
 	var rawURL, out, onlyMode, onlyLabel, connectIPOverride, socks5UDP, cpuProfile, memProfile, traceOut, quicQlog string
 	var count, concurrency int
 	var maxBytes int64
+	var quicInitialStreamWindow, quicMaxStreamWindow, quicInitialConnWindow, quicMaxConnWindow uint64
 	var timeout time.Duration
 	var includeQUICStats bool
 	flag.StringVar(&rawURL, "url", "https://relay.example.com:2087/50M.txt", "download URL")
@@ -94,7 +102,17 @@ func main() {
 	flag.StringVar(&traceOut, "trace", "", "optional runtime trace output path")
 	flag.BoolVar(&includeQUICStats, "quic-stats", false, "include quic-go connection statistics for HTTP/3 requests")
 	flag.StringVar(&quicQlog, "quic-qlog", "", "optional qlog output path for HTTP/3 requests")
+	flag.Uint64Var(&quicInitialStreamWindow, "quic-initial-stream-window", 16<<20, "HTTP/3 QUIC initial stream receive window bytes")
+	flag.Uint64Var(&quicMaxStreamWindow, "quic-max-stream-window", 64<<20, "HTTP/3 QUIC max stream receive window bytes")
+	flag.Uint64Var(&quicInitialConnWindow, "quic-initial-conn-window", 32<<20, "HTTP/3 QUIC initial connection receive window bytes")
+	flag.Uint64Var(&quicMaxConnWindow, "quic-max-conn-window", 128<<20, "HTTP/3 QUIC max connection receive window bytes")
 	flag.Parse()
+	quicWindows := quicWindowOptions{
+		initialStreamReceiveWindow:     quicInitialStreamWindow,
+		maxStreamReceiveWindow:         quicMaxStreamWindow,
+		initialConnectionReceiveWindow: quicInitialConnWindow,
+		maxConnectionReceiveWindow:     quicMaxConnWindow,
+	}
 
 	stopProfiling := startProfiling(cpuProfile, traceOut)
 	defer func() {
@@ -140,7 +158,7 @@ func main() {
 				continue
 			}
 			if count <= 1 {
-				res := run(rawURL, mode, target.label, target.ip, socks5UDP, timeout, maxBytes, includeQUICStats, quicQlog)
+				res := run(rawURL, mode, target.label, target.ip, socks5UDP, timeout, maxBytes, includeQUICStats, quicQlog, quicWindows)
 				_ = enc.Encode(res)
 			} else {
 				res := runBatch(rawURL, mode, target.label, target.ip, socks5UDP, timeout, count, concurrency, maxBytes)
@@ -280,10 +298,10 @@ func fetchOnce(client *http.Client, rawURL string, maxBytes int64) (int64, error
 	return n, nil
 }
 
-func run(rawURL, mode, label, connectIP, socks5UDP string, timeout time.Duration, maxBytes int64, includeQUICStats bool, quicQlog string) result {
+func run(rawURL, mode, label, connectIP, socks5UDP string, timeout time.Duration, maxBytes int64, includeQUICStats bool, quicQlog string, quicWindows quicWindowOptions) result {
 	started := time.Now()
 	res := result{Label: label, Mode: mode, URL: rawURL, ConnectIP: connectIP, Started: started.Format(time.RFC3339Nano)}
-	client, closeFn, quicConn, err := newClientWithOptions(rawURL, mode, connectIP, socks5UDP, timeout, quicQlog)
+	client, closeFn, quicConn, err := newClientWithOptions(rawURL, mode, connectIP, socks5UDP, timeout, quicQlog, quicWindows)
 	if err != nil {
 		res.Error = err.Error()
 		res.Finished = time.Now().Format(time.RFC3339Nano)
@@ -339,11 +357,11 @@ func run(rawURL, mode, label, connectIP, socks5UDP string, timeout time.Duration
 }
 
 func newClient(rawURL, mode, connectIP, socks5UDP string, timeout time.Duration) (*http.Client, func() error, error) {
-	client, closeFn, _, err := newClientWithOptions(rawURL, mode, connectIP, socks5UDP, timeout, "")
+	client, closeFn, _, err := newClientWithOptions(rawURL, mode, connectIP, socks5UDP, timeout, "", quicWindowOptions{})
 	return client, closeFn, err
 }
 
-func newClientWithOptions(rawURL, mode, connectIP, socks5UDP string, timeout time.Duration, quicQlog string) (*http.Client, func() error, *atomic.Pointer[quic.Conn], error) {
+func newClientWithOptions(rawURL, mode, connectIP, socks5UDP string, timeout time.Duration, quicQlog string, quicWindows quicWindowOptions) (*http.Client, func() error, *atomic.Pointer[quic.Conn], error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, nil, nil, err
@@ -391,7 +409,7 @@ func newClientWithOptions(rawURL, mode, connectIP, socks5UDP string, timeout tim
 			}
 			var quicTransport *quic.Transport
 			tr.Dial = func(ctx context.Context, _ string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
-				cfg = withQUICTracer(cfg, qlogTracer)
+				cfg = configureQUIC(cfg, qlogTracer, quicWindows)
 				pc, raddr, err := newSOCKS5UDPConn(ctx, socks5UDP, targetHost, port)
 				if err != nil {
 					return nil, err
@@ -423,15 +441,15 @@ func newClientWithOptions(rawURL, mode, connectIP, socks5UDP string, timeout tim
 			}
 			dialAddr := net.JoinHostPort(connectIP, port)
 			tr.Dial = func(ctx context.Context, _ string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
-				conn, err := quic.DialAddrEarly(ctx, dialAddr, tlsCfg, withQUICTracer(cfg, qlogTracer))
+				conn, err := quic.DialAddrEarly(ctx, dialAddr, tlsCfg, configureQUIC(cfg, qlogTracer, quicWindows))
 				if err == nil {
 					quicConn.Store(conn)
 				}
 				return conn, err
 			}
-		} else if qlogTracer != nil {
+		} else if qlogTracer != nil || !quicWindows.isZero() {
 			tr.Dial = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
-				conn, err := quic.DialAddrEarly(ctx, addr, tlsCfg, withQUICTracer(cfg, qlogTracer))
+				conn, err := quic.DialAddrEarly(ctx, addr, tlsCfg, configureQUIC(cfg, qlogTracer, quicWindows))
 				if err == nil {
 					quicConn.Store(conn)
 				}
@@ -444,8 +462,8 @@ func newClientWithOptions(rawURL, mode, connectIP, socks5UDP string, timeout tim
 	}
 }
 
-func withQUICTracer(cfg *quic.Config, tracer func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace) *quic.Config {
-	if tracer == nil {
+func configureQUIC(cfg *quic.Config, tracer func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace, windows quicWindowOptions) *quic.Config {
+	if tracer == nil && windows.isZero() {
 		return cfg
 	}
 	if cfg == nil {
@@ -453,8 +471,29 @@ func withQUICTracer(cfg *quic.Config, tracer func(context.Context, bool, quic.Co
 	} else {
 		cfg = cfg.Clone()
 	}
-	cfg.Tracer = tracer
+	if tracer != nil {
+		cfg.Tracer = tracer
+	}
+	if windows.initialStreamReceiveWindow > 0 {
+		cfg.InitialStreamReceiveWindow = windows.initialStreamReceiveWindow
+	}
+	if windows.maxStreamReceiveWindow > 0 {
+		cfg.MaxStreamReceiveWindow = windows.maxStreamReceiveWindow
+	}
+	if windows.initialConnectionReceiveWindow > 0 {
+		cfg.InitialConnectionReceiveWindow = windows.initialConnectionReceiveWindow
+	}
+	if windows.maxConnectionReceiveWindow > 0 {
+		cfg.MaxConnectionReceiveWindow = windows.maxConnectionReceiveWindow
+	}
 	return cfg
+}
+
+func (w quicWindowOptions) isZero() bool {
+	return w.initialStreamReceiveWindow == 0 &&
+		w.maxStreamReceiveWindow == 0 &&
+		w.initialConnectionReceiveWindow == 0 &&
+		w.maxConnectionReceiveWindow == 0
 }
 
 func newQlogTracer(path string) func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace {
