@@ -4,16 +4,104 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestDialWebSocketTLSSessionResumption(t *testing.T) {
+	// Isolate the test trust store from other tests and the host's root store.
+	const childEnv = "RELAY_TEST_TLS_RESUMPTION_CHILD"
+	if os.Getenv(childEnv) != "1" {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestDialWebSocketTLSSessionResumption$", "-test.v")
+		cmd.Env = append(os.Environ(), childEnv+"=1")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("TLS test subprocess: %v\n%s", err, out)
+		}
+		return
+	}
+
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := AcceptWebSocket(w, r)
+		if err != nil {
+			t.Errorf("accept websocket: %v", err)
+			return
+		}
+		defer ws.Close()
+		_ = ws.SetDeadline(time.Now().Add(5 * time.Second))
+		body, err := ws.ReadBinary()
+		if err != nil {
+			t.Errorf("read websocket: %v", err)
+			return
+		}
+		if err := ws.WriteBinary(body); err != nil {
+			t.Errorf("echo websocket: %v", err)
+		}
+	}))
+	ts.TLS = &tls.Config{MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13}
+	ts.StartTLS()
+	defer ts.Close()
+	roots := x509.NewCertPool()
+	roots.AddCert(ts.Certificate())
+	t.Setenv("GODEBUG", "x509usefallbackroots=1")
+	x509.SetFallbackRoots(roots)
+
+	dialAndEcho := func(t *testing.T, wantResume bool) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		ws, err := DialWebSocket(ctx, "wss"+strings.TrimPrefix(ts.URL, "https"), "", "token", 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ws.Close()
+		_ = ws.SetDeadline(time.Now().Add(5 * time.Second))
+		state := ws.conn.(*tls.Conn).ConnectionState()
+		if state.DidResume != wantResume {
+			t.Errorf("DidResume=%v, want %v", state.DidResume, wantResume)
+		}
+		payload := []byte("session resumption echo")
+		if err := ws.WriteBinary(payload); err != nil {
+			t.Fatal(err)
+		}
+		got, err := ws.ReadBinary()
+		if err != nil || !bytes.Equal(got, payload) {
+			t.Fatalf("echo=%q, err=%v", got, err)
+		}
+	}
+
+	dialAndEcho(t, false)
+	dialAndEcho(t, true)
+	t.Run("concurrent dials", func(t *testing.T) {
+		var wg sync.WaitGroup
+		for i := 0; i < 8; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				dialAndEcho(t, true)
+			}()
+		}
+		wg.Wait()
+	})
+	// Discard the old ticket key: the next connection must fall back to a full
+	// handshake and still complete the WebSocket upgrade and exchange data.
+	ts.TLS.SetSessionTicketKeys([][32]byte{{1}})
+	dialAndEcho(t, false)
+	dialAndEcho(t, true)
+}
 
 func TestWebSocketReadRejectsOversizedPayload(t *testing.T) {
 	client, server := net.Pipe()
