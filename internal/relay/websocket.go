@@ -25,6 +25,10 @@ const MaxWebSocketPayloadBytes = MaxMessageBytes
 const DefaultWebSocketWriteTimeout = 15 * time.Second
 const websocketReadBufferRetainLimit = 512 << 10
 
+// Share tickets across pool refills and direct dials. The bounded cache is safe
+// for concurrent use and keeps TLS resumption state only in memory.
+var websocketSessionCache = tls.NewLRUClientSessionCache(64)
+
 type WebSocketConn struct {
 	conn         net.Conn
 	reader       *bufio.Reader
@@ -69,7 +73,10 @@ func DialWebSocketWithOptions(ctx context.Context, rawURL, connectIP, token stri
 	}
 	conn := raw
 	if u.Scheme == "wss" || u.Scheme == "https" {
-		tlsConn := tls.Client(raw, &tls.Config{ServerName: u.Hostname()})
+		tlsConn := tls.Client(raw, &tls.Config{
+			ServerName:         u.Hostname(),
+			ClientSessionCache: websocketSessionCache,
+		})
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			raw.Close()
 			return nil, err
