@@ -71,7 +71,7 @@ func (s *server) snapshot() map[string]any {
 		if sess.expandHintInFlight.Load() {
 			expandHintsInflightSessions++
 		}
-		wsLanes = append(wsLanes, sess.wsSnapshots()...)
+		wsLanes = append(wsLanes, sess.laneSnapshots()...)
 	}
 	s.mu.Unlock()
 	return map[string]any{
@@ -101,8 +101,8 @@ func (s *server) snapshot() map[string]any {
 		"queue_wait_count":               s.stats.queueWaitCount.Load(),
 		"batchq_wait_max_ms":             float64(s.stats.batchQWaitMaxUS.Load()) / 1000,
 		"batchq_wait_count":              s.stats.batchQWaitCount.Load(),
-		"ws_write_max_ms":                float64(s.stats.wsWriteMaxUS.Load()) / 1000,
-		"ws_write_count":                 s.stats.wsWriteCount.Load(),
+		"ws_write_max_ms":                float64(s.stats.laneWriteMaxUS.Load()) / 1000,
+		"ws_write_count":                 s.stats.laneWriteCount.Load(),
 		"expand_hints_pending_sessions":  expandHintsPendingSessions,
 		"expand_hints_inflight_sessions": expandHintsInflightSessions,
 		"expand_hints_sent":              s.stats.expandHintsSent.Load(),
@@ -146,12 +146,12 @@ func (s *server) observeBatchQueueWait(frames []relay.Frame) {
 	updateMax(&s.stats.batchQWaitMaxUS, time.Since(frames[0].QueuedAt).Microseconds())
 }
 
-func (s *server) observeWSWrite(d time.Duration) {
+func (s *server) observeLaneWrite(d time.Duration) {
 	if !s.metrics {
 		return
 	}
-	s.stats.wsWriteCount.Add(1)
-	updateMax(&s.stats.wsWriteMaxUS, d.Microseconds())
+	s.stats.laneWriteCount.Add(1)
+	updateMax(&s.stats.laneWriteMaxUS, d.Microseconds())
 }
 
 func (s *server) countQueueDrops(n int) {
@@ -254,7 +254,7 @@ func (s *server) countStatus(status int) {
 	}
 }
 
-func (l *serverWSLane) observeDownlink(frames, bytes int) {
+func (l *serverLane) observeDownlink(frames, bytes int) {
 	l.writes.Add(1)
 	l.frames.Add(int64(frames))
 	l.bytes.Add(int64(bytes))

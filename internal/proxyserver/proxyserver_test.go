@@ -15,6 +15,25 @@ import (
 	"cloudflare-h3-test/internal/relay"
 )
 
+type nonComparableStream []byte
+
+func (nonComparableStream) WriteMessage([]byte) error      { return nil }
+func (nonComparableStream) WriteMessageOwned([]byte) error { return nil }
+func (nonComparableStream) ReadMessage() ([]byte, error)   { return nil, io.EOF }
+func (nonComparableStream) Close() error                   { return nil }
+
+func TestServerLanesAcceptNonComparableStream(t *testing.T) {
+	sess := &session{lanes: make(map[*serverLane]struct{})}
+	lane, ok := sess.addLane(nonComparableStream{1}, "test")
+	if !ok || sess.laneCount() != 1 || lane.transport != "test" {
+		t.Fatalf("lane=%+v ok=%v count=%d", lane, ok, sess.laneCount())
+	}
+	sess.removeLane(lane)
+	if sess.laneCount() != 0 {
+		t.Fatalf("lane count=%d, want 0", sess.laneCount())
+	}
+}
+
 func TestLegacyHTTPRelayMethodsAreRejected(t *testing.T) {
 	s := &server{token: "example-token", sessions: map[string]*session{}}
 	for _, method := range []string{http.MethodPost, http.MethodGet, http.MethodDelete} {
@@ -40,11 +59,11 @@ func TestServerSnapshotIncludesWebSocketLaneDownlinkStats(t *testing.T) {
 		id:    "session-1",
 		queue: make(chan relay.Frame, 1),
 		done:  make(chan struct{}),
-		ws:    make(map[*relay.WebSocketConn]*serverWSLane),
+		lanes: make(map[*serverLane]struct{}),
 	}
-	ln := &serverWSLane{id: 3}
+	ln := &serverLane{id: 3}
 	ln.observeDownlink(2, 128)
-	sess.ws[nil] = ln
+	sess.lanes[ln] = struct{}{}
 	s.sessions[sess.id] = sess
 
 	snap := s.snapshot()
@@ -64,7 +83,7 @@ func TestBenchEchoCopiesViewBackedPayloadBeforeQueue(t *testing.T) {
 		id:    "echo-session",
 		queue: make(chan relay.Frame, 1),
 		done:  make(chan struct{}),
-		ws:    make(map[*relay.WebSocketConn]*serverWSLane),
+		lanes: make(map[*serverLane]struct{}),
 	}
 	payload := []byte("payload")
 	if err := s.handleInboundFrameAfterTouch(sess, relay.Frame{PacketID: 9, Payload: payload}); err != nil {
@@ -84,7 +103,7 @@ func TestServerDownBatchLoopAggregatesFrames(t *testing.T) {
 		queue:  make(chan relay.Frame, 3),
 		batchQ: make(chan []relay.Frame, 3),
 		done:   make(chan struct{}),
-		ws:     make(map[*relay.WebSocketConn]*serverWSLane),
+		lanes:  make(map[*serverLane]struct{}),
 	}
 	defer sess.close()
 	go sess.downBatchLoop(s)
@@ -115,7 +134,7 @@ func TestServerDownBatchLoopDrainsWithoutDelay(t *testing.T) {
 		queue:  make(chan relay.Frame, 4),
 		batchQ: make(chan []relay.Frame, 3),
 		done:   make(chan struct{}),
-		ws:     make(map[*relay.WebSocketConn]*serverWSLane),
+		lanes:  make(map[*serverLane]struct{}),
 	}
 	defer sess.close()
 	go sess.downBatchLoop(s)
@@ -198,8 +217,8 @@ func TestServerBatchSizeOneForcesZeroDelayAndSkipsBatchQueue(t *testing.T) {
 	if sess.batchQ != nil {
 		t.Fatalf("batchQ=%v, want nil in direct write mode", sess.batchQ)
 	}
-	if !s.usesDirectWSWrite() {
-		t.Fatal("usesDirectWSWrite=false, want true")
+	if !s.usesDirectLaneWrite() {
+		t.Fatal("usesDirectLaneWrite=false, want true")
 	}
 }
 
@@ -210,9 +229,9 @@ func TestServerExpandHintQueuedWhenBatchBacklogged(t *testing.T) {
 		queue:  make(chan relay.Frame, 1),
 		batchQ: make(chan []relay.Frame, 2),
 		done:   make(chan struct{}),
-		ws:     make(map[*relay.WebSocketConn]*serverWSLane),
+		lanes:  make(map[*serverLane]struct{}),
 	}
-	sess.ws[nil] = &serverWSLane{id: 1}
+	sess.lanes[&serverLane{id: 1}] = struct{}{}
 	sess.batchQ <- []relay.Frame{{PacketID: 1}}
 	sess.batchQ <- []relay.Frame{{PacketID: 2}}
 
@@ -229,9 +248,9 @@ func TestServerExpandHintQueuedWhenDirectQueueBacklogged(t *testing.T) {
 		id:    "hint-session",
 		queue: make(chan relay.Frame, 2),
 		done:  make(chan struct{}),
-		ws:    make(map[*relay.WebSocketConn]*serverWSLane),
+		lanes: make(map[*serverLane]struct{}),
 	}
-	sess.ws[nil] = &serverWSLane{id: 1}
+	sess.lanes[&serverLane{id: 1}] = struct{}{}
 	sess.queue <- relay.Frame{PacketID: 1}
 	sess.queue <- relay.Frame{PacketID: 2}
 
@@ -248,10 +267,10 @@ func TestServerExpandHintLoopNotStartedWhenMaxLaneOne(t *testing.T) {
 		queue:  make(chan relay.Frame, 1),
 		batchQ: make(chan []relay.Frame, 2),
 		done:   make(chan struct{}),
-		ws:     make(map[*relay.WebSocketConn]*serverWSLane),
+		lanes:  make(map[*serverLane]struct{}),
 	}
 	defer close(sess.done)
-	sess.ws[nil] = &serverWSLane{id: 1}
+	sess.lanes[&serverLane{id: 1}] = struct{}{}
 	sess.batchQ <- []relay.Frame{{PacketID: 1}}
 	sess.batchQ <- []relay.Frame{{PacketID: 2}}
 
@@ -282,9 +301,9 @@ func TestServerExpandHintNotQueuedForSingleBatch(t *testing.T) {
 		queue:  make(chan relay.Frame, 1),
 		batchQ: make(chan []relay.Frame, 2),
 		done:   make(chan struct{}),
-		ws:     make(map[*relay.WebSocketConn]*serverWSLane),
+		lanes:  make(map[*serverLane]struct{}),
 	}
-	sess.ws[nil] = &serverWSLane{id: 1}
+	sess.lanes[&serverLane{id: 1}] = struct{}{}
 	sess.batchQ <- []relay.Frame{{PacketID: 1}}
 
 	sess.maybeQueueExpandHint(s, time.Now())
@@ -304,9 +323,9 @@ func TestServerExpandHintSkippedAtMaxLanes(t *testing.T) {
 		queue:  make(chan relay.Frame, 1),
 		batchQ: make(chan []relay.Frame, 2),
 		done:   make(chan struct{}),
-		ws:     make(map[*relay.WebSocketConn]*serverWSLane),
+		lanes:  make(map[*serverLane]struct{}),
 	}
-	sess.ws[nil] = &serverWSLane{id: 1}
+	sess.lanes[&serverLane{id: 1}] = struct{}{}
 	sess.batchQ <- []relay.Frame{{PacketID: 1}}
 	sess.batchQ <- []relay.Frame{{PacketID: 2}}
 
@@ -330,9 +349,9 @@ func TestServerExpandHintInFlightExpires(t *testing.T) {
 		queue:  make(chan relay.Frame, 1),
 		batchQ: make(chan []relay.Frame, 2),
 		done:   make(chan struct{}),
-		ws:     make(map[*relay.WebSocketConn]*serverWSLane),
+		lanes:  make(map[*serverLane]struct{}),
 	}
-	sess.ws[nil] = &serverWSLane{id: 1}
+	sess.lanes[&serverLane{id: 1}] = struct{}{}
 	sess.batchQ <- []relay.Frame{{PacketID: 1}}
 	sess.batchQ <- []relay.Frame{{PacketID: 2}}
 	now := time.Now()
@@ -362,7 +381,7 @@ func TestServerWritePendingExpandHintWritesControl(t *testing.T) {
 		queue:  make(chan relay.Frame, 1),
 		batchQ: make(chan []relay.Frame, 1),
 		done:   make(chan struct{}),
-		ws:     make(map[*relay.WebSocketConn]*serverWSLane),
+		lanes:  make(map[*serverLane]struct{}),
 	}
 	defer sess.close()
 	sess.expandHintPending.Store(true)
@@ -374,7 +393,7 @@ func TestServerWritePendingExpandHintWritesControl(t *testing.T) {
 			return
 		}
 		defer ws.Close()
-		if !s.writePendingExpandHint(ws, sess, sess.id, r.RemoteAddr) {
+		if !s.writePendingExpandHint(&serverLane{stream: ws, transport: "ws"}, sess, sess.id, r.RemoteAddr) {
 			errCh <- io.ErrUnexpectedEOF
 			return
 		}
@@ -389,7 +408,7 @@ func TestServerWritePendingExpandHintWritesControl(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ws.Close()
-	body, err := ws.ReadBinary()
+	body, err := ws.ReadMessage()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,7 +439,7 @@ func TestServerDirectDownlinkWritesPendingExpandHintBeforeData(t *testing.T) {
 		id:    "direct-hint-session",
 		queue: make(chan relay.Frame, 1),
 		done:  make(chan struct{}),
-		ws:    make(map[*relay.WebSocketConn]*serverWSLane),
+		lanes: make(map[*serverLane]struct{}),
 	}
 	defer sess.close()
 	sess.expandHintPending.Store(true)
@@ -434,7 +453,7 @@ func TestServerDirectDownlinkWritesPendingExpandHintBeforeData(t *testing.T) {
 			return
 		}
 		defer ws.Close()
-		s.writeDownDirectLoop(ws, &serverWSLane{}, sess, sess.id, r.RemoteAddr, r.Context().Done())
+		s.writeLaneDownDirectLoop(&serverLane{stream: ws}, sess, sess.id, r.RemoteAddr, r.Context().Done())
 		errCh <- nil
 	}))
 	defer ts.Close()
@@ -447,7 +466,7 @@ func TestServerDirectDownlinkWritesPendingExpandHintBeforeData(t *testing.T) {
 	}
 	defer ws.Close()
 
-	body, err := ws.ReadBinary()
+	body, err := ws.ReadMessage()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -459,7 +478,7 @@ func TestServerDirectDownlinkWritesPendingExpandHintBeforeData(t *testing.T) {
 		t.Fatalf("op=%d payload_len=%d, want expand hint empty", op, len(payload))
 	}
 
-	body, err = ws.ReadBinary()
+	body, err = ws.ReadMessage()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -489,7 +508,7 @@ func TestServerWritePendingExpandHintSkippedWhenMaxLaneOne(t *testing.T) {
 		queue:  make(chan relay.Frame, 1),
 		batchQ: make(chan []relay.Frame, 1),
 		done:   make(chan struct{}),
-		ws:     make(map[*relay.WebSocketConn]*serverWSLane),
+		lanes:  make(map[*serverLane]struct{}),
 	}
 	defer sess.close()
 	sess.expandHintPending.Store(true)
@@ -506,13 +525,13 @@ func TestServerWritePendingExpandHintSkippedWhenMaxLaneOne(t *testing.T) {
 }
 
 func TestServerWSLaneRetainsEncodeBufferWithinCap(t *testing.T) {
-	ln := &serverWSLane{}
+	ln := &serverLane{}
 	body := make([]byte, 128)
 	ln.retainEncodeBuffer(body)
 	if ln.encodeBuf == nil || len(ln.encodeBuf) != 0 || cap(ln.encodeBuf) != cap(body) {
 		t.Fatalf("encodeBuf len=%d cap=%d, want retained cap %d", len(ln.encodeBuf), cap(ln.encodeBuf), cap(body))
 	}
-	ln.retainEncodeBuffer(make([]byte, wsEncodeBufferRetainLimit+1))
+	ln.retainEncodeBuffer(make([]byte, streamEncodeBufferRetainLimit+1))
 	if ln.encodeBuf != nil {
 		t.Fatalf("encodeBuf retained oversized cap=%d, want nil", cap(ln.encodeBuf))
 	}
@@ -524,13 +543,13 @@ func TestServerAttachClearsExpandHintInFlight(t *testing.T) {
 		queue:  make(chan relay.Frame, 1),
 		batchQ: make(chan []relay.Frame, 1),
 		done:   make(chan struct{}),
-		ws:     make(map[*relay.WebSocketConn]*serverWSLane),
+		lanes:  make(map[*serverLane]struct{}),
 	}
 	sess.expandHintInFlight.Store(true)
 	sess.expandHintInFlightAt.Store(time.Now().UnixNano())
 
-	if _, ok := sess.addWebSocket(nil); !ok {
-		t.Fatal("addWebSocket returned false")
+	if _, ok := sess.addLane(nil, "ws"); !ok {
+		t.Fatal("addLane returned false")
 	}
 	if sess.expandHintInFlight.Load() {
 		t.Fatal("expandHintInFlight=true, want false")
@@ -575,8 +594,8 @@ func TestWebSocketBadAttachDoesNotCreateSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = ws.WriteBinary(bad)
-	_, _ = ws.ReadBinary()
+	_ = ws.WriteMessage(bad)
+	_, _ = ws.ReadMessage()
 	_ = ws.Close()
 
 	s.mu.Lock()
@@ -610,10 +629,10 @@ func TestWebSocketAttachBenchEcho(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ws.WriteBinary(body); err != nil {
+	if err := ws.WriteMessage(body); err != nil {
 		t.Fatal(err)
 	}
-	echo, err := ws.ReadBinary()
+	echo, err := ws.ReadMessage()
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -30,39 +30,39 @@ func (c *clientState) countReconnect() {
 	}
 }
 
-func (c *clientState) countWSExpandHintReceived() {
+func (c *clientState) countExpandHintReceived() {
 	if c.metrics {
-		c.stats.wsExpandHintsReceived.Add(1)
+		c.stats.expandHintsReceived.Add(1)
 	}
 }
 
-func (c *clientState) countWSExpandHintUsed() {
+func (c *clientState) countExpandHintUsed() {
 	if c.metrics {
-		c.stats.wsExpandHintsUsed.Add(1)
+		c.stats.expandHintsUsed.Add(1)
 	}
 }
 
-func (c *clientState) countWSIncrementalAcquireStarted() {
+func (c *clientState) countIncrementalAcquireStarted() {
 	if c.metrics {
-		c.stats.wsIncrementalAcquireStarted.Add(1)
+		c.stats.incrementalAcquireStarted.Add(1)
 	}
 }
 
-func (c *clientState) countWSIncrementalAcquireSucceeded() {
+func (c *clientState) countIncrementalAcquireSucceeded() {
 	if c.metrics {
-		c.stats.wsIncrementalAcquireSucceeded.Add(1)
+		c.stats.incrementalAcquireSucceeded.Add(1)
 	}
 }
 
-func (c *clientState) countWSIncrementalAcquireFailed() {
+func (c *clientState) countIncrementalAcquireFailed() {
 	if c.metrics {
-		c.stats.wsIncrementalAcquireFailed.Add(1)
+		c.stats.incrementalAcquireFailed.Add(1)
 	}
 }
 
-func (c *clientState) countWSIncrementalAcquireSkippedFull() {
+func (c *clientState) countIncrementalAcquireSkippedFull() {
 	if c.metrics {
-		c.stats.wsIncrementalAcquireSkippedFull.Add(1)
+		c.stats.incrementalAcquireSkippedFull.Add(1)
 	}
 }
 
@@ -105,32 +105,32 @@ func (s *session) countUDPInFrames(frames []relay.Frame) {
 	s.countUDPIn(len(frames), bytes)
 }
 
-func (s *session) countWSPostStart(ln *wsLane) {
+func (s *session) countLaneWriteStart(ln *streamLane) {
 	if s.metrics {
 		ln.requests.Add(1)
 		ln.posts.Add(1)
 	}
 }
 
-func (s *session) countWSRequestDone(ln *wsLane) {
+func (s *session) countLaneWriteDone(ln *streamLane) {
 	if s.metrics {
 		ln.requests.Add(-1)
 	}
 }
 
-func (s *session) countWSPostOK(ln *wsLane) {
+func (s *session) countLaneWriteOK(ln *streamLane) {
 	if s.metrics {
 		ln.postOK.Add(1)
 	}
 }
 
-func (s *session) countWSPostError(ln *wsLane) {
+func (s *session) countLaneWriteError(ln *streamLane) {
 	if s.metrics {
 		ln.postErr.Add(1)
 	}
 }
 
-func (s *session) countWSReadError(ln *wsLane) {
+func (s *session) countLaneReadError(ln *streamLane) {
 	if s.metrics {
 		ln.readErr.Add(1)
 	}
@@ -189,10 +189,10 @@ func (c *clientState) snapshot() map[string]any {
 		batchQPacketDepthEstimate += sessBatchQPacketDepthEstimate
 		sendQueueDepth += sessSendQDepth + sessBatchQPacketDepthEstimate
 		sendQueueCapacity += sessSendQCapacity + sessBatchQCapacity
-		sess.wsMu.Lock()
-		wsLanes := append([]*wsLane(nil), sess.ws...)
-		sess.wsMu.Unlock()
-		for _, ln := range wsLanes {
+		sess.lanesMu.Lock()
+		sessionLanes := append([]*streamLane(nil), sess.lanes...)
+		sess.lanesMu.Unlock()
+		for _, ln := range sessionLanes {
 			r := ln.requests.Load()
 			inflightRequests += r
 			lanes = append(lanes, map[string]any{
@@ -235,12 +235,12 @@ func (c *clientState) snapshot() map[string]any {
 		"batchq_capacity":                     batchQCapacity,
 		"batchq_drops":                        c.stats.batchQDrops.Load(),
 		"batchq_packet_depth":                 batchQPacketDepthEstimate,
-		"ws_expand_hints_received":            c.stats.wsExpandHintsReceived.Load(),
-		"ws_expand_hints_used":                c.stats.wsExpandHintsUsed.Load(),
-		"ws_incremental_acquire_started":      c.stats.wsIncrementalAcquireStarted.Load(),
-		"ws_incremental_acquire_succeeded":    c.stats.wsIncrementalAcquireSucceeded.Load(),
-		"ws_incremental_acquire_failed":       c.stats.wsIncrementalAcquireFailed.Load(),
-		"ws_incremental_acquire_skipped_full": c.stats.wsIncrementalAcquireSkippedFull.Load(),
+		"ws_expand_hints_received":            c.stats.expandHintsReceived.Load(),
+		"ws_expand_hints_used":                c.stats.expandHintsUsed.Load(),
+		"ws_incremental_acquire_started":      c.stats.incrementalAcquireStarted.Load(),
+		"ws_incremental_acquire_succeeded":    c.stats.incrementalAcquireSucceeded.Load(),
+		"ws_incremental_acquire_failed":       c.stats.incrementalAcquireFailed.Load(),
+		"ws_incremental_acquire_skipped_full": c.stats.incrementalAcquireSkippedFull.Load(),
 		"inflight_bytes":                      inflightBytes,
 		"inflight_requests":                   inflightRequests,
 		"lanes":                               lanes,

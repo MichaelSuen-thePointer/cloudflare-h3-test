@@ -25,9 +25,9 @@ import (
 	"cloudflare-h3-test/internal/relay"
 )
 
-type wsLane struct {
+type streamLane struct {
 	index        int
-	conn         relay.BinaryConn
+	stream       relay.MessageStream
 	done         chan struct{}
 	doneOnce     sync.Once
 	encodeBuf    []byte
@@ -40,15 +40,15 @@ type wsLane struct {
 	reconnecting atomic.Bool
 }
 
-type wsLaneSnapshot struct {
-	lanes []*wsLane
+type streamLaneSnapshot struct {
+	lanes []*streamLane
 }
 
-func newWSLane(index int, conn relay.BinaryConn) *wsLane {
-	return &wsLane{index: index, conn: conn, done: make(chan struct{})}
+func newStreamLane(index int, stream relay.MessageStream) *streamLane {
+	return &streamLane{index: index, stream: stream, done: make(chan struct{})}
 }
 
-func (ln *wsLane) closeWorker() {
+func (ln *streamLane) closeWorker() {
 	if ln == nil || ln.done == nil {
 		return
 	}
@@ -59,12 +59,12 @@ type session struct {
 	id                string
 	peer              *net.UDPAddr
 	state             *clientState
-	ws                []*wsLane
+	lanes             []*streamLane
 	ready             chan struct{}
-	wsMu              sync.Mutex
-	wsSnapshot        atomic.Pointer[wsLaneSnapshot]
-	wsChanged         chan struct{}
-	wsPending         atomic.Int64
+	lanesMu           sync.Mutex
+	lanesSnapshot     atomic.Pointer[streamLaneSnapshot]
+	lanesChanged      chan struct{}
+	lanesPending      atomic.Int64
 	expandHintPending atomic.Bool
 	next              atomic.Uint64
 	ctx               context.Context
@@ -86,7 +86,7 @@ var (
 	appLog           = diaglog.New(diaglog.Info)
 )
 
-const wsEncodeBufferRetainLimit = 512 << 10
+const streamEncodeBufferRetainLimit = 512 << 10
 
 func Main(args []string) {
 	var listen, remote, token, connectIP, metricsOut, transport, logLevel, pprofAddr string
@@ -195,7 +195,7 @@ func Main(args []string) {
 	}
 	stats := &clientStats{started: time.Now()}
 	wsSocketOptions := relay.WebSocketSocketOptions{SendBuffer: wsSocketSendBuffer, ReceiveBuffer: wsSocketReceiveBuffer}
-	state := &clientState{remote: remote, token: token, connectIP: connectIP, transport: transport, wsLanesN: wsLanesN, wsLanesIncremental: wsLanesIncremental, wsSocketOptions: wsSocketOptions, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, idle: idle, udp: udp, sessions: map[netip.AddrPort]*session{}, stats: stats, metrics: metrics}
+	state := &clientState{remote: remote, token: token, connectIP: connectIP, transport: transport, laneTarget: wsLanesN, lanesIncremental: wsLanesIncremental, wsSocketOptions: wsSocketOptions, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, idle: idle, udp: udp, sessions: map[netip.AddrPort]*session{}, stats: stats, metrics: metrics}
 	state.wsPool = newWSPool(remote, connectIP, token, wsPoolSize, timeout, wsSocketOptions)
 	defer state.wsPool.Close()
 	if metricsBuild && metricsOut != "" {
@@ -221,44 +221,44 @@ func Main(args []string) {
 }
 
 type clientState struct {
-	remote             string
-	token              string
-	connectIP          string
-	transport          string
-	wsLanesN           int
-	wsLanesIncremental bool
-	wsSocketOptions    relay.WebSocketSocketOptions
-	batchSize          int
-	batchDelay         time.Duration
-	sendQueue          int
-	timeout            time.Duration
-	idle               time.Duration
-	udp                *net.UDPConn
-	mu                 sync.Mutex
-	sessions           map[netip.AddrPort]*session
-	wsPool             *wsPool
-	stats              *clientStats
-	metrics            bool
+	remote           string
+	token            string
+	connectIP        string
+	transport        string
+	laneTarget       int
+	lanesIncremental bool
+	wsSocketOptions  relay.WebSocketSocketOptions
+	batchSize        int
+	batchDelay       time.Duration
+	sendQueue        int
+	timeout          time.Duration
+	idle             time.Duration
+	udp              *net.UDPConn
+	mu               sync.Mutex
+	sessions         map[netip.AddrPort]*session
+	wsPool           *wsPool
+	stats            *clientStats
+	metrics          bool
 }
 
 type clientStats struct {
-	started                         time.Time
-	sessions                        atomic.Int64
-	udpInPackets                    atomic.Int64
-	udpInBytes                      atomic.Int64
-	udpOutPackets                   atomic.Int64
-	udpOutBytes                     atomic.Int64
-	queueDrops                      atomic.Int64
-	sendQDrops                      atomic.Int64
-	batchQDrops                     atomic.Int64
-	transports                      atomic.Int64
-	reconnects                      atomic.Int64
-	wsExpandHintsReceived           atomic.Int64
-	wsExpandHintsUsed               atomic.Int64
-	wsIncrementalAcquireStarted     atomic.Int64
-	wsIncrementalAcquireSucceeded   atomic.Int64
-	wsIncrementalAcquireFailed      atomic.Int64
-	wsIncrementalAcquireSkippedFull atomic.Int64
+	started                       time.Time
+	sessions                      atomic.Int64
+	udpInPackets                  atomic.Int64
+	udpInBytes                    atomic.Int64
+	udpOutPackets                 atomic.Int64
+	udpOutBytes                   atomic.Int64
+	queueDrops                    atomic.Int64
+	sendQDrops                    atomic.Int64
+	batchQDrops                   atomic.Int64
+	transports                    atomic.Int64
+	reconnects                    atomic.Int64
+	expandHintsReceived           atomic.Int64
+	expandHintsUsed               atomic.Int64
+	incrementalAcquireStarted     atomic.Int64
+	incrementalAcquireSucceeded   atomic.Int64
+	incrementalAcquireFailed      atomic.Int64
+	incrementalAcquireSkippedFull atomic.Int64
 }
 
 func udpPeerKeyFromAddr(addr *net.UDPAddr) (netip.AddrPort, bool) {
@@ -280,21 +280,21 @@ func (c *clientState) getSession(key netip.AddrPort, peer *net.UDPAddr) *session
 	id := randomID()
 	ctx, cancel := context.WithCancel(context.Background())
 	var batchQ chan []relay.Frame
-	if !c.usesDirectWSWrite() {
+	if !c.usesDirectLaneWrite() {
 		batchQ = make(chan []relay.Frame, batchQueueCapacity(c.sendQueue, c.batchSize))
 	}
-	sess := &session{id: id, peer: peer, state: c, ctx: ctx, cancel: cancel, closed: make(chan struct{}), ready: make(chan struct{}), wsChanged: make(chan struct{}, 1), lastActive: atomic.Int64{}, touchEvery: touchInterval(c.idle), stats: c.stats, metrics: c.metrics, sendQ: make(chan []byte, c.sendQueue), batchQ: batchQ}
+	sess := &session{id: id, peer: peer, state: c, ctx: ctx, cancel: cancel, closed: make(chan struct{}), ready: make(chan struct{}), lanesChanged: make(chan struct{}, 1), lastActive: atomic.Int64{}, touchEvery: touchInterval(c.idle), stats: c.stats, metrics: c.metrics, sendQ: make(chan []byte, c.sendQueue), batchQ: batchQ}
 	sess.touch()
 	c.sessions[key] = sess
 	c.countSession()
-	if !c.usesDirectWSWrite() {
+	if !c.usesDirectLaneWrite() {
 		sess.goRun(func() { sess.sendLoop(c.batchSize, c.batchDelay) })
 	}
-	if c.wsLanesIncremental && c.wsLanesN > 1 {
-		sess.goRun(func() { sess.wsIncrementalLoop() })
+	if c.lanesIncremental && c.laneTarget > 1 {
+		sess.goRun(func() { sess.incrementalLaneLoop() })
 	}
-	sess.goRun(func() { c.connectWebSocketLanes(sess, key, peerLabel) })
-	appLog.Debug("websocket-session-create", "session", id, "peer", peerLabel, "transport", c.transport, "lanes", c.wsLanesN, "connecting", true)
+	sess.goRun(func() { c.connectInitialLanes(sess, key, peerLabel) })
+	appLog.Debug("stream-session-create", "session", id, "peer", peerLabel, "transport", c.transport, "lanes", c.laneTarget, "connecting", true)
 	return sess
 }
 
@@ -334,7 +334,7 @@ func (c *clientState) closeSession(key netip.AddrPort, sess *session) {
 	sess.close()
 }
 
-func (c *clientState) acquireBinaryConn(ctx context.Context, sessionID string) (relay.BinaryConn, error) {
+func (c *clientState) acquireMessageStream(ctx context.Context, sessionID string) (relay.MessageStream, error) {
 	if c.wsPool != nil {
 		return c.wsPool.Acquire(ctx, c.token, sessionID)
 	}
@@ -349,15 +349,15 @@ func (c *clientState) acquireBinaryConn(ctx context.Context, sessionID string) (
 	return ws, nil
 }
 
-func (c *clientState) connectWebSocketLanes(sess *session, key netip.AddrPort, peerLabel string) {
+func (c *clientState) connectInitialLanes(sess *session, key netip.AddrPort, peerLabel string) {
 	defer close(sess.ready)
-	target := c.wsLanesN
-	if c.wsLanesIncremental {
+	target := c.laneTarget
+	if c.lanesIncremental {
 		target = 1
 	}
-	if err := c.ensureWebSocketLanes(sess, target); err != nil {
+	if err := c.ensureLanes(sess, target); err != nil {
 		if !errors.Is(err, errSessionClosed) {
-			appLog.WarnRate("websocket_initial_connect_failed", 10*time.Second, "websocket-initial-connect-failed", "session", sess.id, "peer", peerLabel, "err", err)
+			appLog.WarnRate("stream_initial_connect_failed", 10*time.Second, "stream-initial-connect-failed", "session", sess.id, "peer", peerLabel, "err", err, "transport", c.transport)
 			if sess.state != nil {
 				go sess.state.closeSession(key, sess)
 			} else {
@@ -366,26 +366,26 @@ func (c *clientState) connectWebSocketLanes(sess *session, key netip.AddrPort, p
 		}
 		return
 	}
-	appLog.Debug("websocket-session-ready", "session", sess.id, "peer", peerLabel, "lanes", sess.wsCount())
+	appLog.Debug("stream-session-ready", "session", sess.id, "peer", peerLabel, "lanes", sess.laneCount(), "transport", c.transport)
 }
 
-func (c *clientState) ensureWebSocketLanes(sess *session, target int) error {
+func (c *clientState) ensureLanes(sess *session, target int) error {
 	if sess.isClosed() {
 		return errSessionClosed
 	}
-	sess.wsMu.Lock()
-	current := len(sess.ws)
+	sess.lanesMu.Lock()
+	current := len(sess.lanes)
 	if target <= current {
-		sess.publishWSSnapshotLocked()
-		sess.wsMu.Unlock()
-		sess.notifyWSChanged()
+		sess.publishLaneSnapshotLocked()
+		sess.lanesMu.Unlock()
+		sess.notifyLanesChanged()
 		return nil
 	}
-	sess.wsMu.Unlock()
+	sess.lanesMu.Unlock()
 
-	wsLanes := make([]*wsLane, target-current)
-	errCh := make(chan error, len(wsLanes))
-	for i := range wsLanes {
+	lanes := make([]*streamLane, target-current)
+	errCh := make(chan error, len(lanes))
+	for i := range lanes {
 		index := current + i
 		go func(pos, index int) {
 			if sess.isClosed() {
@@ -394,7 +394,7 @@ func (c *clientState) ensureWebSocketLanes(sess *session, target int) error {
 			}
 			ctx, cancel := context.WithTimeout(sess.ctx, c.timeout)
 			defer cancel()
-			ws, err := c.acquireBinaryConn(ctx, sess.id)
+			stream, err := c.acquireMessageStream(ctx, sess.id)
 			if err != nil {
 				if sess.isClosed() {
 					errCh <- errSessionClosed
@@ -404,16 +404,16 @@ func (c *clientState) ensureWebSocketLanes(sess *session, target int) error {
 				return
 			}
 			if sess.isClosed() {
-				_ = ws.Close()
+				_ = stream.Close()
 				errCh <- errSessionClosed
 				return
 			}
-			wsLanes[pos] = newWSLane(index, ws)
+			lanes[pos] = newStreamLane(index, stream)
 			errCh <- nil
 		}(i, index)
 	}
 	var firstErr error
-	for range wsLanes {
+	for range lanes {
 		if err := <-errCh; err != nil {
 			if firstErr == nil || errors.Is(firstErr, errSessionClosed) {
 				firstErr = err
@@ -421,129 +421,129 @@ func (c *clientState) ensureWebSocketLanes(sess *session, target int) error {
 		}
 	}
 	if firstErr != nil {
-		for _, ln := range wsLanes {
+		for _, ln := range lanes {
 			if ln != nil {
-				_ = ln.conn.Close()
+				_ = ln.stream.Close()
 			}
 		}
 		return firstErr
 	}
 
-	sess.wsMu.Lock()
+	sess.lanesMu.Lock()
 	if sess.isClosed() {
-		for _, ln := range wsLanes {
+		for _, ln := range lanes {
 			if ln != nil {
-				_ = ln.conn.Close()
+				_ = ln.stream.Close()
 			}
 		}
-		sess.wsMu.Unlock()
+		sess.lanesMu.Unlock()
 		return errSessionClosed
 	}
-	for _, ln := range wsLanes {
+	for _, ln := range lanes {
 		ln := ln
 		c.countTransport()
-		sess.ws = append(sess.ws, ln)
-		sess.goRun(func() { sess.wsReadLoop(c, ln) })
-		sess.goRun(func() { sess.wsWriteLoop(c, ln) })
+		sess.lanes = append(sess.lanes, ln)
+		sess.goRun(func() { sess.laneReadLoop(c, ln) })
+		sess.goRun(func() { sess.laneWriteLoop(c, ln) })
 	}
-	sess.publishWSSnapshotLocked()
-	sess.wsMu.Unlock()
-	sess.notifyWSChanged()
+	sess.publishLaneSnapshotLocked()
+	sess.lanesMu.Unlock()
+	sess.notifyLanesChanged()
 	return nil
 }
 
-func (s *session) maybeAcquireIncrementalWebSocketLane() {
-	if s.state == nil || !s.state.wsLanesIncremental {
+func (s *session) maybeAcquireIncrementalLane() {
+	if s.state == nil || !s.state.lanesIncremental {
 		return
 	}
-	if s.state.wsLanesN <= 1 {
+	if s.state.laneTarget <= 1 {
 		return
 	}
-	localBacklog := s.wsBacklogDepth() > 1
+	localBacklog := s.laneBacklogDepth() > 1
 	serverHint := s.expandHintPending.Load()
 	if !localBacklog && !serverHint {
 		return
 	}
-	if s.wsTotalPlanned() >= s.state.wsLanesN {
+	if s.lanesTotalPlanned() >= s.state.laneTarget {
 		if serverHint {
 			s.expandHintPending.Store(false)
-			s.state.countWSIncrementalAcquireSkippedFull()
+			s.state.countIncrementalAcquireSkippedFull()
 		}
 		return
 	}
-	if !s.reservePendingWebSocketLane(s.state.wsLanesN) {
+	if !s.reservePendingLane(s.state.laneTarget) {
 		return
 	}
 	if serverHint {
 		s.expandHintPending.Store(false)
-		s.state.countWSExpandHintUsed()
+		s.state.countExpandHintUsed()
 	}
 	if !s.goRun(func() {
-		defer s.wsPending.Add(-1)
-		s.state.countWSIncrementalAcquireStarted()
+		defer s.lanesPending.Add(-1)
+		s.state.countIncrementalAcquireStarted()
 		ctx, cancel := context.WithTimeout(s.ctx, s.state.timeout)
 		defer cancel()
-		ws, err := s.state.acquireBinaryConn(ctx, s.id)
+		stream, err := s.state.acquireMessageStream(ctx, s.id)
 		if err != nil {
-			s.state.countWSIncrementalAcquireFailed()
+			s.state.countIncrementalAcquireFailed()
 			if !s.isClosed() {
-				appLog.WarnRate("websocket_incremental_lane_acquire_failed", 10*time.Second, "websocket-incremental-lane-acquire-failed", "session", s.id, "err", err)
+				appLog.WarnRate("stream_incremental_lane_acquire_failed", 10*time.Second, "stream-incremental-lane-acquire-failed", "session", s.id, "err", err, "transport", s.state.transport)
 			}
 			return
 		}
 		if s.isClosed() {
-			_ = ws.Close()
+			_ = stream.Close()
 			return
 		}
-		var ln *wsLane
-		s.wsMu.Lock()
-		if !s.isClosed() && len(s.ws) < s.state.wsLanesN {
-			ln = newWSLane(s.nextWSLaneIndexLocked(), ws)
-			s.ws = append(s.ws, ln)
-			s.publishWSSnapshotLocked()
+		var ln *streamLane
+		s.lanesMu.Lock()
+		if !s.isClosed() && len(s.lanes) < s.state.laneTarget {
+			ln = newStreamLane(s.nextLaneIndexLocked(), stream)
+			s.lanes = append(s.lanes, ln)
+			s.publishLaneSnapshotLocked()
 		}
-		s.wsMu.Unlock()
+		s.lanesMu.Unlock()
 		if ln == nil {
-			_ = ws.Close()
+			_ = stream.Close()
 			return
 		}
-		s.notifyWSChanged()
+		s.notifyLanesChanged()
 		s.state.countTransport()
-		s.state.countWSIncrementalAcquireSucceeded()
-		s.goRun(func() { s.wsReadLoop(s.state, ln) })
-		s.goRun(func() { s.wsWriteLoop(s.state, ln) })
-		appLog.Info("websocket-lanes-incremental", "session", s.id, "lanes", s.wsCount())
+		s.state.countIncrementalAcquireSucceeded()
+		s.goRun(func() { s.laneReadLoop(s.state, ln) })
+		s.goRun(func() { s.laneWriteLoop(s.state, ln) })
+		appLog.Info("stream-lanes-incremental", "session", s.id, "lanes", s.laneCount(), "transport", s.state.transport)
 	}) {
-		s.wsPending.Add(-1)
+		s.lanesPending.Add(-1)
 	}
 }
 
-func (s *session) reservePendingWebSocketLane(max int) bool {
+func (s *session) reservePendingLane(max int) bool {
 	for {
 		if s.isClosed() {
 			return false
 		}
-		current := s.wsTotalPlanned()
+		current := s.lanesTotalPlanned()
 		if current >= max {
 			return false
 		}
-		pending := s.wsPending.Load()
-		if s.wsPending.CompareAndSwap(pending, pending+1) {
-			if s.wsTotalPlanned() <= max {
+		pending := s.lanesPending.Load()
+		if s.lanesPending.CompareAndSwap(pending, pending+1) {
+			if s.lanesTotalPlanned() <= max {
 				return true
 			}
-			s.wsPending.Add(-1)
+			s.lanesPending.Add(-1)
 		}
 	}
 }
 
-func (s *session) wsTotalPlanned() int {
-	return s.wsCount() + int(s.wsPending.Load())
+func (s *session) lanesTotalPlanned() int {
+	return s.laneCount() + int(s.lanesPending.Load())
 }
 
-func (s *session) nextWSLaneIndexLocked() int {
+func (s *session) nextLaneIndexLocked() int {
 	index := 0
-	for _, ln := range s.ws {
+	for _, ln := range s.lanes {
 		if ln.index >= index {
 			index = ln.index + 1
 		}
@@ -551,22 +551,22 @@ func (s *session) nextWSLaneIndexLocked() int {
 	return index
 }
 
-func (s *session) publishWSSnapshotLocked() {
-	lanes := append([]*wsLane(nil), s.ws...)
-	s.wsSnapshot.Store(&wsLaneSnapshot{lanes: lanes})
+func (s *session) publishLaneSnapshotLocked() {
+	lanes := append([]*streamLane(nil), s.lanes...)
+	s.lanesSnapshot.Store(&streamLaneSnapshot{lanes: lanes})
 }
 
-func (s *session) currentWSSnapshot() []*wsLane {
-	snap := s.wsSnapshot.Load()
+func (s *session) currentLaneSnapshot() []*streamLane {
+	snap := s.lanesSnapshot.Load()
 	if snap == nil {
 		return nil
 	}
 	return snap.lanes
 }
 
-func (s *session) notifyWSChanged() {
+func (s *session) notifyLanesChanged() {
 	select {
-	case s.wsChanged <- struct{}{}:
+	case s.lanesChanged <- struct{}{}:
 	default:
 	}
 }
@@ -632,7 +632,7 @@ func (s *session) drainSendBatch(batch []relay.Frame, batchSize int) []relay.Fra
 	return batch
 }
 
-func (s *session) wsIncrementalLoop() {
+func (s *session) incrementalLaneLoop() {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -644,15 +644,15 @@ func (s *session) wsIncrementalLoop() {
 		case <-ticker.C:
 			select {
 			case <-s.ready:
-				s.maybeAcquireIncrementalWebSocketLane()
+				s.maybeAcquireIncrementalLane()
 			default:
 			}
 		}
 	}
 }
 
-func (s *session) wsBacklogDepth() int {
-	if s.state != nil && s.state.usesDirectWSWrite() {
+func (s *session) laneBacklogDepth() int {
+	if s.state != nil && s.state.usesDirectLaneWrite() {
 		return len(s.sendQ)
 	}
 	if s.batchQ == nil {
@@ -661,8 +661,8 @@ func (s *session) wsBacklogDepth() int {
 	return len(s.batchQ)
 }
 
-func (s *session) wsCount() int {
-	return len(s.currentWSSnapshot())
+func (s *session) laneCount() int {
+	return len(s.currentLaneSnapshot())
 }
 
 func (s *session) goRun(fn func()) bool {
@@ -710,16 +710,16 @@ func (s *session) close() {
 		if s.cancel != nil {
 			s.cancel()
 		}
-		s.wsMu.Lock()
-		wsLanes := append([]*wsLane(nil), s.ws...)
-		s.ws = nil
-		s.publishWSSnapshotLocked()
-		s.wsMu.Unlock()
-		s.notifyWSChanged()
-		for _, ln := range wsLanes {
+		s.lanesMu.Lock()
+		lanes := append([]*streamLane(nil), s.lanes...)
+		s.lanes = nil
+		s.publishLaneSnapshotLocked()
+		s.lanesMu.Unlock()
+		s.notifyLanesChanged()
+		for _, ln := range lanes {
 			ln.closeWorker()
-			if ln.conn != nil {
-				_ = ln.conn.Close()
+			if ln.stream != nil {
+				_ = ln.stream.Close()
 			}
 		}
 		s.wgMu.Lock()
@@ -782,13 +782,13 @@ func normalizeBatchSettings(batchSize *int, batchDelay *time.Duration) {
 	}
 }
 
-func (c *clientState) usesDirectWSWrite() bool {
+func (c *clientState) usesDirectLaneWrite() bool {
 	return c.batchSize == 1
 }
 
-func (s *session) wsWriteLoop(c *clientState, ln *wsLane) {
-	if c.usesDirectWSWrite() {
-		s.wsDirectWriteLoop(c, ln)
+func (s *session) laneWriteLoop(c *clientState, ln *streamLane) {
+	if c.usesDirectLaneWrite() {
+		s.directLaneWriteLoop(c, ln)
 		return
 	}
 	for {
@@ -812,7 +812,7 @@ func (s *session) wsWriteLoop(c *clientState, ln *wsLane) {
 	}
 }
 
-func (s *session) wsDirectWriteLoop(c *clientState, ln *wsLane) {
+func (s *session) directLaneWriteLoop(c *clientState, ln *streamLane) {
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -845,7 +845,7 @@ func (s *session) returnBatch(frames []relay.Frame) {
 	s.enqueueBatch(frames)
 }
 
-func (s *session) writeBatchOnLane(c *clientState, ln *wsLane, frames []relay.Frame) {
+func (s *session) writeBatchOnLane(c *clientState, ln *streamLane, frames []relay.Frame) {
 	select {
 	case <-s.ctx.Done():
 		return
@@ -890,7 +890,7 @@ func (s *session) writeBatchOnLane(c *clientState, ln *wsLane, frames []relay.Fr
 	}
 }
 
-func (s *session) writeFrameChunk(ln *wsLane, frames []relay.Frame) bool {
+func (s *session) writeFrameChunk(ln *streamLane, frames []relay.Frame) bool {
 	if s.isClosed() {
 		return false
 	}
@@ -902,37 +902,37 @@ func (s *session) writeFrameChunk(ln *wsLane, frames []relay.Frame) bool {
 	return s.writeEncodedFrameChunk(ln, frames, body)
 }
 
-func (s *session) writeEncodedFrameChunk(ln *wsLane, frames []relay.Frame, body []byte) bool {
+func (s *session) writeEncodedFrameChunk(ln *streamLane, frames []relay.Frame, body []byte) bool {
 	if s.isClosed() {
 		return false
 	}
 	defer ln.retainEncodeBuffer(body)
-	s.countWSPostStart(ln)
+	s.countLaneWriteStart(ln)
 	s.countUDPInFrames(frames)
-	defer s.countWSRequestDone(ln)
-	if err := ln.conn.WriteBinaryOwned(body); err != nil {
-		s.countWSPostError(ln)
+	defer s.countLaneWriteDone(ln)
+	if err := ln.stream.WriteMessageOwned(body); err != nil {
+		s.countLaneWriteError(ln)
 		ln.closed.Store(true)
 		ln.closeWorker()
-		s.notifyWSChanged()
-		s.goRun(func() { s.reconnectWebSocketLane(s.state, ln) })
-		appLog.WarnRate("websocket_write_failed", 10*time.Second, "websocket-write-failed", "session", s.id, "lane", ln.index, "err", err)
+		s.notifyLanesChanged()
+		s.goRun(func() { s.reconnectLane(s.state, ln) })
+		appLog.WarnRate("stream_write_failed", 10*time.Second, "stream-write-failed", "session", s.id, "lane", ln.index, "err", err, "transport", s.state.transport)
 		return false
 	}
-	s.countWSPostOK(ln)
+	s.countLaneWriteOK(ln)
 	return true
 }
 
-func (ln *wsLane) retainEncodeBuffer(body []byte) {
-	if cap(body) > wsEncodeBufferRetainLimit {
+func (ln *streamLane) retainEncodeBuffer(body []byte) {
+	if cap(body) > streamEncodeBufferRetainLimit {
 		ln.encodeBuf = nil
 		return
 	}
 	ln.encodeBuf = body[:0]
 }
 
-func (s *session) firstOpenWSLane() *wsLane {
-	for _, ln := range s.currentWSSnapshot() {
+func (s *session) firstOpenLane() *streamLane {
+	for _, ln := range s.currentLaneSnapshot() {
 		if !ln.closed.Load() {
 			return ln
 		}
@@ -940,30 +940,30 @@ func (s *session) firstOpenWSLane() *wsLane {
 	return nil
 }
 
-func (s *session) wsReadLoop(c *clientState, ln *wsLane) {
+func (s *session) laneReadLoop(c *clientState, ln *streamLane) {
 	for {
 		if s.isClosed() {
 			return
 		}
-		body, err := relay.ReadBinaryView(ln.conn)
+		body, err := relay.ReadMessageView(ln.stream)
 		if err != nil {
 			if s.isClosed() {
 				return
 			}
-			s.countWSReadError(ln)
+			s.countLaneReadError(ln)
 			ln.closed.Store(true)
 			ln.closeWorker()
-			s.notifyWSChanged()
-			s.goRun(func() { s.reconnectWebSocketLane(c, ln) })
-			appLog.WarnRate("websocket_read_failed", 10*time.Second, "websocket-read-failed", "session", s.id, "lane", ln.index, "err", err)
+			s.notifyLanesChanged()
+			s.goRun(func() { s.reconnectLane(c, ln) })
+			appLog.WarnRate("stream_read_failed", 10*time.Second, "stream-read-failed", "session", s.id, "lane", ln.index, "err", err, "transport", c.transport)
 			return
 		}
-		if s.handleWSControlMessage(c, ln.index, body) {
+		if s.handleStreamControlMessage(c, ln.index, body) {
 			continue
 		}
 		frames, err := relay.DecodeFramesView(body)
 		if err != nil {
-			appLog.WarnRate("websocket_decode_failed", 10*time.Second, "websocket-decode-failed", "session", s.id, "lane", ln.index, "err", err)
+			appLog.WarnRate("stream_decode_failed", 10*time.Second, "stream-decode-failed", "session", s.id, "lane", ln.index, "err", err, "transport", c.transport)
 			continue
 		}
 		s.touch()
@@ -975,39 +975,39 @@ func (s *session) wsReadLoop(c *clientState, ln *wsLane) {
 	}
 }
 
-func (s *session) handleWSControlMessage(c *clientState, laneIndex int, body []byte) bool {
+func (s *session) handleStreamControlMessage(c *clientState, laneIndex int, body []byte) bool {
 	if !relay.IsControlMessage(body) {
 		return false
 	}
 	op, payload, err := relay.DecodeControl(body)
 	if err != nil {
-		appLog.WarnRate("websocket_control_decode_failed", 10*time.Second, "websocket-control-decode-failed", "session", s.id, "lane", laneIndex, "err", err)
+		appLog.WarnRate("stream_control_decode_failed", 10*time.Second, "stream-control-decode-failed", "session", s.id, "lane", laneIndex, "err", err, "transport", c.transport)
 		return true
 	}
 	switch op {
 	case relay.ControlOpExpandLanesHint:
 		if len(payload) != 0 {
-			appLog.WarnRate("websocket_expand_hint_payload", 10*time.Second, "websocket-expand-hint-payload", "session", s.id, "lane", laneIndex, "payload_bytes", len(payload))
+			appLog.WarnRate("stream_expand_hint_payload", 10*time.Second, "stream-expand-hint-payload", "session", s.id, "lane", laneIndex, "payload_bytes", len(payload), "transport", c.transport)
 		}
 		if c != nil {
-			c.countWSExpandHintReceived()
-			if c.wsLanesN <= 1 {
+			c.countExpandHintReceived()
+			if c.laneTarget <= 1 {
 				return true
 			}
 		}
 		s.expandHintPending.Store(true)
 	default:
-		appLog.WarnRate("websocket_unknown_control", 10*time.Second, "websocket-unknown-control", "session", s.id, "lane", laneIndex, "op", op)
+		appLog.WarnRate("stream_unknown_control", 10*time.Second, "stream-unknown-control", "session", s.id, "lane", laneIndex, "op", op, "transport", c.transport)
 	}
 	return true
 }
 
-func (s *session) reconnectWebSocketLane(c *clientState, old *wsLane) {
+func (s *session) reconnectLane(c *clientState, old *streamLane) {
 	if !old.reconnecting.CompareAndSwap(false, true) {
 		return
 	}
 	old.closeWorker()
-	_ = old.conn.Close()
+	_ = old.stream.Close()
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -1017,13 +1017,13 @@ func (s *session) reconnectWebSocketLane(c *clientState, old *wsLane) {
 		default:
 		}
 		ctx, cancel := context.WithTimeout(s.ctx, c.timeout)
-		ws, err := c.acquireBinaryConn(ctx, s.id)
+		stream, err := c.acquireMessageStream(ctx, s.id)
 		cancel()
 		if err != nil {
 			if s.isClosed() {
 				return
 			}
-			appLog.WarnRate("websocket_reconnect_failed", 10*time.Second, "websocket-reconnect-failed", "session", s.id, "lane", old.index, "err", err)
+			appLog.WarnRate("stream_reconnect_failed", 10*time.Second, "stream-reconnect-failed", "session", s.id, "lane", old.index, "err", err, "transport", c.transport)
 			select {
 			case <-s.ctx.Done():
 				return
@@ -1034,35 +1034,35 @@ func (s *session) reconnectWebSocketLane(c *clientState, old *wsLane) {
 			continue
 		}
 		if s.isClosed() {
-			_ = ws.Close()
+			_ = stream.Close()
 			return
 		}
-		ln := newWSLane(old.index, ws)
+		ln := newStreamLane(old.index, stream)
 		replaced := false
-		s.wsMu.Lock()
+		s.lanesMu.Lock()
 		if !s.isClosed() {
-			for i, cur := range s.ws {
+			for i, cur := range s.lanes {
 				if cur == old {
-					s.ws[i] = ln
+					s.lanes[i] = ln
 					replaced = true
 					break
 				}
 			}
 			if replaced {
-				s.publishWSSnapshotLocked()
+				s.publishLaneSnapshotLocked()
 			}
 		}
-		s.wsMu.Unlock()
+		s.lanesMu.Unlock()
 		if !replaced {
-			_ = ws.Close()
+			_ = stream.Close()
 			return
 		}
-		s.notifyWSChanged()
+		s.notifyLanesChanged()
 		c.countTransport()
 		c.countReconnect()
-		s.goRun(func() { s.wsReadLoop(c, ln) })
-		s.goRun(func() { s.wsWriteLoop(c, ln) })
-		appLog.Info("websocket-lane-reconnected", "session", s.id, "lane", old.index)
+		s.goRun(func() { s.laneReadLoop(c, ln) })
+		s.goRun(func() { s.laneWriteLoop(c, ln) })
+		appLog.Info("stream-lane-reconnected", "session", s.id, "lane", old.index, "transport", c.transport)
 		return
 	}
 }
