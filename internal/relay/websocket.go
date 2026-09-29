@@ -38,6 +38,9 @@ type WebSocketConn struct {
 	readBuf      []byte
 }
 
+var _ MessageStream = (*WebSocketConn)(nil)
+var _ MessageViewReader = (*WebSocketConn)(nil)
+
 type WebSocketSocketOptions struct {
 	SendBuffer    int
 	ReceiveBuffer int
@@ -149,10 +152,10 @@ func AttachWebSocketSession(ctx context.Context, ws *WebSocketConn, sessionID st
 		_ = ws.SetDeadline(deadline)
 		defer ws.SetDeadline(time.Time{})
 	}
-	if err := ws.WriteBinary(body); err != nil {
+	if err := ws.WriteMessage(body); err != nil {
 		return err
 	}
-	ack, err := ws.ReadBinary()
+	ack, err := ws.ReadMessage()
 	if err != nil {
 		return err
 	}
@@ -247,11 +250,11 @@ func (c *WebSocketConn) SetDeadline(t time.Time) error {
 	return c.conn.SetDeadline(t)
 }
 
-func (c *WebSocketConn) WriteBinary(payload []byte) error {
+func (c *WebSocketConn) WriteMessage(payload []byte) error {
 	return c.writeBinary(payload, false)
 }
 
-func (c *WebSocketConn) WriteBinaryOwned(payload []byte) error {
+func (c *WebSocketConn) WriteMessageOwned(payload []byte) error {
 	return c.writeBinary(payload, true)
 }
 
@@ -313,11 +316,11 @@ func (c *WebSocketConn) Ping(payload []byte) error {
 	return c.writeControl(0x9, payload)
 }
 
-func (c *WebSocketConn) ReadMessage() (byte, []byte, error) {
+func (c *WebSocketConn) ReadWebSocketMessage() (byte, []byte, error) {
 	return c.readMessage(false)
 }
 
-func (c *WebSocketConn) ReadMessageView() (byte, []byte, error) {
+func (c *WebSocketConn) ReadWebSocketMessageView() (byte, []byte, error) {
 	return c.readMessage(true)
 }
 
@@ -334,9 +337,9 @@ func (c *WebSocketConn) readMessage(view bool) (byte, []byte, error) {
 	return opcode, payload, nil
 }
 
-func (c *WebSocketConn) ReadBinary() ([]byte, error) {
+func (c *WebSocketConn) ReadMessage() ([]byte, error) {
 	for {
-		opcode, payload, err := c.ReadMessage()
+		opcode, payload, err := c.ReadWebSocketMessage()
 		if err != nil {
 			return nil, err
 		}
@@ -349,11 +352,11 @@ func (c *WebSocketConn) ReadBinary() ([]byte, error) {
 	}
 }
 
-// ReadBinaryView returns a binary message backed by a connection-owned buffer
+// ReadMessageView returns a binary message backed by a connection-owned buffer
 // when possible. The returned slice is only valid until the next read on c.
-func (c *WebSocketConn) ReadBinaryView() ([]byte, error) {
+func (c *WebSocketConn) ReadMessageView() ([]byte, error) {
 	for {
-		opcode, payload, err := c.ReadMessageView()
+		opcode, payload, err := c.ReadWebSocketMessageView()
 		if err != nil {
 			return nil, err
 		}

@@ -17,7 +17,7 @@ func (s *server) queueFrame(f relay.Frame) relay.Frame             { return f }
 func (s *server) markBatchQueued(frames []relay.Frame)             {}
 func (s *server) observeQueueWait(f relay.Frame)                   {}
 func (s *server) observeBatchQueueWait(frames []relay.Frame)       {}
-func (s *server) observeWSWrite(d time.Duration)                   {}
+func (s *server) observeLaneWrite(d time.Duration)                 {}
 func (s *server) countQueueDrops(n int)                            {}
 func (s *server) countBatchQueueDrops(n int)                       {}
 func (s *server) countExpandHintSent()                             {}
@@ -31,4 +31,4 @@ func (s *server) countSessionClosed()                              {}
 func (s *server) countUnattachedWS(delta int64)                    {}
 func (s *server) countMethod()                                     {}
 func (s *server) countStatus(status int)                           {}
-func (l *serverWSLane) observeDownlink(frames, bytes int)          {}
+func (l *serverLane) observeDownlink(frames, bytes int)            {}

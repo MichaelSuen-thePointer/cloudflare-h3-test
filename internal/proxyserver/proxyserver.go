@@ -22,8 +22,8 @@ import (
 )
 
 const (
-	maxFramesPerDownlinkMessage = relay.MaxPayloadFramesPerMessage
-	wsEncodeBufferRetainLimit   = 512 << 10
+	maxFramesPerDownlinkMessage   = relay.MaxPayloadFramesPerMessage
+	streamEncodeBufferRetainLimit = 512 << 10
 )
 
 var (
@@ -46,12 +46,14 @@ type session struct {
 	expandHintPending    atomic.Bool
 	expandHintInFlight   atomic.Bool
 	expandHintInFlightAt atomic.Int64
-	wsMu                 sync.Mutex
-	ws                   map[*relay.WebSocketConn]*serverWSLane
-	wsNext               atomic.Int64
+	lanesMu              sync.Mutex
+	lanes                map[*serverLane]struct{}
+	nextLaneID           atomic.Int64
 }
 
-type serverWSLane struct {
+type serverLane struct {
+	stream    relay.MessageStream
+	transport string
 	id        int64
 	encodeBuf []byte
 	writes    atomic.Int64
@@ -93,8 +95,8 @@ type serverStats struct {
 	queueWaitCount             atomic.Int64
 	batchQWaitMaxUS            atomic.Int64
 	batchQWaitCount            atomic.Int64
-	wsWriteMaxUS               atomic.Int64
-	wsWriteCount               atomic.Int64
+	laneWriteMaxUS             atomic.Int64
+	laneWriteCount             atomic.Int64
 	expandHintsSent            atomic.Int64
 	expandHintsWriteFailed     atomic.Int64
 	expandHintsExpired         atomic.Int64
@@ -236,39 +238,43 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		_ = ws.Close()
 		return
 	}
+	s.serveAttachedStream(ws, "ws", id, r.RemoteAddr, r.Context().Done())
+}
+
+func (s *server) serveAttachedStream(stream relay.MessageStream, transport, id, remoteAddr string, requestDone <-chan struct{}) {
 	sess, err := s.getSession(id)
 	if err != nil {
-		appLog.WarnRate("websocket_session_failed", 10*time.Second, "websocket-session-failed", "session", id, "remote", r.RemoteAddr, "err", err)
-		_ = ws.Close()
+		appLog.WarnRate("stream_session_failed", 10*time.Second, "stream-session-failed", "session", id, "remote", remoteAddr, "err", err, "transport", transport)
+		_ = stream.Close()
 		return
 	}
-	wsLane, ok := sess.addWebSocket(ws)
+	lane, ok := sess.addLane(stream, transport)
 	if !ok {
-		_ = ws.Close()
+		_ = stream.Close()
 		return
 	}
 	ack, err := relay.EncodeControl(relay.ControlOpAttachOK, nil)
 	if err != nil {
-		sess.removeWebSocket(ws)
-		_ = ws.Close()
+		sess.removeLane(lane)
+		_ = stream.Close()
 		return
 	}
-	if err := ws.WriteBinary(ack); err != nil {
-		sess.removeWebSocket(ws)
-		_ = ws.Close()
+	if err := stream.WriteMessage(ack); err != nil {
+		sess.removeLane(lane)
+		_ = stream.Close()
 		return
 	}
-	defer sess.removeWebSocket(ws)
-	defer ws.Close()
+	defer sess.removeLane(lane)
+	defer stream.Close()
 	sess.startExpandHintLoop(s)
-	if !s.usesDirectWSWrite() {
+	if !s.usesDirectLaneWrite() {
 		sess.startDownBatchLoop(s)
 	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if s.usesDirectWSWrite() {
-			s.writeDownDirectLoop(ws, wsLane, sess, id, r.RemoteAddr, r.Context().Done())
+		if s.usesDirectLaneWrite() {
+			s.writeLaneDownDirectLoop(lane, sess, id, remoteAddr, requestDone)
 			return
 		}
 		for {
@@ -280,13 +286,13 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				if sess.isClosed() {
 					return
 				}
-				if !s.writePendingExpandHint(ws, sess, id, r.RemoteAddr) {
+				if !s.writePendingExpandHint(lane, sess, id, remoteAddr) {
 					return
 				}
-				if !s.writeDownBatch(ws, wsLane, id, r.RemoteAddr, frames, true) {
+				if !s.writeDownBatch(lane, id, remoteAddr, frames, true) {
 					return
 				}
-			case <-r.Context().Done():
+			case <-requestDone:
 				return
 			case <-sess.done:
 				return
@@ -294,13 +300,13 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	for {
-		body, err := ws.ReadBinaryView()
+		body, err := relay.ReadMessageView(lane.stream)
 		if err != nil {
 			return
 		}
 		frames, err := relay.DecodeFramesView(body)
 		if err != nil {
-			appLog.WarnRate("server_websocket_decode_failed", 10*time.Second, "websocket-decode-failed", "session", id, "remote", r.RemoteAddr, "err", err)
+			appLog.WarnRate("server_stream_decode_failed", 10*time.Second, "stream-decode-failed", "session", id, "remote", remoteAddr, "err", err, "transport", transport)
 			continue
 		}
 		if sess.isClosed() {
@@ -310,7 +316,7 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		for _, f := range frames {
 			if err := s.handleInboundFrameAfterTouch(sess, f); err != nil {
 				if !sess.isClosed() {
-					appLog.WarnRate("websocket_udp_write_failed", 10*time.Second, "websocket-udp-write-failed", "session", id, "remote", r.RemoteAddr, "err", err)
+					appLog.WarnRate("stream_udp_write_failed", 10*time.Second, "stream-udp-write-failed", "session", id, "remote", remoteAddr, "err", err, "transport", transport)
 				}
 				return
 			}
@@ -380,7 +386,7 @@ func (sess *session) maybeQueueExpandHint(parent *server, now time.Time) {
 	if hintTimeout <= 0 {
 		hintTimeout = 15 * time.Second
 	}
-	if sess.wsCount() >= maxLanes {
+	if sess.laneCount() >= maxLanes {
 		parent.countExpandHintSkippedMaxLanes()
 		return
 	}
@@ -398,7 +404,7 @@ func (sess *session) maybeQueueExpandHint(parent *server, now time.Time) {
 }
 
 func (sess *session) downlinkBacklogDepth(parent *server) int {
-	if parent.usesDirectWSWrite() {
+	if parent.usesDirectLaneWrite() {
 		return len(sess.queue)
 	}
 	if sess.batchQ == nil {
@@ -526,11 +532,11 @@ func normalizeBatchSettings(batchSize *int, batchDelay *time.Duration) {
 	}
 }
 
-func (s *server) usesDirectWSWrite() bool {
+func (s *server) usesDirectLaneWrite() bool {
 	return s.batchSize == 1
 }
 
-func (s *server) writeDownDirectLoop(ws *relay.WebSocketConn, wsLane *serverWSLane, sess *session, id, remoteAddr string, done <-chan struct{}) {
+func (s *server) writeLaneDownDirectLoop(lane *serverLane, sess *session, id, remoteAddr string, done <-chan struct{}) {
 	for {
 		if sess.isClosed() {
 			return
@@ -541,10 +547,10 @@ func (s *server) writeDownDirectLoop(ws *relay.WebSocketConn, wsLane *serverWSLa
 				return
 			}
 			s.observeQueueWait(f)
-			if !s.writePendingExpandHint(ws, sess, id, remoteAddr) {
+			if !s.writePendingExpandHint(lane, sess, id, remoteAddr) {
 				return
 			}
-			if !s.writeDownBatch(ws, wsLane, id, remoteAddr, []relay.Frame{f}, false) {
+			if !s.writeDownBatch(lane, id, remoteAddr, []relay.Frame{f}, false) {
 				return
 			}
 		case <-done:
@@ -555,7 +561,7 @@ func (s *server) writeDownDirectLoop(ws *relay.WebSocketConn, wsLane *serverWSLa
 	}
 }
 
-func (s *server) writePendingExpandHint(ws *relay.WebSocketConn, sess *session, id, remoteAddr string) bool {
+func (s *server) writePendingExpandHint(lane *serverLane, sess *session, id, remoteAddr string) bool {
 	if s.downExpandLanesMax <= 1 {
 		return true
 	}
@@ -564,12 +570,12 @@ func (s *server) writePendingExpandHint(ws *relay.WebSocketConn, sess *session, 
 	}
 	body, err := relay.EncodeControl(relay.ControlOpExpandLanesHint, nil)
 	if err != nil {
-		appLog.Error("websocket-expand-hint-encode-failed", "session", id, "err", err)
+		appLog.Error("stream-expand-hint-encode-failed", "session", id, "err", err, "transport", lane.transport)
 		return false
 	}
-	if err := ws.WriteBinaryOwned(body); err != nil {
+	if err := lane.stream.WriteMessageOwned(body); err != nil {
 		s.countExpandHintWriteFailed()
-		appLog.WarnRate("server_websocket_expand_hint_write_failed", 10*time.Second, "websocket-expand-hint-write-failed", "session", id, "remote", remoteAddr, "err", err)
+		appLog.WarnRate("server_stream_expand_hint_write_failed", 10*time.Second, "stream-expand-hint-write-failed", "session", id, "remote", remoteAddr, "err", err, "transport", lane.transport)
 		return false
 	}
 	sess.expandHintInFlight.Store(true)
@@ -578,12 +584,12 @@ func (s *server) writePendingExpandHint(ws *relay.WebSocketConn, sess *session, 
 	return true
 }
 
-func (s *server) writeDownBatch(ws *relay.WebSocketConn, wsLane *serverWSLane, id, remoteAddr string, frames []relay.Frame, observeBatchQueue bool) bool {
-	if body, ok, err := relay.EncodeFramesWithinLimitInto(wsLane.encodeBuf, frames, relay.MaxMessageBytes); err != nil {
-		appLog.Error("websocket-encode-failed", "session", id, "err", err)
+func (s *server) writeDownBatch(lane *serverLane, id, remoteAddr string, frames []relay.Frame, observeBatchQueue bool) bool {
+	if body, ok, err := relay.EncodeFramesWithinLimitInto(lane.encodeBuf, frames, relay.MaxMessageBytes); err != nil {
+		appLog.Error("stream-encode-failed", "session", id, "err", err, "transport", lane.transport)
 		return false
 	} else if ok {
-		return s.writeDownEncodedChunk(ws, wsLane, id, remoteAddr, frames, body, observeBatchQueue)
+		return s.writeDownEncodedChunk(lane, id, remoteAddr, frames, body, observeBatchQueue)
 	}
 
 	chunks, err := relay.SplitFramesByEncodedLimit(frames, relay.MaxMessageBytes)
@@ -592,43 +598,43 @@ func (s *server) writeDownBatch(ws *relay.WebSocketConn, wsLane *serverWSLane, i
 		return false
 	}
 	for _, chunk := range chunks {
-		body, err := relay.EncodeFramesInto(wsLane.encodeBuf, chunk)
+		body, err := relay.EncodeFramesInto(lane.encodeBuf, chunk)
 		if err != nil {
-			appLog.Error("websocket-encode-failed", "session", id, "err", err)
+			appLog.Error("stream-encode-failed", "session", id, "err", err, "transport", lane.transport)
 			return false
 		}
-		if !s.writeDownEncodedChunk(ws, wsLane, id, remoteAddr, chunk, body, observeBatchQueue) {
+		if !s.writeDownEncodedChunk(lane, id, remoteAddr, chunk, body, observeBatchQueue) {
 			return false
 		}
 	}
 	return true
 }
 
-func (s *server) writeDownEncodedChunk(ws *relay.WebSocketConn, wsLane *serverWSLane, id, remoteAddr string, frames []relay.Frame, body []byte, observeBatchQueue bool) bool {
-	defer wsLane.retainEncodeBuffer(body)
+func (s *server) writeDownEncodedChunk(lane *serverLane, id, remoteAddr string, frames []relay.Frame, body []byte, observeBatchQueue bool) bool {
+	defer lane.retainEncodeBuffer(body)
 	if observeBatchQueue {
 		s.observeBatchQueueWait(frames)
 	}
 	if metricsBuild && s.metrics {
 		started := time.Now()
-		if err := ws.WriteBinaryOwned(body); err != nil {
-			appLog.WarnRate("server_websocket_write_failed", 10*time.Second, "websocket-write-failed", "session", id, "remote", remoteAddr, "err", err)
+		if err := lane.stream.WriteMessageOwned(body); err != nil {
+			appLog.WarnRate("server_stream_write_failed", 10*time.Second, "stream-write-failed", "session", id, "remote", remoteAddr, "err", err, "transport", lane.transport)
 			return false
 		}
-		wsLane.observeDownlink(len(frames), len(body))
-		s.observeWSWrite(time.Since(started))
+		lane.observeDownlink(len(frames), len(body))
+		s.observeLaneWrite(time.Since(started))
 		return true
 	}
-	if err := ws.WriteBinaryOwned(body); err != nil {
-		appLog.WarnRate("server_websocket_write_failed", 10*time.Second, "websocket-write-failed", "session", id, "remote", remoteAddr, "err", err)
+	if err := lane.stream.WriteMessageOwned(body); err != nil {
+		appLog.WarnRate("server_stream_write_failed", 10*time.Second, "stream-write-failed", "session", id, "remote", remoteAddr, "err", err, "transport", lane.transport)
 		return false
 	}
-	wsLane.observeDownlink(len(frames), len(body))
+	lane.observeDownlink(len(frames), len(body))
 	return true
 }
 
-func (l *serverWSLane) retainEncodeBuffer(body []byte) {
-	if cap(body) > wsEncodeBufferRetainLimit {
+func (l *serverLane) retainEncodeBuffer(body []byte) {
+	if cap(body) > streamEncodeBufferRetainLimit {
 		l.encodeBuf = nil
 		return
 	}
@@ -658,10 +664,10 @@ func (s *server) getSession(id string) (*session, error) {
 		queueCap = 65536
 	}
 	var batchQ chan []relay.Frame
-	if !s.usesDirectWSWrite() {
+	if !s.usesDirectLaneWrite() {
 		batchQ = make(chan []relay.Frame, batchQueueCapacity(queueCap, s.batchSize))
 	}
-	sess := &session{id: id, udp: udp, queue: make(chan relay.Frame, queueCap), batchQ: batchQ, done: make(chan struct{}), touchEvery: touchInterval(s.idle), ws: make(map[*relay.WebSocketConn]*serverWSLane)}
+	sess := &session{id: id, udp: udp, queue: make(chan relay.Frame, queueCap), batchQ: batchQ, done: make(chan struct{}), touchEvery: touchInterval(s.idle), lanes: make(map[*serverLane]struct{})}
 	sess.touch()
 	s.sessions[id] = sess
 	s.countSessionMade()
@@ -728,7 +734,7 @@ func validWebSocketUpgrade(r *http.Request) bool {
 
 func readAttachSession(ws *relay.WebSocketConn) (string, error) {
 	for {
-		opcode, body, err := ws.ReadMessage()
+		opcode, body, err := ws.ReadWebSocketMessage()
 		if err != nil {
 			return "", err
 		}
@@ -773,14 +779,16 @@ func (s *session) close() {
 	s.closeOnce.Do(func() {
 		s.closed.Store(true)
 		close(s.done)
-		s.wsMu.Lock()
-		websockets := make([]*relay.WebSocketConn, 0, len(s.ws))
-		for ws := range s.ws {
-			websockets = append(websockets, ws)
+		s.lanesMu.Lock()
+		lanes := make([]*serverLane, 0, len(s.lanes))
+		for ln := range s.lanes {
+			lanes = append(lanes, ln)
 		}
-		s.wsMu.Unlock()
-		for _, ws := range websockets {
-			_ = ws.Close()
+		s.lanesMu.Unlock()
+		for _, ln := range lanes {
+			if ln.stream != nil {
+				_ = ln.stream.Close()
+			}
 		}
 		for {
 			select {
@@ -805,41 +813,41 @@ func (s *session) isClosed() bool {
 	return s.closed.Load()
 }
 
-func (s *session) addWebSocket(ws *relay.WebSocketConn) (*serverWSLane, bool) {
+func (s *session) addLane(stream relay.MessageStream, transport string) (*serverLane, bool) {
 	if s.isClosed() {
 		return nil, false
 	}
-	s.wsMu.Lock()
-	defer s.wsMu.Unlock()
+	s.lanesMu.Lock()
+	defer s.lanesMu.Unlock()
 	if s.isClosed() {
 		return nil, false
 	}
-	ln := &serverWSLane{id: s.wsNext.Add(1)}
-	s.ws[ws] = ln
+	ln := &serverLane{stream: stream, transport: transport, id: s.nextLaneID.Add(1)}
+	s.lanes[ln] = struct{}{}
 	s.expandHintInFlight.Store(false)
 	s.expandHintInFlightAt.Store(0)
 	return ln, true
 }
 
-func (s *session) removeWebSocket(ws *relay.WebSocketConn) {
-	s.wsMu.Lock()
-	delete(s.ws, ws)
-	s.wsMu.Unlock()
+func (s *session) removeLane(ln *serverLane) {
+	s.lanesMu.Lock()
+	delete(s.lanes, ln)
+	s.lanesMu.Unlock()
 }
 
-func (s *session) wsCount() int {
-	s.wsMu.Lock()
-	defer s.wsMu.Unlock()
-	return len(s.ws)
+func (s *session) laneCount() int {
+	s.lanesMu.Lock()
+	defer s.lanesMu.Unlock()
+	return len(s.lanes)
 }
 
-func (s *session) wsSnapshots() []map[string]any {
-	s.wsMu.Lock()
-	lanes := make([]*serverWSLane, 0, len(s.ws))
-	for _, ln := range s.ws {
+func (s *session) laneSnapshots() []map[string]any {
+	s.lanesMu.Lock()
+	lanes := make([]*serverLane, 0, len(s.lanes))
+	for ln := range s.lanes {
 		lanes = append(lanes, ln)
 	}
-	s.wsMu.Unlock()
+	s.lanesMu.Unlock()
 	out := make([]map[string]any, 0, len(lanes))
 	for _, ln := range lanes {
 		out = append(out, map[string]any{

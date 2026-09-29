@@ -42,12 +42,12 @@ func TestDialWebSocketTLSSessionResumption(t *testing.T) {
 		}
 		defer ws.Close()
 		_ = ws.SetDeadline(time.Now().Add(5 * time.Second))
-		body, err := ws.ReadBinary()
+		body, err := ws.ReadMessage()
 		if err != nil {
 			t.Errorf("read websocket: %v", err)
 			return
 		}
-		if err := ws.WriteBinary(body); err != nil {
+		if err := ws.WriteMessage(body); err != nil {
 			t.Errorf("echo websocket: %v", err)
 		}
 	}))
@@ -74,10 +74,10 @@ func TestDialWebSocketTLSSessionResumption(t *testing.T) {
 			t.Errorf("DidResume=%v, want %v", state.DidResume, wantResume)
 		}
 		payload := []byte("session resumption echo")
-		if err := ws.WriteBinary(payload); err != nil {
+		if err := ws.WriteMessage(payload); err != nil {
 			t.Fatal(err)
 		}
-		got, err := ws.ReadBinary()
+		got, err := ws.ReadMessage()
 		if err != nil || !bytes.Equal(got, payload) {
 			t.Fatalf("echo=%q, err=%v", got, err)
 		}
@@ -119,7 +119,7 @@ func TestWebSocketReadRejectsOversizedPayload(t *testing.T) {
 	}()
 
 	ws := &WebSocketConn{conn: server, reader: bufio.NewReader(server), mask: true}
-	_, err := ws.ReadBinary()
+	_, err := ws.ReadMessage()
 	if err == nil || !strings.Contains(err.Error(), "payload too large") {
 		t.Fatalf("err=%v, want payload too large", err)
 	}
@@ -140,7 +140,7 @@ func TestWebSocketReadRejectsBadMaskDirection(t *testing.T) {
 	}()
 
 	ws := &WebSocketConn{conn: server, reader: bufio.NewReader(server), mask: false}
-	_, err := ws.ReadBinary()
+	_, err := ws.ReadMessage()
 	if err == nil || !strings.Contains(err.Error(), "mask direction") {
 		t.Fatalf("err=%v, want mask direction", err)
 	}
@@ -227,7 +227,7 @@ func TestAcceptWebSocketDoesNotNegotiateExtensions(t *testing.T) {
 	}
 }
 
-func TestWebSocketReadBinaryViewReusesBuffer(t *testing.T) {
+func TestWebSocketReadMessageViewReusesBuffer(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
@@ -235,22 +235,22 @@ func TestWebSocketReadBinaryViewReusesBuffer(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		ws := &WebSocketConn{conn: client, reader: bufio.NewReader(client), mask: true}
-		if err := ws.WriteBinary([]byte("alpha")); err != nil {
+		if err := ws.WriteMessage([]byte("alpha")); err != nil {
 			errCh <- err
 			return
 		}
-		errCh <- ws.WriteBinary([]byte("bravo"))
+		errCh <- ws.WriteMessage([]byte("bravo"))
 	}()
 
 	ws := &WebSocketConn{conn: server, reader: bufio.NewReader(server), mask: false}
-	first, err := ws.ReadBinaryView()
+	first, err := ws.ReadMessageView()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(first) != "alpha" {
 		t.Fatalf("first=%q, want alpha", first)
 	}
-	second, err := ws.ReadBinaryView()
+	second, err := ws.ReadMessageView()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,7 +265,7 @@ func TestWebSocketReadBinaryViewReusesBuffer(t *testing.T) {
 	}
 }
 
-func TestWebSocketReadBinaryKeepsPayloadStable(t *testing.T) {
+func TestWebSocketReadMessageKeepsPayloadStable(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
@@ -273,22 +273,22 @@ func TestWebSocketReadBinaryKeepsPayloadStable(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		ws := &WebSocketConn{conn: client, reader: bufio.NewReader(client), mask: true}
-		if err := ws.WriteBinary([]byte("alpha")); err != nil {
+		if err := ws.WriteMessage([]byte("alpha")); err != nil {
 			errCh <- err
 			return
 		}
-		errCh <- ws.WriteBinary([]byte("bravo"))
+		errCh <- ws.WriteMessage([]byte("bravo"))
 	}()
 
 	ws := &WebSocketConn{conn: server, reader: bufio.NewReader(server), mask: false}
-	first, err := ws.ReadBinary()
+	first, err := ws.ReadMessage()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(first) != "alpha" {
 		t.Fatalf("first=%q, want alpha", first)
 	}
-	second, err := ws.ReadBinary()
+	second, err := ws.ReadMessage()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,7 +344,7 @@ func TestWebSocketClientControlFramesAreMasked(t *testing.T) {
 	}
 }
 
-func TestWebSocketClientWriteBinaryOwnedMasksInPlace(t *testing.T) {
+func TestWebSocketClientWriteMessageOwnedMasksInPlace(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
@@ -354,7 +354,7 @@ func TestWebSocketClientWriteBinaryOwnedMasksInPlace(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		ws := &WebSocketConn{conn: client, reader: bufio.NewReader(client), mask: true}
-		errCh <- ws.WriteBinaryOwned(payload)
+		errCh <- ws.WriteMessageOwned(payload)
 	}()
 
 	masked, got := readTestWebSocketFrame(t, server, true)
@@ -365,14 +365,14 @@ func TestWebSocketClientWriteBinaryOwnedMasksInPlace(t *testing.T) {
 		t.Fatalf("unmasked=%q, want %q", got, original)
 	}
 	if err := <-errCh; err != nil {
-		t.Fatalf("WriteBinaryOwned: %v", err)
+		t.Fatalf("WriteMessageOwned: %v", err)
 	}
 	if bytes.Equal(payload, original) {
 		t.Fatal("owned payload was not masked in place")
 	}
 }
 
-func TestWebSocketClientWriteBinaryDoesNotMutatePayload(t *testing.T) {
+func TestWebSocketClientWriteMessageDoesNotMutatePayload(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
@@ -382,7 +382,7 @@ func TestWebSocketClientWriteBinaryDoesNotMutatePayload(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		ws := &WebSocketConn{conn: client, reader: bufio.NewReader(client), mask: true}
-		errCh <- ws.WriteBinary(payload)
+		errCh <- ws.WriteMessage(payload)
 	}()
 
 	_, got := readTestWebSocketFrame(t, server, true)
@@ -390,14 +390,14 @@ func TestWebSocketClientWriteBinaryDoesNotMutatePayload(t *testing.T) {
 		t.Fatalf("unmasked=%q, want %q", got, original)
 	}
 	if err := <-errCh; err != nil {
-		t.Fatalf("WriteBinary: %v", err)
+		t.Fatalf("WriteMessage: %v", err)
 	}
 	if !bytes.Equal(payload, original) {
 		t.Fatalf("payload mutated: %q want %q", payload, original)
 	}
 }
 
-func TestWebSocketServerWriteBinaryOwnedUnmasked(t *testing.T) {
+func TestWebSocketServerWriteMessageOwnedUnmasked(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
@@ -406,7 +406,7 @@ func TestWebSocketServerWriteBinaryOwnedUnmasked(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		ws := &WebSocketConn{conn: client, reader: bufio.NewReader(client), mask: false}
-		errCh <- ws.WriteBinaryOwned(payload)
+		errCh <- ws.WriteMessageOwned(payload)
 	}()
 
 	masked, got := readTestWebSocketFrame(t, server, false)
@@ -417,17 +417,17 @@ func TestWebSocketServerWriteBinaryOwnedUnmasked(t *testing.T) {
 		t.Fatalf("payload=%q, want payload", got)
 	}
 	if err := <-errCh; err != nil {
-		t.Fatalf("WriteBinaryOwned: %v", err)
+		t.Fatalf("WriteMessageOwned: %v", err)
 	}
 }
 
-func TestWebSocketWriteBinaryOwnedRejectsOversizedPayload(t *testing.T) {
+func TestWebSocketWriteMessageOwnedRejectsOversizedPayload(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
 
 	ws := &WebSocketConn{conn: client, reader: bufio.NewReader(client), mask: true}
-	err := ws.WriteBinaryOwned(make([]byte, MaxWebSocketPayloadBytes+1))
+	err := ws.WriteMessageOwned(make([]byte, MaxWebSocketPayloadBytes+1))
 	if err == nil || !strings.Contains(err.Error(), "websocket payload too large") {
 		t.Fatalf("err=%v, want payload too large", err)
 	}
