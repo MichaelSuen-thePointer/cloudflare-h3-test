@@ -8,21 +8,42 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 type event map[string]any
 
+var eventMu sync.Mutex
+
 func main() {
 	var listen, cert, key, proto string
 	var readSize int
+	var duplex bool
+	var responseChunks int
+	var responseInterval time.Duration
 	flag.StringVar(&listen, "listen", ":2096", "listen address")
 	flag.StringVar(&cert, "cert", "", "TLS certificate")
 	flag.StringVar(&key, "key", "", "TLS key")
-	flag.StringVar(&proto, "proto", "http1", "origin protocol: http1 or default")
+	flag.StringVar(&proto, "proto", "http1", "origin protocol: http1, http2, or default")
 	flag.IntVar(&readSize, "read-size", 1024, "request body read buffer size")
+	flag.BoolVar(&duplex, "duplex", false, "stream response frames while reading the request body")
+	flag.IntVar(&responseChunks, "response-chunks", 12, "number of duplex response frames")
+	flag.DurationVar(&responseInterval, "response-interval", time.Second, "duplex response frame interval")
 	flag.Parse()
+	if proto != "http1" && proto != "http2" && proto != "default" {
+		log.Fatal("-proto must be http1, http2, or default")
+	}
+	if proto == "http2" && (cert == "" || key == "") {
+		log.Fatal("-proto http2 requires -cert and -key")
+	}
+	if duplex && proto != "http2" {
+		log.Fatal("-duplex requires -proto http2")
+	}
+	if duplex && (responseChunks < 1 || responseInterval <= 0 || readSize < 1) {
+		log.Fatal("duplex requires positive response-chunks, response-interval, and read-size")
+	}
 
 	var reqID atomic.Uint64
 	mux := http.NewServeMux()
@@ -39,6 +60,10 @@ func main() {
 			"t_ms":           0,
 			"time":           start.Format(time.RFC3339Nano),
 		})
+		if duplex {
+			runDuplex(w, r, id, start, readSize, responseChunks, responseInterval)
+			return
+		}
 		if r.Body == nil || r.Body == http.NoBody {
 			w.WriteHeader(http.StatusNoContent)
 			writeEvent(event{"event": "request_done", "id": id, "status": http.StatusNoContent, "t_ms": sinceMS(start)})
@@ -83,6 +108,8 @@ func main() {
 	srv := &http.Server{Addr: listen, Handler: mux}
 	if proto == "http1" {
 		srv.TLSConfig = &tls.Config{NextProtos: []string{"http/1.1"}}
+	} else if proto == "http2" {
+		srv.TLSConfig = &tls.Config{NextProtos: []string{"h2"}}
 	}
 	writeEvent(event{"event": "server_start", "listen": listen, "proto": proto, "time": time.Now().Format(time.RFC3339Nano)})
 	if cert == "" && key == "" {
@@ -99,6 +126,8 @@ func sinceMS(start time.Time) int64 {
 }
 
 func writeEvent(e event) {
+	eventMu.Lock()
+	defer eventMu.Unlock()
 	b, err := json.Marshal(e)
 	if err != nil {
 		log.Printf(`{"event":"json_error","error":%q}`, err.Error())
