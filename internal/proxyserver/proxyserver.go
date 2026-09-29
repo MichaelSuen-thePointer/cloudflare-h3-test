@@ -33,7 +33,6 @@ var (
 
 type session struct {
 	id                   string
-	mode                 string
 	udp                  *net.UDPConn
 	queue                chan relay.Frame
 	batchQ               chan []relay.Frame
@@ -62,7 +61,6 @@ type serverWSLane struct {
 
 type server struct {
 	token                 string
-	requireH3             bool
 	upstream              *net.UDPAddr
 	benchEcho             bool
 	idle                  time.Duration
@@ -81,16 +79,9 @@ type server struct {
 
 type serverStats struct {
 	requests                   atomic.Int64
-	postRequests               atomic.Int64
-	getRequests                atomic.Int64
-	deleteRequests             atomic.Int64
 	status200                  atomic.Int64
-	status204                  atomic.Int64
 	status400                  atomic.Int64
 	status404                  atomic.Int64
-	status410                  atomic.Int64
-	status413                  atomic.Int64
-	status502                  atomic.Int64
 	status500                  atomic.Int64
 	udpUpPackets               atomic.Int64
 	udpUpBytes                 atomic.Int64
@@ -116,7 +107,7 @@ type serverStats struct {
 func Main(args []string) {
 	var listen, cert, key, token, upstream, metricsOut, logLevel string
 	var udpBuffer, downQueue, batchSize, downExpandLanesMax, wsSocketSendBuffer, wsSocketReceiveBuffer int
-	var requireH3, benchEcho, metrics, useSyslog bool
+	var benchEcho, metrics, useSyslog bool
 	var idle, batchDelay, downExpandHintTimeout time.Duration
 	fs := flag.NewFlagSet("proxy-server", flag.ExitOnError)
 	fs.StringVar(&listen, "listen", ":2083", "TLS listen address")
@@ -124,7 +115,6 @@ func Main(args []string) {
 	fs.StringVar(&key, "key", "", "TLS key")
 	fs.StringVar(&token, "token", "change-me-token", "shared relay token")
 	fs.StringVar(&upstream, "upstream", "127.0.0.1:19090", "UDP upstream test/upstream service server")
-	fs.BoolVar(&requireH3, "require-h3", true, "require X-Client-HTTP-Version: HTTP/3")
 	fs.BoolVar(&benchEcho, "bench-echo", false, "echo frames in proxy server instead of UDP upstream")
 	fs.BoolVar(&metrics, "metrics", false, "enable periodic JSON metrics logging")
 	fs.StringVar(&metricsOut, "metrics-out", "", "optional JSONL metrics output path")
@@ -161,7 +151,7 @@ func Main(args []string) {
 		if err := configureLogger("proxy-server", logLevel, useSyslog); err != nil {
 			log.Fatal(err)
 		}
-		if err := applyServerPluginEnv(pluginEnv, &listen, &upstream, &cert, &key, &token, &metricsOut, &logLevel, &requireH3, &benchEcho, &metrics, &useSyslog, &idle, &batchDelay, &downExpandHintTimeout, &udpBuffer, &downQueue, &batchSize, &downExpandLanesMax, &wsSocketSendBuffer, &wsSocketReceiveBuffer); err != nil {
+		if err := applyServerPluginEnv(pluginEnv, &listen, &upstream, &cert, &key, &token, &metricsOut, &logLevel, &benchEcho, &metrics, &useSyslog, &idle, &batchDelay, &downExpandHintTimeout, &udpBuffer, &downQueue, &batchSize, &downExpandLanesMax, &wsSocketSendBuffer, &wsSocketReceiveBuffer); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -192,7 +182,7 @@ func Main(args []string) {
 		metricsOut = ""
 	}
 	wsSocketOptions := relay.WebSocketSocketOptions{SendBuffer: wsSocketSendBuffer, ReceiveBuffer: wsSocketReceiveBuffer}
-	s := &server{token: token, requireH3: requireH3, upstream: addr, benchEcho: benchEcho, idle: idle, udpBuffer: udpBuffer, downQueue: downQueue, batchSize: batchSize, batchDelay: batchDelay, wsSocketOptions: wsSocketOptions, downExpandLanesMax: downExpandLanesMax, downExpandHintTimeout: downExpandHintTimeout, metrics: metrics, sessions: map[string]*session{}}
+	s := &server{token: token, upstream: addr, benchEcho: benchEcho, idle: idle, udpBuffer: udpBuffer, downQueue: downQueue, batchSize: batchSize, batchDelay: batchDelay, wsSocketOptions: wsSocketOptions, downExpandLanesMax: downExpandLanesMax, downExpandHintTimeout: downExpandHintTimeout, metrics: metrics, sessions: map[string]*session{}}
 	go s.cleanupLoop()
 	if metricsBuild && metricsOut != "" {
 		go s.writeMetrics(metricsOut, 5*time.Second)
@@ -201,7 +191,7 @@ func Main(args []string) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handle)
-	appLog.Info("proxy-server-start", "listen", listen, "upstream", upstream, "require_h3", requireH3, "bench_echo", benchEcho, "metrics", metrics, "batch_size", batchSize, "batch_delay", batchDelay, "ws_socket_send_buffer", wsSocketSendBuffer, "ws_socket_recv_buffer", wsSocketReceiveBuffer, "down_expand_lanes_max", downExpandLanesMax, "down_expand_hint_timeout", downExpandHintTimeout)
+	appLog.Info("proxy-server-start", "listen", listen, "upstream", upstream, "bench_echo", benchEcho, "metrics", metrics, "batch_size", batchSize, "batch_delay", batchDelay, "ws_socket_send_buffer", wsSocketSendBuffer, "ws_socket_recv_buffer", wsSocketReceiveBuffer, "down_expand_lanes_max", downExpandLanesMax, "down_expand_hint_timeout", downExpandHintTimeout)
 	httpServer := &http.Server{Addr: listen, Handler: mux, ErrorLog: appLog.StdLogger(diaglog.Warn, "http-server-error")}
 	if cert == "" && key == "" {
 		log.Fatal(httpServer.ListenAndServe())
@@ -213,7 +203,7 @@ func Main(args []string) {
 }
 
 func (s *server) handle(w http.ResponseWriter, r *http.Request) {
-	s.countMethod(r.Method)
+	s.countMethod()
 	if r.Header.Get("X-Relay-Token") != s.token {
 		s.countStatus(http.StatusNotFound)
 		http.NotFound(w, r)
@@ -228,30 +218,8 @@ func (s *server) handle(w http.ResponseWriter, r *http.Request) {
 		s.handleWebSocket(w, r)
 		return
 	}
-	id := r.Header.Get("X-Relay-Session")
-	if id == "" || len(id) > 128 {
-		s.countStatus(http.StatusBadRequest)
-		http.Error(w, "bad session", http.StatusBadRequest)
-		return
-	}
-	if s.requireH3 && r.Header.Get("X-Client-HTTP-Version") != "HTTP/3" {
-		s.countStatus(http.StatusNotFound)
-		http.NotFound(w, r)
-		return
-	}
-	switch r.Method {
-	case http.MethodPost:
-		s.handlePost(w, r, id)
-	case http.MethodGet:
-		s.handleGet(w, r, id)
-	case http.MethodDelete:
-		s.closeSession(id)
-		s.countStatus(http.StatusNoContent)
-		w.WriteHeader(http.StatusNoContent)
-	default:
-		s.countStatus(http.StatusNotFound)
-		http.NotFound(w, r)
-	}
+	s.countStatus(http.StatusNotFound)
+	http.NotFound(w, r)
 }
 
 func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -355,59 +323,6 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *server) handlePost(w http.ResponseWriter, r *http.Request, id string) {
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, relay.MaxMessageBytes+1))
-	if err != nil {
-		s.countStatus(http.StatusRequestEntityTooLarge)
-		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
-		return
-	}
-	if len(body) > relay.MaxMessageBytes {
-		s.countStatus(http.StatusRequestEntityTooLarge)
-		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
-		return
-	}
-	frames, err := relay.DecodeFramesView(body)
-	if err != nil {
-		s.countStatus(http.StatusBadRequest)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	sess, err := s.getSession(id)
-	if err != nil {
-		s.countStatus(http.StatusBadGateway)
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	if sess.isClosed() {
-		s.countStatus(http.StatusGone)
-		http.Error(w, "session gone", http.StatusGone)
-		return
-	}
-	for _, f := range frames {
-		if sess.isClosed() {
-			s.countStatus(http.StatusGone)
-			http.Error(w, "session gone", http.StatusGone)
-			return
-		}
-		if err := s.handleInboundFrame(sess, f); err != nil {
-			s.countStatus(http.StatusBadGateway)
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-	}
-	s.countStatus(http.StatusNoContent)
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *server) handleInboundFrame(sess *session, f relay.Frame) error {
-	if sess.isClosed() {
-		return errSessionClosed
-	}
-	sess.touch()
-	return s.handleInboundFrameAfterTouch(sess, f)
-}
-
 func (s *server) handleInboundFrameAfterTouch(sess *session, f relay.Frame) error {
 	if sess.isClosed() {
 		return errSessionClosed
@@ -423,65 +338,6 @@ func (s *server) handleInboundFrameAfterTouch(sess *session, f relay.Frame) erro
 	}
 	s.countUDPUp(len(f.Payload))
 	return nil
-}
-
-func (s *server) handleGet(w http.ResponseWriter, r *http.Request, id string) {
-	sess, err := s.getSession(id)
-	if err != nil {
-		s.countStatus(http.StatusBadGateway)
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	if sess.isClosed() {
-		s.countStatus(http.StatusGone)
-		http.Error(w, "session gone", http.StatusGone)
-		return
-	}
-	flusher, _ := w.(http.Flusher)
-	w.Header().Set("Content-Type", "application/octet-stream")
-	s.countStatus(http.StatusOK)
-	w.WriteHeader(http.StatusOK)
-	if flusher != nil {
-		flusher.Flush()
-	}
-	for {
-		var frames []relay.Frame
-		select {
-		case f := <-sess.queue:
-			if sess.isClosed() {
-				return
-			}
-			s.observeQueueWait(f)
-			frames = append(frames, f)
-		case <-r.Context().Done():
-			return
-		case <-sess.done:
-			return
-		}
-	drain:
-		for len(frames) < maxFramesPerDownlinkMessage {
-			select {
-			case f := <-sess.queue:
-				if sess.isClosed() {
-					return
-				}
-				s.observeQueueWait(f)
-				frames = append(frames, f)
-			default:
-				break drain
-			}
-		}
-		body, err := relay.EncodeFrames(frames)
-		if err != nil {
-			return
-		}
-		if err := relay.WriteStreamMessage(w, body); err != nil {
-			return
-		}
-		if flusher != nil {
-			flusher.Flush()
-		}
-	}
 }
 
 func (sess *session) startDownBatchLoop(parent *server) {
@@ -1015,7 +871,7 @@ func (s *session) readLoop(parent *server) {
 	}
 }
 
-func applyServerPluginEnv(env PluginEnv.Env, listen, upstream, cert, key, token, metricsOut, logLevel *string, requireH3, benchEcho, metrics, useSyslog *bool, idle, batchDelay, downExpandHintTimeout *time.Duration, udpBuffer, downQueue, batchSize, downExpandLanesMax, wsSocketSendBuffer, wsSocketReceiveBuffer *int) error {
+func applyServerPluginEnv(env PluginEnv.Env, listen, upstream, cert, key, token, metricsOut, logLevel *string, benchEcho, metrics, useSyslog *bool, idle, batchDelay, downExpandHintTimeout *time.Duration, udpBuffer, downQueue, batchSize, downExpandLanesMax, wsSocketSendBuffer, wsSocketReceiveBuffer *int) error {
 	opts := env.Options
 	warnUnknownPluginEnvOptions(opts, knownServerPluginEnvOptions)
 
@@ -1026,9 +882,6 @@ func applyServerPluginEnv(env PluginEnv.Env, listen, upstream, cert, key, token,
 	applyStringOption(opts, "key", key)
 	applyStringOption(opts, "metrics-out", metricsOut)
 	if err := applyLogLevelOption(opts, logLevel); err != nil {
-		return err
-	}
-	if err := applyBoolOption(opts, "require-h3", requireH3); err != nil {
 		return err
 	}
 	if err := applyBoolOption(opts, "bench-echo", benchEcho); err != nil {
@@ -1161,7 +1014,7 @@ func applyDurationOption(opts PluginEnv.Options, key string, dst *time.Duration)
 
 var knownServerPluginEnvOptions = map[string]struct{}{
 	"server": {}, "host": {}, "token": {}, "cert": {}, "key": {},
-	"require-h3": {}, "bench-echo": {}, "metrics": {}, "metrics-out": {}, "log-level": {}, "use-syslog": {}, "idle": {}, "udp-buffer": {}, "down-queue": {}, "batch-size": {}, "batch-delay": {}, "down-expand-lanes-max": {}, "down-expand-hint-timeout": {}, "ws-socket-send-buffer": {}, "ws-socket-recv-buffer": {},
+	"bench-echo": {}, "metrics": {}, "metrics-out": {}, "log-level": {}, "use-syslog": {}, "idle": {}, "udp-buffer": {}, "down-queue": {}, "batch-size": {}, "batch-delay": {}, "down-expand-lanes-max": {}, "down-expand-hint-timeout": {}, "ws-socket-send-buffer": {}, "ws-socket-recv-buffer": {},
 }
 
 func warnUnknownPluginEnvOptions(opts PluginEnv.Options, known map[string]struct{}) {

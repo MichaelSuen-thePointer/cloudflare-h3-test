@@ -82,17 +82,10 @@ func (s *server) snapshot() map[string]any {
 		"sessions_created":               s.stats.sessionsMade.Load(),
 		"sessions_closed":                s.stats.sessionsClosed.Load(),
 		"requests":                       s.stats.requests.Load(),
-		"post_requests":                  s.stats.postRequests.Load(),
-		"get_requests":                   s.stats.getRequests.Load(),
-		"delete_requests":                s.stats.deleteRequests.Load(),
 		"status_200":                     s.stats.status200.Load(),
-		"status_204":                     s.stats.status204.Load(),
 		"status_400":                     s.stats.status400.Load(),
 		"status_404":                     s.stats.status404.Load(),
-		"status_410":                     s.stats.status410.Load(),
-		"status_413":                     s.stats.status413.Load(),
 		"status_500":                     s.stats.status500.Load(),
-		"status_502":                     s.stats.status502.Load(),
 		"udp_up_packets":                 s.stats.udpUpPackets.Load(),
 		"udp_up_bytes":                   s.stats.udpUpBytes.Load(),
 		"udp_down_packets":               s.stats.udpDownPackets.Load(),
@@ -238,19 +231,11 @@ func updateMax(target *atomic.Int64, value int64) {
 	}
 }
 
-func (s *server) countMethod(method string) {
+func (s *server) countMethod() {
 	if !s.metrics {
 		return
 	}
 	s.stats.requests.Add(1)
-	switch method {
-	case http.MethodPost:
-		s.stats.postRequests.Add(1)
-	case http.MethodGet:
-		s.stats.getRequests.Add(1)
-	case http.MethodDelete:
-		s.stats.deleteRequests.Add(1)
-	}
 }
 
 func (s *server) countStatus(status int) {
@@ -260,18 +245,10 @@ func (s *server) countStatus(status int) {
 	switch status {
 	case http.StatusOK:
 		s.stats.status200.Add(1)
-	case http.StatusNoContent:
-		s.stats.status204.Add(1)
 	case http.StatusBadRequest:
 		s.stats.status400.Add(1)
 	case http.StatusNotFound:
 		s.stats.status404.Add(1)
-	case http.StatusGone:
-		s.stats.status410.Add(1)
-	case http.StatusRequestEntityTooLarge:
-		s.stats.status413.Add(1)
-	case http.StatusBadGateway:
-		s.stats.status502.Add(1)
 	case http.StatusInternalServerError:
 		s.stats.status500.Add(1)
 	}

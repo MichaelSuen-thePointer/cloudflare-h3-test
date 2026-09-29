@@ -136,62 +136,6 @@ func (s *session) countWSReadError(ln *wsLane) {
 	}
 }
 
-func (s *session) countPostStart(ln *lane) {
-	if s.metrics {
-		ln.requests.Add(1)
-		ln.posts.Add(1)
-	}
-}
-
-func (s *session) countRequestDone(ln *lane) {
-	if s.metrics {
-		ln.requests.Add(-1)
-	}
-}
-
-func (s *session) countPostOK(ln *lane) {
-	if s.metrics {
-		ln.postOK.Add(1)
-	}
-}
-
-func (s *session) countPostError(ln *lane) {
-	if s.metrics {
-		ln.postErr.Add(1)
-	}
-}
-
-func (s *session) countGetStart(ln *lane) {
-	if s.metrics {
-		ln.requests.Add(1)
-		ln.gets.Add(1)
-	}
-}
-
-func (s *session) countGetOK(ln *lane) {
-	if s.metrics {
-		ln.getOK.Add(1)
-	}
-}
-
-func (s *session) countGetEmpty(ln *lane) {
-	if s.metrics {
-		ln.getEmpty.Add(1)
-	}
-}
-
-func (s *session) countGetError(ln *lane) {
-	if s.metrics {
-		ln.getErr.Add(1)
-	}
-}
-
-func (s *session) countGetTimeout(ln *lane) {
-	if s.metrics {
-		ln.getTO.Add(1)
-	}
-}
-
 func (c *clientState) writeMetrics(path string, interval time.Duration) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
@@ -266,48 +210,6 @@ func (c *clientState) snapshot() map[string]any {
 				"get_empty":         int64(0),
 				"get_errors":        ln.readErr.Load(),
 				"get_timeouts":      int64(0),
-			})
-		}
-		for _, ln := range sess.up {
-			b := ln.inflight.Load()
-			r := ln.requests.Load()
-			inflightBytes += b
-			inflightRequests += r
-			lanes = append(lanes, map[string]any{
-				"session":           sess.id,
-				"direction":         "up",
-				"lane":              ln.index,
-				"inflight_bytes":    b,
-				"inflight_requests": r,
-				"post_started":      ln.posts.Load(),
-				"post_ok":           ln.postOK.Load(),
-				"post_errors":       ln.postErr.Load(),
-				"post_timeouts":     ln.postTO.Load(),
-				"get_started":       ln.gets.Load(),
-				"get_ok":            ln.getOK.Load(),
-				"get_empty":         ln.getEmpty.Load(),
-				"get_errors":        ln.getErr.Load(),
-				"get_timeouts":      ln.getTO.Load(),
-			})
-		}
-		for _, ln := range sess.down {
-			r := ln.requests.Load()
-			inflightRequests += r
-			lanes = append(lanes, map[string]any{
-				"session":           sess.id,
-				"direction":         "down",
-				"lane":              ln.index,
-				"inflight_bytes":    int64(0),
-				"inflight_requests": r,
-				"post_started":      ln.posts.Load(),
-				"post_ok":           ln.postOK.Load(),
-				"post_errors":       ln.postErr.Load(),
-				"post_timeouts":     ln.postTO.Load(),
-				"get_started":       ln.gets.Load(),
-				"get_ok":            ln.getOK.Load(),
-				"get_empty":         ln.getEmpty.Load(),
-				"get_errors":        ln.getErr.Load(),
-				"get_timeouts":      ln.getTO.Load(),
 			})
 		}
 	}
