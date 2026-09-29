@@ -29,6 +29,6 @@ func (s *server) countUDPDown(n int)                               {}
 func (s *server) countSessionMade()                                {}
 func (s *server) countSessionClosed()                              {}
 func (s *server) countUnattachedWS(delta int64)                    {}
-func (s *server) countMethod(method string)                        {}
+func (s *server) countMethod()                                     {}
 func (s *server) countStatus(status int)                           {}
 func (l *serverWSLane) observeDownlink(frames, bytes int)          {}

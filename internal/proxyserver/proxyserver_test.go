@@ -1,7 +1,6 @@
 package proxyserver
 
 import (
-	"bytes"
 	"context"
 	"io"
 	"net"
@@ -16,51 +15,19 @@ import (
 	"cloudflare-h3-test/internal/relay"
 )
 
-func TestHandlePostClosedSessionReturnsGone(t *testing.T) {
-	s := &server{benchEcho: true, sessions: map[string]*session{}}
-	sess := &session{
-		id:    "closed-session",
-		queue: make(chan relay.Frame, 1),
-		done:  make(chan struct{}),
-		ws:    make(map[*relay.WebSocketConn]*serverWSLane),
-	}
-	s.sessions[sess.id] = sess
-	sess.close()
-
-	encoded, err := relay.EncodeFrames([]relay.Frame{{Payload: []byte("payload")}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(encoded))
-	rec := httptest.NewRecorder()
-	s.handlePost(rec, req, sess.id)
-
-	if rec.Code != http.StatusGone {
-		t.Fatalf("status=%d, want %d", rec.Code, http.StatusGone)
-	}
-	if got := len(sess.queue); got != 0 {
-		t.Fatalf("queue len=%d, want 0", got)
-	}
-}
-
-func TestHandleGetClosedSessionWithQueuedPacketReturnsGone(t *testing.T) {
-	s := &server{sessions: map[string]*session{}}
-	sess := &session{
-		id:    "closed-session",
-		queue: make(chan relay.Frame, 1),
-		done:  make(chan struct{}),
-		ws:    make(map[*relay.WebSocketConn]*serverWSLane),
-	}
-	sess.queue <- relay.Frame{Payload: []byte("stale")}
-	s.sessions[sess.id] = sess
-	sess.close()
-
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	rec := httptest.NewRecorder()
-	s.handleGet(rec, req, sess.id)
-
-	if rec.Code != http.StatusGone {
-		t.Fatalf("status=%d, want %d", rec.Code, http.StatusGone)
+func TestLegacyHTTPRelayMethodsAreRejected(t *testing.T) {
+	s := &server{token: "example-token", sessions: map[string]*session{}}
+	for _, method := range []string{http.MethodPost, http.MethodGet, http.MethodDelete} {
+		t.Run(method, func(t *testing.T) {
+			req := httptest.NewRequest(method, "/", nil)
+			req.Header.Set("X-Relay-Token", "example-token")
+			req.Header.Set("X-Relay-Session", "old-session")
+			rec := httptest.NewRecorder()
+			s.handle(rec, req)
+			if rec.Code != http.StatusNotFound || len(s.sessions) != 0 {
+				t.Fatalf("status=%d sessions=%d, want 404 and no session", rec.Code, len(s.sessions))
+			}
+		})
 	}
 }
 
@@ -91,33 +58,6 @@ func TestServerSnapshotIncludesWebSocketLaneDownlinkStats(t *testing.T) {
 	}
 }
 
-func TestHandlePostBenchEcho(t *testing.T) {
-	s := &server{benchEcho: true, sessions: map[string]*session{}}
-	encoded, err := relay.EncodeFrames([]relay.Frame{{PacketID: 7, Payload: []byte("payload")}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(encoded))
-	rec := httptest.NewRecorder()
-	s.handlePost(rec, req, "post-session")
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("post status=%d, want %d", rec.Code, http.StatusNoContent)
-	}
-
-	sess := s.findSession("post-session")
-	if sess == nil {
-		t.Fatal("session not created")
-	}
-	select {
-	case f := <-sess.queue:
-		if f.PacketID != 7 || string(f.Payload) != "payload" {
-			t.Fatalf("frame=%+v, want payload echo", f)
-		}
-	default:
-		t.Fatal("echo frame not queued")
-	}
-}
-
 func TestBenchEchoCopiesViewBackedPayloadBeforeQueue(t *testing.T) {
 	s := &server{benchEcho: true}
 	sess := &session{
@@ -127,7 +67,7 @@ func TestBenchEchoCopiesViewBackedPayloadBeforeQueue(t *testing.T) {
 		ws:    make(map[*relay.WebSocketConn]*serverWSLane),
 	}
 	payload := []byte("payload")
-	if err := s.handleInboundFrame(sess, relay.Frame{PacketID: 9, Payload: payload}); err != nil {
+	if err := s.handleInboundFrameAfterTouch(sess, relay.Frame{PacketID: 9, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
 	copy(payload, "changed")
@@ -600,22 +540,6 @@ func TestServerAttachClearsExpandHintInFlight(t *testing.T) {
 	}
 }
 
-func TestHandlePostBadFrameReturnsBadRequest(t *testing.T) {
-	s := &server{benchEcho: true, sessions: map[string]*session{}}
-	body := []byte("bad stream frame")
-	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
-	rec := httptest.NewRecorder()
-
-	s.handlePost(rec, req, "bad-stream")
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status=%d, want %d", rec.Code, http.StatusBadRequest)
-	}
-	if got := len(s.sessions); got != 0 {
-		t.Fatalf("sessions=%d, want 0", got)
-	}
-}
-
 func TestBadWebSocketUpgradeDoesNotCreateSession(t *testing.T) {
 	s := &server{token: "example-token", sessions: map[string]*session{}}
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -730,7 +654,7 @@ func TestWebSocketPingBeforeAttach(t *testing.T) {
 }
 
 func TestApplyServerPluginEnvMapsAddressesAndOptions(t *testing.T) {
-	opts, err := PluginEnv.ParseOptions("server;token=example-secret;cert=/tmp/cert.pem;key=/tmp/key.pem;require-h3=false;bench-echo;metrics;metrics-out=/tmp/metrics.jsonl;log-level=error;use-syslog;idle=30s;udp-buffer=8192;down-queue=4096;batch-size=5;batch-delay=250us;down-expand-lanes-max=8;down-expand-hint-timeout=15s;ws-socket-send-buffer=262144;ws-socket-recv-buffer=131072")
+	opts, err := PluginEnv.ParseOptions("server;token=example-secret;cert=/tmp/cert.pem;key=/tmp/key.pem;bench-echo;metrics;metrics-out=/tmp/metrics.jsonl;log-level=error;use-syslog;idle=30s;udp-buffer=8192;down-queue=4096;batch-size=5;batch-delay=250us;down-expand-lanes-max=8;down-expand-hint-timeout=15s;ws-socket-send-buffer=262144;ws-socket-recv-buffer=131072")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -749,7 +673,6 @@ func TestApplyServerPluginEnvMapsAddressesAndOptions(t *testing.T) {
 	token := ""
 	metricsOut := ""
 	logLevel := "info"
-	requireH3 := true
 	benchEcho := false
 	metrics := false
 	useSyslog := false
@@ -763,15 +686,15 @@ func TestApplyServerPluginEnvMapsAddressesAndOptions(t *testing.T) {
 	wsSocketSendBuffer := 0
 	wsSocketReceiveBuffer := 0
 
-	err = applyServerPluginEnv(env, &listen, &upstream, &cert, &key, &token, &metricsOut, &logLevel, &requireH3, &benchEcho, &metrics, &useSyslog, &idle, &batchDelay, &downExpandHintTimeout, &udpBuffer, &downQueue, &batchSize, &downExpandLanesMax, &wsSocketSendBuffer, &wsSocketReceiveBuffer)
+	err = applyServerPluginEnv(env, &listen, &upstream, &cert, &key, &token, &metricsOut, &logLevel, &benchEcho, &metrics, &useSyslog, &idle, &batchDelay, &downExpandHintTimeout, &udpBuffer, &downQueue, &batchSize, &downExpandLanesMax, &wsSocketSendBuffer, &wsSocketReceiveBuffer)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if listen != "0.0.0.0:2083" || upstream != "127.0.0.1:8388" {
 		t.Fatalf("listen=%q upstream=%q, want mapped PluginEnv addresses", listen, upstream)
 	}
-	if token != "example-secret" || cert != "/tmp/cert.pem" || key != "/tmp/key.pem" || metricsOut != "/tmp/metrics.jsonl" || logLevel != "error" || !useSyslog || requireH3 || !benchEcho || !metrics || idle != 30*time.Second || udpBuffer != 8192 || downQueue != 4096 || batchSize != 5 || batchDelay != 250*time.Microsecond || downExpandLanesMax != 8 || downExpandHintTimeout != 15*time.Second || wsSocketSendBuffer != 262144 || wsSocketReceiveBuffer != 131072 {
-		t.Fatalf("mapped token=%q cert=%q key=%q metricsOut=%q logLevel=%q useSyslog=%v requireH3=%v benchEcho=%v metrics=%v idle=%v udpBuffer=%d downQueue=%d batchSize=%d batchDelay=%v downExpandLanesMax=%d downExpandHintTimeout=%v wsSendBuf=%d wsRecvBuf=%d", token, cert, key, metricsOut, logLevel, useSyslog, requireH3, benchEcho, metrics, idle, udpBuffer, downQueue, batchSize, batchDelay, downExpandLanesMax, downExpandHintTimeout, wsSocketSendBuffer, wsSocketReceiveBuffer)
+	if token != "example-secret" || cert != "/tmp/cert.pem" || key != "/tmp/key.pem" || metricsOut != "/tmp/metrics.jsonl" || logLevel != "error" || !useSyslog || !benchEcho || !metrics || idle != 30*time.Second || udpBuffer != 8192 || downQueue != 4096 || batchSize != 5 || batchDelay != 250*time.Microsecond || downExpandLanesMax != 8 || downExpandHintTimeout != 15*time.Second || wsSocketSendBuffer != 262144 || wsSocketReceiveBuffer != 131072 {
+		t.Fatalf("mapped token=%q cert=%q key=%q metricsOut=%q logLevel=%q useSyslog=%v benchEcho=%v metrics=%v idle=%v udpBuffer=%d downQueue=%d batchSize=%d batchDelay=%v downExpandLanesMax=%d downExpandHintTimeout=%v wsSendBuf=%d wsRecvBuf=%d", token, cert, key, metricsOut, logLevel, useSyslog, benchEcho, metrics, idle, udpBuffer, downQueue, batchSize, batchDelay, downExpandLanesMax, downExpandHintTimeout, wsSocketSendBuffer, wsSocketReceiveBuffer)
 	}
 }
 

@@ -32,12 +32,3 @@ func (s *session) countWSRequestDone(ln *wsLane)         {}
 func (s *session) countWSPostOK(ln *wsLane)              {}
 func (s *session) countWSPostError(ln *wsLane)           {}
 func (s *session) countWSReadError(ln *wsLane)           {}
-func (s *session) countPostStart(ln *lane)               {}
-func (s *session) countRequestDone(ln *lane)             {}
-func (s *session) countPostOK(ln *lane)                  {}
-func (s *session) countPostError(ln *lane)               {}
-func (s *session) countGetStart(ln *lane)                {}
-func (s *session) countGetOK(ln *lane)                   {}
-func (s *session) countGetEmpty(ln *lane)                {}
-func (s *session) countGetError(ln *lane)                {}
-func (s *session) countGetTimeout(ln *lane)              {}

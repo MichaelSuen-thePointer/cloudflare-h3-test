@@ -1,226 +1,31 @@
-# Cloudflare HTTP/3 UDP Relay Prototype
+# Cloudflare UDP Relay Test Workspace
 
-This workspace contains a prototype for the HTTP/3-over-Cloudflare UDP relay design in `cloudflare-http3-udp-relay-design.md`.
+The production Go relay currently supports WebSocket only. Its old HTTP/3
+relay mode has been removed. A new duplex HTTP/3 implementation is being developed. The independent
+`cmd/cf-h3-post-client` and `cmd/cf-h3-post-server` probes remain available for
+full-duplex HTTP/3-to-HTTP/2 experiments.
 
-## Files
+## Binaries
 
-- `legacy/server.py`: original Python origin-side HTTPS relay prototype.
-- `legacy/client_bench.js`: original Chrome/Node benchmark prototype.
-- `legacy/client_udp_relay.js`: original Chrome/Node UDP relay prototype.
-- `docs/cloudflare-http3-udp-relay-design.md`: design notes and measurement plan.
-- `cmd/udp-proxy`, `cmd/proxy-client`, `cmd/proxy-server`, `cmd/test-client`, `cmd/test-server`: native Go implementation of the relay and its UDP echo test harness.
-- `reports/go-test-quality-report.md`: first native Go deployment and test quality report.
-- `reports/go-throughput-quality-report.md`: throughput sweep report using preferred Cloudflare edge IP `104.17.173.91` and max target `8 MB/s`.
-- `test-results/`: JSON outputs from functional and throughput test runs.
-- `evidence/netlogs/`: Chrome NetLog evidence from earlier HTTP/3 validation runs.
-
-## Go Binaries
-
-`udp-proxy` is the combined entrypoint. It starts client mode by default and starts server mode with `-server`:
+`udp-proxy` starts client mode by default, or server mode with `-server`.
+`proxy-client` and `proxy-server` are separate entrypoints. `test-client` and
+`test-server` provide a UDP echo test harness.
 
 ```powershell
+.\bin\udp-proxy.exe -server -listen 127.0.0.1:18083 -upstream 127.0.0.1:19090
 .\bin\udp-proxy.exe -listen 127.0.0.1:15353 -remote http://127.0.0.1:18083/ -transport ws
-.\bin\udp-proxy.exe -server -listen 127.0.0.1:18083 -upstream 127.0.0.1:19090 -require-h3=false
 ```
 
-PluginEnv mode uses the same split: server mode is selected through the standard plugin option marker; otherwise `udp-proxy` starts client mode. The legacy `proxy-client` and `proxy-server` binaries are still built and keep their original flags.
+The WebSocket upgrade carries `X-Relay-Token`. The first binary control
+message binds the lane to a session with `ATTACH`; the server replies with
+`ATTACH_OK`. Subsequent binary messages carry UDP relay frames in both
+directions. The server rejects ordinary HTTP relay requests.
 
-## Request Model
+## Metrics
 
-HTTP/3 relay requests use:
+Metrics counters are disabled in the default build. Build with `-tags metrics`
+to enable them. Both proxy binaries accept `-metrics` and `-metrics-out`; a
+JSONL output path also enables metrics. The client additionally accepts
+`-metrics-interval` (default `1s`). Server metrics without an output path are
+written to the process log.
 
-```text
-X-Relay-Token: <shared-token>
-X-Relay-Session: <session-id>
-```
-
-WebSocket relay connections use `X-Relay-Token` during upgrade, then attach a session with the first WebSocket binary control frame. WebSocket upgrades no longer accept `X-Relay-Session` as the session binding.
-
-UDP uplink:
-
-```text
-POST /
-```
-
-UDP downlink:
-
-```text
-GET /
-```
-
-UDP close:
-
-```text
-DELETE /
-```
-
-The deployed Cloudflare request transform should add:
-
-```text
-X-Client-HTTP-Version: http.request.version
-```
-
-Run the server with `--require-h3` when testing through Cloudflare.
-
-## Current Deployment
-
-As of 2026-05-30, the prototype server is deployed on the origin:
-
-```text
-host: 203.0.113.10
-ssh: admin@203.0.113.10 -p29975
-port: 2083
-pid file: /tmp/h3_udp_relay_2083.pid
-server file: /tmp/h3_udp_relay_server.py
-stdout: /tmp/h3_udp_relay_2083.out
-stderr: /tmp/h3_udp_relay_2083.err
-```
-
-It was started with:
-
-```text
-python3 /tmp/h3_udp_relay_server.py \
-  --port 2083 \
-  --cert ~/.acme.sh/relay.example.com_ecc/fullchain.cer \
-  --key ~/.acme.sh/relay.example.com_ecc/relay.example.com.key \
-  --require-h3 \
-  --down-hold 2 \
-  --session-idle-timeout 120
-```
-
-Do not touch existing services on `2053` or `2087`.
-
-## Verified Runs
-
-UDP wrapper functional test through Cloudflare HTTP/3:
-
-```text
-local UDP payload -> client_udp_relay.js -> Chrome HTTP/3 -> Cloudflare -> server bench-echo -> long-poll downlink -> local UDP response
-```
-
-Result:
-
-```json
-{
-  "sent": "udp-wrapper-test-1780148497511",
-  "received": "udp-wrapper-test-1780148497511",
-  "ok": true
-}
-```
-
-Benchmark run through Cloudflare HTTP/3:
-
-```text
-packets: 20
-payload_size: 300 bytes
-lanes: 4
-down_polls: 2
-```
-
-Result:
-
-```json
-{
-  "sent": 20,
-  "received": 20,
-  "lost": 0,
-  "lossRate": 0,
-  "goodputMbps": 0.003092683869720692,
-  "rttMs": {
-    "min": 1167.699999988079,
-    "avg": 2148.5500000044703,
-    "p50": 1886.699999988079,
-    "p90": 3643.800000011921,
-    "p95": 3644.100000023842,
-    "p99": 3644.100000023842,
-    "max": 4162.4000000059605
-  },
-  "errorCount": 0
-}
-```
-
-Chrome NetLog evidence from `chrome-relay-bench-netlog.json`:
-
-```json
-{
-  "quicSessions": 3,
-  "http3HeadersSent": 66
-}
-```
-
-## Native Go Verified Run
-
-The native Go implementation was built and tested on 2026-05-30:
-
-```text
-Windows:
-  bin/proxy-client.exe
-  bin/test-client.exe
-
-Origin 203.0.113.10:
-  /tmp/proxy-server-linux-amd64 on :2083
-  /tmp/test-server-linux-amd64 on 127.0.0.1:19090/udp
-```
-
-Result:
-
-```json
-{
-  "sent": 30,
-  "received": 30,
-  "lost": 0,
-  "loss_rate": 0,
-  "goodput_mbps": 0.024246007263497626,
-  "rtt_avg_ms": 2413.165,
-  "rtt_p95_ms": 2941.467
-}
-```
-
-See `reports/go-test-quality-report.md` for details.
-
-## Native Go Throughput Sweep
-
-`test-client` now supports:
-
-```text
--mode sweep
--rates 0.01,0.025,0.05,0.1,0.25,0.5,1,2,4,8
--max-mbps 8
-```
-
-`proxy-client` now supports:
-
-```text
--connect-ip 104.17.173.91
-```
-
-## Native Go Runtime Metrics
-
-Runtime metrics are disabled by default for release-style runs.
-
-`proxy-client` supports:
-
-```text
--log-level info
--use-syslog
--metrics
--metrics-out test-results/metrics-proxy-client.jsonl
--metrics-interval 1s
-```
-
-`-metrics-out` also enables metrics so existing benchmark commands keep working.
-`-log-level` accepts `debug`, `info`, `warn`, or `error`; default `info` keeps per-session and per-packet noise out of process logs.
-Without `-use-syslog`, Go `log` writes stderr timestamps with microseconds. `-use-syslog` sends diagnostic logs to syslog/logread, so messages omit the program's own timestamp.
-
-`proxy-server` supports:
-
-```text
--log-level info
--use-syslog
--metrics
--metrics-out test-results/metrics-proxy-server.jsonl
-```
-
-When `-metrics-out` is omitted, `proxy-server -metrics` writes periodic `proxy-server-metrics` JSON records to the process log for compatibility.
-
-The first sweep reached the configured `8 MB/s` target stage, but the current one-packet-per-HTTP3-POST prototype did not sustain high throughput. Maximum observed goodput was about `0.0205 MB/s`, and no stage met the strict loss/latency/reorder sustainability thresholds. See `reports/go-throughput-quality-report.md` and `test-results/go-throughput-sweep-report-preferred-ip.json`.

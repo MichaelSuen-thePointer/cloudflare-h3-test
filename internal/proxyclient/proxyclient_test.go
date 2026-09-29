@@ -45,7 +45,6 @@ func TestEnsureWebSocketLanesDoesNotAppendAfterClose(t *testing.T) {
 		cancel: cancel,
 		closed: make(chan struct{}),
 		ready:  make(chan struct{}),
-		posts:  make(chan struct{}, 1),
 		sendQ:  make(chan []byte, 1),
 		batchQ: make(chan []relay.Frame, 2),
 	}
@@ -118,7 +117,6 @@ func TestInitialWebSocketConnectFailureClosesSession(t *testing.T) {
 		cancel: cancel,
 		closed: make(chan struct{}),
 		ready:  make(chan struct{}),
-		posts:  make(chan struct{}, 1),
 		sendQ:  make(chan []byte, 1),
 	}
 	peerKey := netip.MustParseAddrPort("127.0.0.1:12345")
@@ -170,7 +168,6 @@ func TestInitialIncrementalWebSocketConnectsOneLane(t *testing.T) {
 		cancel: cancel,
 		closed: make(chan struct{}),
 		ready:  make(chan struct{}),
-		posts:  make(chan struct{}, 1),
 		sendQ:  make(chan []byte, 1),
 	}
 	defer sess.close()
@@ -230,7 +227,6 @@ func TestEnsureWebSocketLanesClosesSuccessfulLaneAfterParallelFailure(t *testing
 		cancel: cancel,
 		closed: make(chan struct{}),
 		ready:  make(chan struct{}),
-		posts:  make(chan struct{}, 1),
 		sendQ:  make(chan []byte, 1),
 	}
 	c := &clientState{
@@ -276,7 +272,6 @@ func TestIncrementalWebSocketLaneAddsLaneWhenBatchQueueBacklogged(t *testing.T) 
 		cancel: cancel,
 		closed: make(chan struct{}),
 		ready:  make(chan struct{}),
-		posts:  make(chan struct{}, 1),
 		sendQ:  make(chan []byte, 1),
 		batchQ: make(chan []relay.Frame, 2),
 	}
@@ -288,7 +283,6 @@ func TestIncrementalWebSocketLaneAddsLaneWhenBatchQueueBacklogged(t *testing.T) 
 		timeout:            time.Second,
 	}
 	sess.state = c
-	sess.wsMode = true
 	sess.ws = append(sess.ws, &wsLane{index: 0})
 	publishTestWSSnapshot(sess)
 	defer sess.close()
@@ -320,7 +314,6 @@ func TestIncrementalWebSocketLaneDoesNotAddLaneForSingleQueuedBatch(t *testing.T
 		cancel: cancel,
 		closed: make(chan struct{}),
 		ready:  make(chan struct{}),
-		posts:  make(chan struct{}, 1),
 		batchQ: make(chan []relay.Frame, 2),
 	}
 	defer sess.close()
@@ -330,7 +323,6 @@ func TestIncrementalWebSocketLaneDoesNotAddLaneForSingleQueuedBatch(t *testing.T
 		timeout:            50 * time.Millisecond,
 	}
 	sess.state = c
-	sess.wsMode = true
 	sess.ws = append(sess.ws, &wsLane{index: 0})
 	publishTestWSSnapshot(sess)
 	sess.batchQ <- []relay.Frame{{PacketID: 1, Payload: []byte("single")}}
@@ -416,7 +408,6 @@ func TestWebSocketExpandHintDoesNotTriggerWhenIncrementalDisabled(t *testing.T) 
 		cancel:  cancel,
 		closed:  make(chan struct{}),
 		ready:   make(chan struct{}),
-		posts:   make(chan struct{}, 1),
 		batchQ:  make(chan []relay.Frame, 2),
 		stats:   stats,
 		metrics: true,
@@ -424,7 +415,6 @@ func TestWebSocketExpandHintDoesNotTriggerWhenIncrementalDisabled(t *testing.T) 
 	defer sess.close()
 	c := &clientState{wsLanesN: 2, wsLanesIncremental: false, stats: stats, metrics: true}
 	sess.state = c
-	sess.wsMode = true
 	sess.expandHintPending.Store(true)
 
 	sess.maybeAcquireIncrementalWebSocketLane()
@@ -447,7 +437,6 @@ func TestWebSocketExpandHintShortCircuitsWhenMaxLaneOne(t *testing.T) {
 		cancel:  cancel,
 		closed:  make(chan struct{}),
 		ready:   make(chan struct{}),
-		posts:   make(chan struct{}, 1),
 		batchQ:  make(chan []relay.Frame, 2),
 		stats:   stats,
 		metrics: true,
@@ -455,7 +444,6 @@ func TestWebSocketExpandHintShortCircuitsWhenMaxLaneOne(t *testing.T) {
 	defer sess.close()
 	c := &clientState{wsLanesN: 1, wsLanesIncremental: true, stats: stats, metrics: true}
 	sess.state = c
-	sess.wsMode = true
 	sess.ws = append(sess.ws, &wsLane{index: 0})
 	publishTestWSSnapshot(sess)
 	sess.expandHintPending.Store(true)
@@ -490,7 +478,6 @@ func TestWebSocketExpandHintTriggersIncrementalLane(t *testing.T) {
 		cancel:  cancel,
 		closed:  make(chan struct{}),
 		ready:   make(chan struct{}),
-		posts:   make(chan struct{}, 1),
 		sendQ:   make(chan []byte, 1),
 		batchQ:  make(chan []relay.Frame, 2),
 		stats:   stats,
@@ -506,7 +493,6 @@ func TestWebSocketExpandHintTriggersIncrementalLane(t *testing.T) {
 		metrics:            true,
 	}
 	sess.state = c
-	sess.wsMode = true
 	sess.ws = append(sess.ws, &wsLane{index: 0})
 	publishTestWSSnapshot(sess)
 	defer sess.close()
@@ -546,7 +532,6 @@ func TestWebSocketSingleLaneSendBatchUsesBatchQueue(t *testing.T) {
 		cancel: cancel,
 		closed: make(chan struct{}),
 		ready:  make(chan struct{}),
-		posts:  make(chan struct{}, 1),
 		sendQ:  make(chan []byte, 1),
 		batchQ: make(chan []relay.Frame, 1),
 	}
@@ -556,7 +541,6 @@ func TestWebSocketSingleLaneSendBatchUsesBatchQueue(t *testing.T) {
 		wsLanesIncremental: false,
 	}
 	sess.state = c
-	sess.wsMode = true
 	sess.ws = append(sess.ws, &wsLane{index: 0})
 	publishTestWSSnapshot(sess)
 	close(sess.ready)
@@ -590,7 +574,6 @@ func TestIncrementalWebSocketLaneAcquireFailureKeepsSession(t *testing.T) {
 		cancel: cancel,
 		closed: make(chan struct{}),
 		ready:  make(chan struct{}),
-		posts:  make(chan struct{}, 1),
 		sendQ:  make(chan []byte, 1),
 		batchQ: make(chan []relay.Frame, 2),
 	}
@@ -603,7 +586,6 @@ func TestIncrementalWebSocketLaneAcquireFailureKeepsSession(t *testing.T) {
 		timeout:            50 * time.Millisecond,
 	}
 	sess.state = c
-	sess.wsMode = true
 	sess.ws = append(sess.ws, &wsLane{index: 0})
 	publishTestWSSnapshot(sess)
 	sess.batchQ <- []relay.Frame{{PacketID: 1, Payload: []byte("backlog-1")}}
@@ -639,7 +621,6 @@ func TestIncrementalWebSocketLaneDoesNotReservePastMax(t *testing.T) {
 		cancel: cancel,
 		closed: make(chan struct{}),
 		ready:  make(chan struct{}),
-		posts:  make(chan struct{}, 1),
 		sendQ:  make(chan []byte, 1),
 	}
 	defer sess.close()
@@ -903,8 +884,6 @@ func TestApplyClientPluginEnvMapsAddressesAndOptions(t *testing.T) {
 	logLevel := "info"
 	wsLanesN := 12
 	wsPoolSize := 3
-	polls := 2
-	maxInflightPosts := 20
 	batchSize := 3
 	sendQueue := 4096
 	wsSocketSendBuffer := 0
@@ -918,7 +897,7 @@ func TestApplyClientPluginEnvMapsAddressesAndOptions(t *testing.T) {
 	idle := 120 * time.Second
 	metricsOut := ""
 
-	err = applyClientPluginEnv(env, &listen, &remote, &token, &connectIP, &transport, &logLevel, &wsLanesN, &wsPoolSize, &polls, &maxInflightPosts, &batchSize, &sendQueue, &wsSocketSendBuffer, &wsSocketReceiveBuffer, &wsLanesIncremental, &metrics, &useSyslog, &timeout, &metricsInterval, &batchDelay, &idle, &metricsOut)
+	err = applyClientPluginEnv(env, &listen, &remote, &token, &connectIP, &transport, &logLevel, &wsLanesN, &wsPoolSize, &batchSize, &sendQueue, &wsSocketSendBuffer, &wsSocketReceiveBuffer, &wsLanesIncremental, &metrics, &useSyslog, &timeout, &metricsInterval, &batchDelay, &idle, &metricsOut)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -944,7 +923,7 @@ func TestApplyClientPluginEnvTLSFalse(t *testing.T) {
 	env := PluginEnv.Env{Enabled: true, RemoteHost: "example.com", RemotePort: "80", LocalHost: "127.0.0.1", LocalPort: "1080", Options: opts}
 	listen, remote, token, connectIP, transport := "", "", "", "", "ws"
 	logLevel := "info"
-	wsLanesN, polls, maxInflightPosts, batchSize, sendQueue := 12, 2, 20, 3, 4096
+	wsLanesN, batchSize, sendQueue := 12, 3, 4096
 	wsPoolSize := 10
 	wsSocketSendBuffer, wsSocketReceiveBuffer := 0, 0
 	wsLanesIncremental, metrics := false, false
@@ -952,7 +931,7 @@ func TestApplyClientPluginEnvTLSFalse(t *testing.T) {
 	timeout, metricsInterval, batchDelay, idle := 15*time.Second, time.Second, time.Millisecond, 120*time.Second
 	metricsOut := ""
 
-	if err := applyClientPluginEnv(env, &listen, &remote, &token, &connectIP, &transport, &logLevel, &wsLanesN, &wsPoolSize, &polls, &maxInflightPosts, &batchSize, &sendQueue, &wsSocketSendBuffer, &wsSocketReceiveBuffer, &wsLanesIncremental, &metrics, &useSyslog, &timeout, &metricsInterval, &batchDelay, &idle, &metricsOut); err != nil {
+	if err := applyClientPluginEnv(env, &listen, &remote, &token, &connectIP, &transport, &logLevel, &wsLanesN, &wsPoolSize, &batchSize, &sendQueue, &wsSocketSendBuffer, &wsSocketReceiveBuffer, &wsLanesIncremental, &metrics, &useSyslog, &timeout, &metricsInterval, &batchDelay, &idle, &metricsOut); err != nil {
 		t.Fatal(err)
 	}
 	if remote != "http://example.com:80/" {
