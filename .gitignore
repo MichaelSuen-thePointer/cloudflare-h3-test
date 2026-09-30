@@ -1,5 +1,7 @@
 bin/
 .gocache/
+.gobuildcache/
+.go-build-cache/
 *.log
 chrome-*-profile/
 *.tmp

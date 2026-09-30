@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"net"
 	"net/http"
 	"net/url"
@@ -16,6 +17,7 @@ type HTTP3ClientOptions struct {
 	URL       string
 	Timeout   time.Duration
 	ConnectIP string
+	RootCAs   *x509.CertPool
 }
 
 func NewHTTP3Client(rawURL string, timeout time.Duration) (*http.Client, func() error, error) {
@@ -32,6 +34,7 @@ func NewHTTP3ClientWithOptions(opts HTTP3ClientOptions) (*http.Client, func() er
 		TLSClientConfig: &tls.Config{
 			ServerName: u.Hostname(),
 			NextProtos: []string{"h3"},
+			RootCAs:    opts.RootCAs,
 		},
 		DisableCompression: true,
 	}
