@@ -1,5 +1,7 @@
 package relay
 
+import "context"
+
 type MessageStream interface {
 	// WriteMessage leaves the caller's payload unchanged.
 	WriteMessage(payload []byte) error
@@ -7,6 +9,13 @@ type MessageStream interface {
 	WriteMessageOwned(payload []byte) error
 	ReadMessage() ([]byte, error)
 	Close() error
+}
+
+// AttachableMessageStream is a ready stream before it joins a UDP session.
+type AttachableMessageStream interface {
+	MessageStream
+	Attach(context.Context, string) error
+	Probe(context.Context) error
 }
 
 type MessageViewReader interface {

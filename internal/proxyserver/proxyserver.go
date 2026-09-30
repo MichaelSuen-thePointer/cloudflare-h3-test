@@ -220,8 +220,37 @@ func (s *server) handle(w http.ResponseWriter, r *http.Request) {
 		s.handleWebSocket(w, r)
 		return
 	}
+	if r.Method == http.MethodPost && r.URL.Path == "/" && r.Header.Get("X-Client-HTTP-Version") == "HTTP/3" {
+		s.handleH3Stream(w, r)
+		return
+	}
 	s.countStatus(http.StatusNotFound)
 	http.NotFound(w, r)
+}
+
+func (s *server) handleH3Stream(w http.ResponseWriter, r *http.Request) {
+	if r.ProtoMajor == 1 {
+		if err := http.NewResponseController(w).EnableFullDuplex(); err != nil {
+			s.countStatus(http.StatusInternalServerError)
+			http.Error(w, "full duplex unavailable", http.StatusInternalServerError)
+			return
+		}
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-store, no-transform")
+	w.WriteHeader(http.StatusOK)
+	s.countStatus(http.StatusOK)
+	if err := http.NewResponseController(w).Flush(); err != nil {
+		return
+	}
+	stream := &h3ServerStream{requestBody: r.Body, response: w}
+	id, err := readH3AttachSession(stream)
+	if err != nil {
+		_ = stream.Close()
+		appLog.WarnRate("h3_attach_failed", 10*time.Second, "h3-attach-failed", "remote", r.RemoteAddr, "err", err)
+		return
+	}
+	s.serveAttachedStream(stream, "h3", id, r.RemoteAddr, r.Context().Done())
 }
 
 func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {

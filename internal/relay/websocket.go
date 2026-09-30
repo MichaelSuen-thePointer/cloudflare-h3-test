@@ -39,6 +39,7 @@ type WebSocketConn struct {
 }
 
 var _ MessageStream = (*WebSocketConn)(nil)
+var _ AttachableMessageStream = (*WebSocketConn)(nil)
 var _ MessageViewReader = (*WebSocketConn)(nil)
 
 type WebSocketSocketOptions struct {
@@ -50,7 +51,7 @@ func DialWebSocket(ctx context.Context, rawURL, connectIP, token string, timeout
 	return DialWebSocketWithOptions(ctx, rawURL, connectIP, token, timeout, WebSocketSocketOptions{})
 }
 
-func DialWebSocketWithOptions(ctx context.Context, rawURL, connectIP, token string, timeout time.Duration, socketOptions WebSocketSocketOptions) (*WebSocketConn, error) {
+func DialWebSocketWithOptions(ctx context.Context, rawURL, connectIP, token string, timeout time.Duration, socketOptions WebSocketSocketOptions) (result *WebSocketConn, err error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, err
@@ -86,12 +87,20 @@ func DialWebSocketWithOptions(ctx context.Context, rawURL, connectIP, token stri
 		}
 		conn = tlsConn
 	}
-	stopCancelDeadline := context.AfterFunc(ctx, func() {
-		_ = conn.SetDeadline(time.Now())
+	cancelDone := make(chan struct{})
+	stopCancelClose := context.AfterFunc(ctx, func() {
+		defer close(cancelDone)
+		_ = conn.Close()
 	})
 	defer func() {
-		if stopCancelDeadline() {
-			_ = conn.SetDeadline(time.Time{})
+		if !stopCancelClose() {
+			<-cancelDone
+		}
+		_ = conn.SetDeadline(time.Time{})
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			_ = conn.Close()
+			result = nil
+			err = ctxErr
 		}
 	}()
 	path := u.RequestURI()
@@ -135,22 +144,31 @@ func DialWebSocketWithOptions(ctx context.Context, rawURL, connectIP, token stri
 	return &WebSocketConn{conn: conn, reader: br, mask: true, writeTimeout: normalizeWebSocketWriteTimeout(timeout)}, nil
 }
 
-func AttachWebSocketSession(ctx context.Context, ws *WebSocketConn, sessionID string) error {
+func AttachWebSocketSession(ctx context.Context, ws *WebSocketConn, sessionID string) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	body, err := EncodeAttach(sessionID)
 	if err != nil {
 		return err
 	}
-	stopCancelDeadline := context.AfterFunc(ctx, func() {
-		_ = ws.SetDeadline(time.Now())
+	cancelDone := make(chan struct{})
+	stopCancelClose := context.AfterFunc(ctx, func() {
+		defer close(cancelDone)
+		_ = ws.Close()
 	})
 	defer func() {
-		if stopCancelDeadline() {
-			_ = ws.SetDeadline(time.Time{})
+		if !stopCancelClose() {
+			<-cancelDone
+		}
+		_ = ws.SetDeadline(time.Time{})
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			_ = ws.Close()
+			err = ctxErr
 		}
 	}()
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = ws.SetDeadline(deadline)
-		defer ws.SetDeadline(time.Time{})
 	}
 	if err := ws.WriteMessage(body); err != nil {
 		return err
@@ -167,6 +185,32 @@ func AttachWebSocketSession(ctx context.Context, ws *WebSocketConn, sessionID st
 		return fmt.Errorf("bad attach ack")
 	}
 	return nil
+}
+
+func (c *WebSocketConn) Attach(ctx context.Context, sessionID string) error {
+	return AttachWebSocketSession(ctx, c, sessionID)
+}
+
+func (c *WebSocketConn) Probe(ctx context.Context) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	cancelDone := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(cancelDone)
+		_ = c.Close()
+	})
+	defer func() {
+		if !stop() {
+			<-cancelDone
+		}
+		_ = c.SetDeadline(time.Time{})
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			_ = c.Close()
+			err = ctxErr
+		}
+	}()
+	return c.Ping(nil)
 }
 
 func AcceptWebSocket(w http.ResponseWriter, r *http.Request) (*WebSocketConn, error) {
@@ -468,11 +512,17 @@ func (c *WebSocketConn) writeControl(opcode byte, payload []byte) error {
 		if _, err := c.conn.Write(hdr); err != nil {
 			return err
 		}
+		if len(masked) == 0 {
+			return nil
+		}
 		_, err := c.conn.Write(masked)
 		return err
 	}
 	if _, err := c.conn.Write(hdr); err != nil {
 		return err
+	}
+	if len(payload) == 0 {
+		return nil
 	}
 	_, err := c.conn.Write(payload)
 	return err

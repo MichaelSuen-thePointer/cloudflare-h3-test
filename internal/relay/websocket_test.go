@@ -20,6 +20,105 @@ import (
 	"time"
 )
 
+func TestWebSocketProbeCancellation(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	ws := &WebSocketConn{conn: client, writeTimeout: time.Second}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := ws.Probe(ctx); err != context.DeadlineExceeded {
+		t.Fatalf("probe error=%v, want context deadline", err)
+	}
+	if _, err := client.Write([]byte("x")); err == nil {
+		t.Fatal("canceled probe left connection open")
+	}
+}
+
+func TestWebSocketAttachCancellationUnblocksWrite(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer serverConn.Close()
+	ws := &WebSocketConn{conn: clientConn, reader: bufio.NewReader(clientConn), mask: true, writeTimeout: time.Second}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := ws.Attach(ctx, "session"); err != context.DeadlineExceeded {
+		t.Fatalf("attach error=%v, want context deadline", err)
+	}
+}
+
+func TestWebSocketProbeSuccessDetachesCancellation(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	ws := &WebSocketConn{conn: client}
+	readDone := make(chan error, 1)
+	go func() {
+		var ping [2]byte
+		_, err := io.ReadFull(server, ping[:])
+		readDone <- err
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := ws.Probe(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-readDone; err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	go func() {
+		var binaryMessage [3]byte
+		_, err := io.ReadFull(server, binaryMessage[:])
+		readDone <- err
+	}()
+	if err := ws.WriteMessage([]byte("x")); err != nil {
+		t.Fatalf("canceled completed probe affected connection: %v", err)
+	}
+	if err := <-readDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWebSocketAttachSuccessDetachesCancellation(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	client := &WebSocketConn{conn: clientConn, reader: bufio.NewReader(clientConn), mask: true}
+	server := &WebSocketConn{conn: serverConn, reader: bufio.NewReader(serverConn)}
+	serverDone := make(chan error, 1)
+	go func() {
+		body, err := server.ReadMessage()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		op, payload, err := DecodeControl(body)
+		if err != nil || op != ControlOpAttach || string(payload) != "session" {
+			serverDone <- errors.New("bad attach message")
+			return
+		}
+		ack, _ := EncodeControl(ControlOpAttachOK, nil)
+		if err := server.WriteMessage(ack); err != nil {
+			serverDone <- err
+			return
+		}
+		body, err = server.ReadMessage()
+		if err == nil && string(body) != "next" {
+			err = errors.New("bad post-attach message")
+		}
+		serverDone <- err
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := client.Attach(ctx, "session"); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if err := client.WriteMessage([]byte("next")); err != nil {
+		t.Fatalf("canceled completed attach affected connection: %v", err)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDialWebSocketTLSSessionResumption(t *testing.T) {
 	// Isolate the test trust store from other tests and the host's root store.
 	const childEnv = "RELAY_TEST_TLS_RESUMPTION_CHILD"
