@@ -125,8 +125,10 @@ func TestH3MessageStreamOverQUIC(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	stream, err := NewH3MessageStream(ctx, HTTP3ClientOptions{
-		URL:     serverURL,
-		RootCAs: certs,
+		URL:                serverURL,
+		ConnectIP:          "127.0.0.1",
+		RootCAs:            certs,
+		QUICReceiveWindows: QUICReceiveWindows{InitialStream: 8 << 20, MaxStream: 32 << 20, InitialConnection: 16 << 20, MaxConnection: 64 << 20},
 	}, "token")
 	if err != nil {
 		t.Fatal(err)

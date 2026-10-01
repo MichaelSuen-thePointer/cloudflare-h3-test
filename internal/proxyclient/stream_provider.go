@@ -113,6 +113,9 @@ func newH3Provider(opts relay.HTTP3ClientOptions, token string, maxStreams int, 
 	if maxStreams <= 0 {
 		return nil, errors.New("h3-streams-per-transport must be positive")
 	}
+	if err := opts.QUICReceiveWindows.Validate(); err != nil {
+		return nil, err
+	}
 	return &h3Provider{opts: opts, token: token, maxStreams: maxStreams, counters: providerStats{enabled: metrics}}, nil
 }
 
