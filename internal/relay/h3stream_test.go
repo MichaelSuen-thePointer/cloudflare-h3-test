@@ -121,20 +121,52 @@ func TestDuplexMessageStreamOverHTTP2(t *testing.T) {
 }
 
 func TestH3MessageStreamOverQUIC(t *testing.T) {
+	serverURL, certs := newH3EchoServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	stream, err := NewH3MessageStream(ctx, HTTP3ClientOptions{
+		URL:     serverURL,
+		RootCAs: certs,
+	}, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	if err := stream.Attach(ctx, "session"); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.WriteMessage([]byte("uplink")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := stream.ReadMessage()
+	if err != nil || string(got) != "uplink" {
+		t.Fatalf("downlink=%q err=%v", got, err)
+	}
+}
+
+func newH3EchoServer(t *testing.T) (string, *x509.CertPool) {
+	t.Helper()
 	certificateServer := httptest.NewTLSServer(http.NotFoundHandler())
-	defer certificateServer.Close()
 	certs := x509.NewCertPool()
 	certs.AddCert(certificateServer.Certificate())
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
+		certificateServer.Close()
 		t.Fatal(err)
 	}
-	defer packetConn.Close()
 	server := &http3.Server{
 		TLSConfig: &tls.Config{Certificates: certificateServer.TLS.Certificates},
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.ProtoMajor != 3 || r.Header.Get("X-Relay-Token") != "token" {
 				t.Errorf("request proto=%s token=%q", r.Proto, r.Header.Get("X-Relay-Token"))
+				return
+			}
+			switch r.URL.Path {
+			case "/status":
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			case "/blocked":
+				<-r.Context().Done()
 				return
 			}
 			w.WriteHeader(http.StatusOK)
@@ -168,27 +200,95 @@ func TestH3MessageStreamOverQUIC(t *testing.T) {
 			}
 		}),
 	}
-	defer server.Close()
+	t.Cleanup(func() {
+		_ = server.Close()
+		_ = packetConn.Close()
+		certificateServer.Close()
+	})
 	go func() { _ = server.Serve(packetConn) }()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	stream, err := NewH3MessageStream(ctx, HTTP3ClientOptions{
-		URL:     "https://" + packetConn.LocalAddr().String(),
-		RootCAs: certs,
-	}, "token")
+	return "https://" + packetConn.LocalAddr().String(), certs
+}
+
+func TestH3BorrowedTransportSurvivesStreamCloseAndSetupFailures(t *testing.T) {
+	serverURL, certs := newH3EchoServer(t)
+	transport, err := NewHTTP3TransportWithOptions(HTTP3ClientOptions{URL: serverURL, RootCAs: certs})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer stream.Close()
-	if err := stream.Attach(ctx, "session"); err != nil {
+	t.Cleanup(func() { _ = transport.Close() })
+	if _, err := NewH3MessageStreamOnTransport(context.Background(), nil, serverURL, "token"); err == nil {
+		t.Fatal("nil transport accepted")
+	}
+	if _, err := NewH3MessageStreamOnTransport(context.Background(), transport, "http://example.com/", "token"); err == nil {
+		t.Fatal("invalid URL accepted")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	first, err := NewH3MessageStreamOnTransport(ctx, transport, serverURL, "token")
+	if err != nil {
+		cancel()
 		t.Fatal(err)
 	}
-	if err := stream.WriteMessage([]byte("uplink")); err != nil {
+	defer first.Close()
+	second, err := NewH3MessageStreamOnTransport(ctx, transport, serverURL, "token")
+	cancel() // setup deadline must not end either active request
+	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := stream.ReadMessage()
-	if err != nil || string(got) != "uplink" {
-		t.Fatalf("downlink=%q err=%v", got, err)
+	defer second.Close()
+	attachCtx, attachCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer attachCancel()
+	if err := first.Attach(attachCtx, "first"); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Attach(attachCtx, "second"); err != nil {
+		t.Fatal(err)
+	}
+	readDone := make(chan error, 1)
+	go func() { _, err := first.ReadMessage(); readDone <- err }()
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-readDone:
+		if err == nil {
+			t.Fatal("read succeeded after borrowed stream close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("borrowed stream close did not unblock read")
+	}
+	if err := second.WriteMessage([]byte("still-open")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := second.ReadMessage()
+	if err != nil || string(got) != "still-open" {
+		t.Fatalf("remaining stream message=%q err=%v", got, err)
+	}
+	if _, err := NewH3MessageStreamOnTransport(attachCtx, transport, serverURL+"/status", "token"); err == nil {
+		t.Fatal("non-200 response accepted")
+	}
+	blockedCtx, blockedCancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	_, err = NewH3MessageStreamOnTransport(blockedCtx, transport, serverURL+"/blocked", "token")
+	blockedCancel()
+	if err != context.DeadlineExceeded {
+		t.Fatalf("blocked setup error=%v, want deadline", err)
+	}
+	third, err := NewH3MessageStreamOnTransport(attachCtx, transport, serverURL, "token")
+	if err != nil {
+		t.Fatalf("transport unusable after borrowed setup failures: %v", err)
+	}
+	defer third.Close()
+	if err := third.Attach(attachCtx, "third"); err != nil {
+		t.Fatal(err)
+	}
+	if err := third.WriteMessage([]byte("reused")); err != nil {
+		t.Fatal(err)
+	}
+	got, err = third.ReadMessage()
+	if err != nil || string(got) != "reused" {
+		t.Fatalf("reused stream message=%q err=%v", got, err)
 	}
 }
 
@@ -246,6 +346,38 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return f(request)
+}
+
+func TestDuplexMessageStreamOwnedTransportClosesOnce(t *testing.T) {
+	closes := 0
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(nil))}, nil
+	})
+	stream, err := openDuplexMessageStream(context.Background(), transport, func() error {
+		closes++
+		return nil
+	}, "https://example.com/", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if closes != 1 {
+		t.Fatalf("transport closed %d times, want 1", closes)
+	}
+	if _, err := openDuplexMessageStream(context.Background(), transport, func() error {
+		closes++
+		return nil
+	}, "http://example.com/", "token"); err == nil {
+		t.Fatal("invalid URL accepted")
+	}
+	if closes != 2 {
+		t.Fatalf("transport closed %d times after setup failure, want 2", closes)
+	}
 }
 
 func TestDuplexMessageStreamReadinessCancellation(t *testing.T) {
