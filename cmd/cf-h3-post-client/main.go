@@ -9,7 +9,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/http/httptrace"
+	"net/url"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -27,22 +30,38 @@ var eventMu sync.Mutex
 func main() {
 	var rawURL, connectIP, method string
 	var chunks, chunkSize int
-	var interval, hold, timeout time.Duration
+	var interval, hold, timeout, firstWriteDelay time.Duration
 	var closeBody bool
 	var duplex bool
+	var allowDNS bool
 	var expectedResponseChunks int
 	flag.StringVar(&rawURL, "url", "https://relay.example.com:2096/", "request URL")
 	flag.StringVar(&connectIP, "connect-ip", "", "optional Cloudflare edge IP")
+	flag.BoolVar(&allowDNS, "allow-dns", false, "explicitly allow DNS selection instead of pinning an edge IP")
 	flag.StringVar(&method, "method", http.MethodPost, "HTTP method")
 	flag.IntVar(&chunks, "chunks", 12, "number of body chunks to write")
 	flag.IntVar(&chunkSize, "chunk-size", 64, "bytes per body chunk")
 	flag.DurationVar(&interval, "interval", time.Second, "delay between chunk writes")
+	flag.DurationVar(&firstWriteDelay, "first-write-delay", 0, "delay after request start before the first body write")
 	flag.DurationVar(&hold, "hold", 20*time.Second, "time to keep request body open after writes")
 	flag.DurationVar(&timeout, "timeout", 45*time.Second, "whole request timeout")
 	flag.BoolVar(&closeBody, "close-body", false, "close request body after hold")
 	flag.BoolVar(&duplex, "duplex", false, "record framed response while uploading request body")
 	flag.IntVar(&expectedResponseChunks, "response-chunks", 12, "expected duplex response frames")
 	flag.Parse()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if connectIP != "" && net.ParseIP(connectIP) == nil {
+		log.Fatal("-connect-ip must be a literal IP address")
+	}
+	if connectIP == "" && !allowDNS && u.Hostname() != "localhost" && net.ParseIP(u.Hostname()) == nil {
+		log.Fatal("-connect-ip is required for a hostname; use today's preferred bypass IP, or -allow-dns for an intentional DNS-path test")
+	}
+	if firstWriteDelay < 0 {
+		log.Fatal("-first-write-delay must not be negative")
+	}
 	if duplex && (!closeBody || expectedResponseChunks < 1) {
 		log.Fatal("duplex requires -close-body and positive -response-chunks")
 	}
@@ -67,7 +86,16 @@ func main() {
 	done := make(chan struct{})
 	var bodyClosedAt atomic.Int64
 	var lastWriteAt atomic.Int64
+	var firstWriteStartedAt atomic.Int64
+	var wroteHeadersAt atomic.Int64
 	var successfulWrites atomic.Int64
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		WroteHeaders: func() {
+			at := sinceMS(start)
+			wroteHeadersAt.Store(at)
+			writeEvent(event{"event": "client_request_headers_sent", "t_ms": at})
+		},
+	}))
 	go func() {
 		defer close(done)
 		payload := bytes.Repeat([]byte("x"), chunkSize)
@@ -76,7 +104,12 @@ func main() {
 			case <-ctx.Done():
 				_ = pw.CloseWithError(ctx.Err())
 				return
-			case <-time.After(delayForChunk(i, interval)):
+			case <-time.After(delayForChunk(i, interval, firstWriteDelay)):
+			}
+			if i == 1 {
+				at := sinceMS(start)
+				firstWriteStartedAt.Store(at)
+				writeEvent(event{"event": "client_first_write_start", "t_ms": at})
 			}
 			n, err := pw.Write(payload)
 			at := sinceMS(start)
@@ -106,7 +139,7 @@ func main() {
 		_ = pw.CloseWithError(ctx.Err())
 	}()
 
-	writeEvent(event{"event": "client_request_start", "method": method, "url": rawURL, "connect_ip": connectIP, "chunks": chunks, "chunk_size": chunkSize, "interval_ms": interval.Milliseconds(), "hold_ms": hold.Milliseconds(), "close_body": closeBody, "timeout_ms": timeout.Milliseconds(), "duplex": duplex})
+	writeEvent(event{"event": "client_request_start", "method": method, "url": rawURL, "connect_ip": connectIP, "allow_dns": allowDNS, "chunks": chunks, "chunk_size": chunkSize, "interval_ms": interval.Milliseconds(), "first_write_delay_ms": firstWriteDelay.Milliseconds(), "hold_ms": hold.Milliseconds(), "close_body": closeBody, "timeout_ms": timeout.Milliseconds(), "duplex": duplex})
 	resp, err := client.Do(req)
 	if err != nil {
 		writeEvent(event{"event": "client_response_error", "error": err.Error(), "t_ms": sinceMS(start)})
@@ -117,7 +150,8 @@ func main() {
 		return
 	}
 	if duplex {
-		writeEvent(event{"event": "client_response_headers", "status": resp.StatusCode, "proto": resp.Proto, "cf_ray": resp.Header.Get("Cf-Ray"), "cache_status": resp.Header.Get("Cf-Cache-Status"), "t_ms": sinceMS(start)})
+		responseHeadersAt := sinceMS(start)
+		writeEvent(event{"event": "client_response_headers", "status": resp.StatusCode, "proto": resp.Proto, "cf_ray": resp.Header.Get("Cf-Ray"), "cache_status": resp.Header.Get("Cf-Cache-Status"), "t_ms": responseHeadersAt})
 		var firstDownAt int64
 		var frame [duplexFrameSize]byte
 		var count int
@@ -144,8 +178,9 @@ func main() {
 		}
 		<-done
 		closedAt := bodyClosedAt.Load()
-		pass := resp.ProtoMajor == 3 && resp.StatusCode == http.StatusOK && count == expectedResponseChunks && framesValid && successfulWrites.Load() == int64(chunks) && firstDownAt > 0 && firstDownAt < closedAt && lastWriteAt.Load() > firstDownAt
-		writeEvent(event{"event": "duplex_result", "pass": pass, "frames": count, "expected_frames": expectedResponseChunks, "frames_valid": framesValid, "successful_writes": successfulWrites.Load(), "expected_writes": chunks, "first_down_ms": firstDownAt, "last_up_ms": lastWriteAt.Load(), "body_closed_ms": closedAt, "t_ms": sinceMS(start)})
+		earlyHeaders := firstWriteDelay == 0 || (wroteHeadersAt.Load() > 0 && wroteHeadersAt.Load() < firstWriteStartedAt.Load() && responseHeadersAt < firstWriteStartedAt.Load())
+		pass := resp.ProtoMajor == 3 && resp.StatusCode == http.StatusOK && count == expectedResponseChunks && framesValid && successfulWrites.Load() == int64(chunks) && firstDownAt > 0 && firstDownAt < closedAt && lastWriteAt.Load() > firstDownAt && earlyHeaders
+		writeEvent(event{"event": "duplex_result", "pass": pass, "frames": count, "expected_frames": expectedResponseChunks, "frames_valid": framesValid, "successful_writes": successfulWrites.Load(), "expected_writes": chunks, "request_headers_sent_ms": wroteHeadersAt.Load(), "response_headers_received_ms": responseHeadersAt, "first_write_start_ms": firstWriteStartedAt.Load(), "headers_before_body": earlyHeaders, "first_down_ms": firstDownAt, "last_up_ms": lastWriteAt.Load(), "body_closed_ms": closedAt, "t_ms": sinceMS(start)})
 		resp.Body.Close()
 		if !pass {
 			log.Fatal(fmt.Errorf("duplex test failed: first response at %d ms, last uplink at %d ms, body closed at %d ms, frames %d/%d, protocol %s, status %d", firstDownAt, lastWriteAt.Load(), closedAt, count, expectedResponseChunks, resp.Proto, resp.StatusCode))
@@ -158,9 +193,9 @@ func main() {
 	<-done
 }
 
-func delayForChunk(i int, interval time.Duration) time.Duration {
+func delayForChunk(i int, interval, firstWriteDelay time.Duration) time.Duration {
 	if i == 1 {
-		return 0
+		return firstWriteDelay
 	}
 	return interval
 }

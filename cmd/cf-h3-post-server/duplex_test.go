@@ -77,3 +77,63 @@ func TestHTTP2FullDuplexBeforeRequestEOF(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestHTTP2HeadersArriveBeforeFirstBodyWrite(t *testing.T) {
+	requestHeaders := make(chan struct{}, 1)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestHeaders <- struct{}{}
+		runDuplex(w, r, 1, time.Now(), 64, 1, 30*time.Millisecond)
+	}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	defer srv.Close()
+
+	client := srv.Client()
+	pipeRead, pipeWrite := io.Pipe()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL, pipeRead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responses := make(chan *http.Response, 1)
+	errors := make(chan error, 1)
+	go func() {
+		resp, err := client.Do(req)
+		if err != nil {
+			errors <- err
+			return
+		}
+		responses <- resp
+	}()
+	select {
+	case <-requestHeaders:
+	case <-ctx.Done():
+		t.Fatal("origin did not receive request headers before body write")
+	}
+	var resp *http.Response
+	select {
+	case resp = <-responses:
+	case err := <-errors:
+		t.Fatal(err)
+	case <-ctx.Done():
+		t.Fatal("client did not receive response headers before body write")
+	}
+	defer resp.Body.Close()
+	if resp.ProtoMajor != 2 || resp.StatusCode != http.StatusOK {
+		t.Fatalf("response = %s %d, want HTTP/2 200", resp.Proto, resp.StatusCode)
+	}
+	if _, err := pipeWrite.Write([]byte("up-after-headers")); err != nil {
+		t.Fatal(err)
+	}
+	if err := pipeWrite.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var frame [duplexFrameSize]byte
+	if _, err := io.ReadFull(resp.Body, frame[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatal(err)
+	}
+}
