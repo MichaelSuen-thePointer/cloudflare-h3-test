@@ -155,6 +155,33 @@ func (c *clientState) writeMetrics(path string, interval time.Duration) {
 }
 
 func (c *clientState) snapshot() map[string]any {
+	transport := c.transport
+	if transport == "" {
+		transport = "ws"
+	}
+	legacyWSCount := func(v int64) int64 {
+		if transport == "h3" {
+			return 0
+		}
+		return v
+	}
+	var provider map[string]any
+	if c.provider != nil {
+		s := c.provider.stats()
+		provider = map[string]any{
+			"transport":                transport,
+			"acquire_started":          s.Started,
+			"acquire_succeeded":        s.Succeeded,
+			"acquire_failed":           s.Failed,
+			"acquire_total_ns":         s.AcquireNanos,
+			"attach_total_ns":          s.AttachNanos,
+			"ws_idle":                  s.WSIdle,
+			"ws_dialing":               s.WSDialing,
+			"h3_transports":            s.TransportCount,
+			"h3_active_streams":        s.ActiveStreams,
+			"h3_streams_per_transport": s.StreamsPerTransport,
+		}
+	}
 	c.mu.Lock()
 	sessions := make([]*session, 0, len(c.sessions))
 	for _, sess := range c.sessions {
@@ -197,7 +224,7 @@ func (c *clientState) snapshot() map[string]any {
 			inflightRequests += r
 			lanes = append(lanes, map[string]any{
 				"session":           sess.id,
-				"direction":         "ws",
+				"direction":         transport,
 				"lane":              ln.index,
 				"inflight_bytes":    int64(0),
 				"inflight_requests": r,
@@ -215,6 +242,8 @@ func (c *clientState) snapshot() map[string]any {
 	}
 	return map[string]any{
 		"event":                               "proxy-client-metrics",
+		"transport":                           transport,
+		"provider":                            provider,
 		"ts":                                  time.Now().Format(time.RFC3339Nano),
 		"uptime_sec":                          time.Since(c.stats.started).Seconds(),
 		"active_sessions":                     len(sessions),
@@ -235,12 +264,18 @@ func (c *clientState) snapshot() map[string]any {
 		"batchq_capacity":                     batchQCapacity,
 		"batchq_drops":                        c.stats.batchQDrops.Load(),
 		"batchq_packet_depth":                 batchQPacketDepthEstimate,
-		"ws_expand_hints_received":            c.stats.expandHintsReceived.Load(),
-		"ws_expand_hints_used":                c.stats.expandHintsUsed.Load(),
-		"ws_incremental_acquire_started":      c.stats.incrementalAcquireStarted.Load(),
-		"ws_incremental_acquire_succeeded":    c.stats.incrementalAcquireSucceeded.Load(),
-		"ws_incremental_acquire_failed":       c.stats.incrementalAcquireFailed.Load(),
-		"ws_incremental_acquire_skipped_full": c.stats.incrementalAcquireSkippedFull.Load(),
+		"expand_hints_received":               c.stats.expandHintsReceived.Load(),
+		"expand_hints_used":                   c.stats.expandHintsUsed.Load(),
+		"incremental_acquire_started":         c.stats.incrementalAcquireStarted.Load(),
+		"incremental_acquire_succeeded":       c.stats.incrementalAcquireSucceeded.Load(),
+		"incremental_acquire_failed":          c.stats.incrementalAcquireFailed.Load(),
+		"incremental_acquire_skipped_full":    c.stats.incrementalAcquireSkippedFull.Load(),
+		"ws_expand_hints_received":            legacyWSCount(c.stats.expandHintsReceived.Load()),
+		"ws_expand_hints_used":                legacyWSCount(c.stats.expandHintsUsed.Load()),
+		"ws_incremental_acquire_started":      legacyWSCount(c.stats.incrementalAcquireStarted.Load()),
+		"ws_incremental_acquire_succeeded":    legacyWSCount(c.stats.incrementalAcquireSucceeded.Load()),
+		"ws_incremental_acquire_failed":       legacyWSCount(c.stats.incrementalAcquireFailed.Load()),
+		"ws_incremental_acquire_skipped_full": legacyWSCount(c.stats.incrementalAcquireSkippedFull.Load()),
 		"inflight_bytes":                      inflightBytes,
 		"inflight_requests":                   inflightRequests,
 		"lanes":                               lanes,

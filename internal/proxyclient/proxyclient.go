@@ -90,24 +90,27 @@ const streamEncodeBufferRetainLimit = 512 << 10
 
 func Main(args []string) {
 	var listen, remote, token, connectIP, metricsOut, transport, logLevel, pprofAddr string
-	var wsLanesN, wsPoolSize, batchSize, sendQueue, wsSocketSendBuffer, wsSocketReceiveBuffer int
-	var wsLanesIncremental, metrics, useSyslog bool
+	var lanesN, wsLanesN, wsPoolSize, h3StreamsPerTransport, batchSize, sendQueue, wsSocketSendBuffer, wsSocketReceiveBuffer int
+	var lanesIncremental, wsLanesIncremental, metrics, useSyslog bool
 	var timeout, metricsInterval, batchDelay, idle time.Duration
 	fs := flag.NewFlagSet("proxy-client", flag.ExitOnError)
 	fs.StringVar(&listen, "listen", "127.0.0.1:15353", "local UDP listen address")
 	fs.StringVar(&remote, "remote", "https://relay.example.com:2083/", "relay server URL")
 	fs.StringVar(&token, "token", "change-me-token", "shared relay token")
 	fs.StringVar(&connectIP, "connect-ip", "", "optional Cloudflare edge IP to connect to instead of DNS")
-	fs.StringVar(&transport, "transport", "ws", "relay transport: ws")
-	fs.IntVar(&wsLanesN, "ws-lanes", 1, "WebSocket lanes")
+	fs.StringVar(&transport, "transport", "ws", "relay transport: ws or h3")
+	fs.IntVar(&lanesN, "lanes", 1, "lanes per UDP session")
+	fs.IntVar(&wsLanesN, "ws-lanes", 1, "compatibility alias for -lanes")
 	fs.IntVar(&wsPoolSize, "ws-pool-size", 10, "target number of idle preconnected WebSocket connections")
-	fs.BoolVar(&wsLanesIncremental, "ws-lanes-incremental", false, "start WebSocket sessions with one lane and add lanes when batch queue backs up")
+	fs.BoolVar(&lanesIncremental, "lanes-incremental", false, "start sessions with one lane and add lanes when batch queue backs up")
+	fs.BoolVar(&wsLanesIncremental, "ws-lanes-incremental", false, "compatibility alias for -lanes-incremental")
+	fs.IntVar(&h3StreamsPerTransport, "h3-streams-per-transport", 1, "maximum active HTTP/3 streams per transport")
 	fs.IntVar(&wsSocketSendBuffer, "ws-socket-send-buffer", 0, "WebSocket TCP socket send buffer bytes, 0 keeps OS default")
 	fs.IntVar(&wsSocketReceiveBuffer, "ws-socket-recv-buffer", 0, "WebSocket TCP socket receive buffer bytes, 0 keeps OS default")
-	fs.IntVar(&batchSize, "batch-size", 1, "maximum UDP packets per WebSocket message")
-	fs.DurationVar(&batchDelay, "batch-delay", 0, "maximum time to wait for a partially filled WebSocket batch")
-	fs.IntVar(&sendQueue, "send-queue", 1024, "per-session UDP packet queue before WebSocket batching")
-	fs.DurationVar(&timeout, "http-timeout", 15*time.Second, "WebSocket dial and attach timeout")
+	fs.IntVar(&batchSize, "batch-size", 1, "maximum UDP packets per stream message")
+	fs.DurationVar(&batchDelay, "batch-delay", 0, "maximum time to wait for a partially filled batch")
+	fs.IntVar(&sendQueue, "send-queue", 1024, "per-session UDP packet queue before batching")
+	fs.DurationVar(&timeout, "http-timeout", 15*time.Second, "stream acquisition and attach timeout")
 	fs.DurationVar(&idle, "idle", 120*time.Second, "local UDP session idle timeout")
 	fs.BoolVar(&metrics, "metrics", false, "enable in-memory metrics counters")
 	fs.DurationVar(&metricsInterval, "metrics-interval", 1*time.Second, "metrics snapshot interval")
@@ -116,6 +119,10 @@ func Main(args []string) {
 	fs.StringVar(&logLevel, "log-level", "info", "diagnostic log level: debug, info, warn, or error")
 	fs.BoolVar(&useSyslog, "use-syslog", false, "write diagnostic logs to syslog instead of stderr")
 	fs.Parse(args)
+	seenFlags := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { seenFlags[f.Name] = true })
+	flagLanes, flagWSLanes := lanesN, wsLanesN
+	flagIncremental, flagWSIncremental := lanesIncremental, wsLanesIncremental
 
 	if err := configureLogger("proxy-client", logLevel, useSyslog); err != nil {
 		log.Fatal(err)
@@ -140,13 +147,33 @@ func Main(args []string) {
 		if err := applyClientPluginEnv(pluginEnv, &listen, &remote, &token, &connectIP, &transport, &logLevel, &wsLanesN, &wsPoolSize, &batchSize, &sendQueue, &wsSocketSendBuffer, &wsSocketReceiveBuffer, &wsLanesIncremental, &metrics, &useSyslog, &timeout, &metricsInterval, &batchDelay, &idle, &metricsOut); err != nil {
 			log.Fatal(err)
 		}
+		if err := applyIntOption(pluginEnv.Options, "h3-streams-per-transport", &h3StreamsPerTransport); err != nil {
+			log.Fatal(err)
+		}
+	}
+	lanesN, err = resolveIntLaneOption(flagLanes, flagWSLanes, seenFlags["lanes"], seenFlags["ws-lanes"], pluginEnv.Options)
+	if err != nil {
+		log.Fatal(err)
+	}
+	lanesIncremental, err = resolveBoolLaneOption(flagIncremental, flagWSIncremental, seenFlags["lanes-incremental"], seenFlags["ws-lanes-incremental"], pluginEnv.Options)
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	if transport != "ws" {
-		log.Fatalf("invalid -transport %q: expected ws", transport)
+	if transport != "ws" && transport != "h3" {
+		log.Fatalf("invalid -transport %q: expected ws or h3", transport)
 	}
-	if wsLanesN < 1 {
-		wsLanesN = 1
+	if lanesN < 1 {
+		lanesN = 1
+	}
+	if h3StreamsPerTransport < 1 {
+		log.Fatal("h3-streams-per-transport must be positive")
+	}
+	if transport == "h3" {
+		u, err := url.Parse(remote)
+		if err != nil || u.Scheme != "https" || u.Host == "" || (u.Path != "" && u.Path != "/") {
+			log.Fatalf("H3 remote must be an HTTPS URL with path /: %q", remote)
+		}
 	}
 	if wsPoolSize < 0 {
 		wsPoolSize = 0
@@ -195,14 +222,21 @@ func Main(args []string) {
 	}
 	stats := &clientStats{started: time.Now()}
 	wsSocketOptions := relay.WebSocketSocketOptions{SendBuffer: wsSocketSendBuffer, ReceiveBuffer: wsSocketReceiveBuffer}
-	state := &clientState{remote: remote, token: token, connectIP: connectIP, transport: transport, laneTarget: wsLanesN, lanesIncremental: wsLanesIncremental, wsSocketOptions: wsSocketOptions, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, idle: idle, udp: udp, sessions: map[netip.AddrPort]*session{}, stats: stats, metrics: metrics}
-	state.wsPool = newWSPool(remote, connectIP, token, wsPoolSize, timeout, wsSocketOptions)
-	defer state.wsPool.Close()
+	state := &clientState{transport: transport, laneTarget: lanesN, lanesIncremental: lanesIncremental, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, idle: idle, udp: udp, sessions: map[netip.AddrPort]*session{}, stats: stats, metrics: metrics}
+	if transport == "ws" {
+		state.provider = newWSProvider(remote, connectIP, token, wsPoolSize, timeout, wsSocketOptions, metrics)
+	} else {
+		state.provider, err = newH3Provider(relay.HTTP3ClientOptions{URL: remote, ConnectIP: connectIP}, token, h3StreamsPerTransport, metrics)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+	defer state.provider.Close()
 	if metricsBuild && metricsOut != "" {
 		go state.writeMetrics(metricsOut, metricsInterval)
 	}
 	go state.cleanupLoop()
-	appLog.Info("proxy-client-start", "listen", listen, "remote", remote, "connect_ip", connectIP, "transport", transport, "ws_lanes", wsLanesN, "ws_pool_size", wsPoolSize, "ws_lanes_incremental", wsLanesIncremental, "ws_socket_send_buffer", wsSocketSendBuffer, "ws_socket_recv_buffer", wsSocketReceiveBuffer)
+	appLog.Info("proxy-client-start", "listen", listen, "remote", remote, "connect_ip", connectIP, "transport", transport, "lanes", lanesN, "ws_pool_size", wsPoolSize, "lanes_incremental", lanesIncremental, "h3_streams_per_transport", h3StreamsPerTransport, "ws_socket_send_buffer", wsSocketSendBuffer, "ws_socket_recv_buffer", wsSocketReceiveBuffer)
 	buf := make([]byte, 65535)
 	for {
 		n, peer, err := udp.ReadFromUDP(buf)
@@ -221,13 +255,9 @@ func Main(args []string) {
 }
 
 type clientState struct {
-	remote           string
-	token            string
-	connectIP        string
 	transport        string
 	laneTarget       int
 	lanesIncremental bool
-	wsSocketOptions  relay.WebSocketSocketOptions
 	batchSize        int
 	batchDelay       time.Duration
 	sendQueue        int
@@ -236,7 +266,7 @@ type clientState struct {
 	udp              *net.UDPConn
 	mu               sync.Mutex
 	sessions         map[netip.AddrPort]*session
-	wsPool           *wsPool
+	provider         streamProvider
 	stats            *clientStats
 	metrics          bool
 }
@@ -335,18 +365,7 @@ func (c *clientState) closeSession(key netip.AddrPort, sess *session) {
 }
 
 func (c *clientState) acquireMessageStream(ctx context.Context, sessionID string) (relay.MessageStream, error) {
-	if c.wsPool != nil {
-		return c.wsPool.Acquire(ctx, c.token, sessionID)
-	}
-	ws, err := relay.DialWebSocketWithOptions(ctx, c.remote, c.connectIP, c.token, c.timeout, c.wsSocketOptions)
-	if err != nil {
-		return nil, err
-	}
-	if err := relay.AttachWebSocketSession(ctx, ws, sessionID); err != nil {
-		_ = ws.Close()
-		return nil, err
-	}
-	return ws, nil
+	return c.provider.Acquire(ctx, sessionID)
 }
 
 func (c *clientState) connectInitialLanes(sess *session, key netip.AddrPort, peerLabel string) {
@@ -1181,6 +1200,64 @@ func applyBoolOption(opts PluginEnv.Options, key string, dst *bool) error {
 	return nil
 }
 
+func resolveIntLaneOption(canonical, alias int, canonicalSet, aliasSet bool, opts PluginEnv.Options) (int, error) {
+	if value, ok, err := opts.Int("lanes"); err != nil {
+		return 0, err
+	} else if ok {
+		canonical, canonicalSet = value, true
+		if other, aliasOK, err := opts.Int("ws-lanes"); err != nil {
+			return 0, err
+		} else if aliasOK {
+			alias, aliasSet = other, true
+		} else {
+			aliasSet = false // PluginEnv overrides the CLI setting as a whole
+		}
+	} else if value, ok, err := opts.Int("ws-lanes"); err != nil {
+		return 0, err
+	} else if ok {
+		alias, aliasSet, canonicalSet = value, true, false
+	}
+	if canonicalSet && aliasSet && canonical != alias {
+		return 0, fmt.Errorf("conflicting lanes=%d and ws-lanes=%d", canonical, alias)
+	}
+	if canonicalSet {
+		return canonical, nil
+	}
+	if aliasSet {
+		return alias, nil
+	}
+	return canonical, nil
+}
+
+func resolveBoolLaneOption(canonical, alias, canonicalSet, aliasSet bool, opts PluginEnv.Options) (bool, error) {
+	if value, ok, err := opts.Bool("lanes-incremental"); err != nil {
+		return false, err
+	} else if ok {
+		canonical, canonicalSet = value, true
+		if other, aliasOK, err := opts.Bool("ws-lanes-incremental"); err != nil {
+			return false, err
+		} else if aliasOK {
+			alias, aliasSet = other, true
+		} else {
+			aliasSet = false
+		}
+	} else if value, ok, err := opts.Bool("ws-lanes-incremental"); err != nil {
+		return false, err
+	} else if ok {
+		alias, aliasSet, canonicalSet = value, true, false
+	}
+	if canonicalSet && aliasSet && canonical != alias {
+		return false, fmt.Errorf("conflicting lanes-incremental=%t and ws-lanes-incremental=%t", canonical, alias)
+	}
+	if canonicalSet {
+		return canonical, nil
+	}
+	if aliasSet {
+		return alias, nil
+	}
+	return canonical, nil
+}
+
 func applyDurationOption(opts PluginEnv.Options, key string, dst *time.Duration) error {
 	if v, ok, err := opts.Duration(key); err != nil {
 		return err
@@ -1192,7 +1269,7 @@ func applyDurationOption(opts PluginEnv.Options, key string, dst *time.Duration)
 
 var knownClientPluginEnvOptions = map[string]struct{}{
 	"scheme": {}, "tls": {}, "host": {}, "path": {}, "connect-ip": {}, "token": {}, "transport": {}, "metrics-out": {}, "log-level": {}, "use-syslog": {},
-	"ws-lanes": {}, "batch-size": {}, "send-queue": {},
+	"lanes": {}, "lanes-incremental": {}, "h3-streams-per-transport": {}, "ws-lanes": {}, "batch-size": {}, "send-queue": {},
 	"ws-pool-size": {}, "ws-lanes-incremental": {}, "ws-socket-send-buffer": {}, "ws-socket-recv-buffer": {}, "metrics": {},
 	"http-timeout": {}, "metrics-interval": {}, "batch-delay": {}, "idle": {},
 }
