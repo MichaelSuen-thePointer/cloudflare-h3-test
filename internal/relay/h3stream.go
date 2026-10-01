@@ -9,10 +9,12 @@ import (
 	"net/url"
 	"sync"
 	"sync/atomic"
+
+	"github.com/quic-go/quic-go/http3"
 )
 
 // H3MessageStream carries messages in both bodies of one long-lived POST.
-// The transport is private in phase 3; phase 4 can provide a shared transport.
+// Its transport is either owned by the stream or borrowed from its caller.
 type H3MessageStream struct {
 	requestWriter  *io.PipeWriter
 	responseBody   io.ReadCloser
@@ -28,23 +30,29 @@ type H3MessageStream struct {
 var _ AttachableMessageStream = (*H3MessageStream)(nil)
 var _ MessageViewReader = (*H3MessageStream)(nil)
 
-// NewH3MessageStream waits only for response headers. Its request remains open
-// after the setup context expires; Close controls the active request lifetime.
+// NewH3MessageStream owns a private transport and waits only for response
+// headers. Its request remains open after the setup context expires; Close
+// controls the active request and transport lifetime.
 func NewH3MessageStream(ctx context.Context, opts HTTP3ClientOptions, token string) (*H3MessageStream, error) {
-	opts.Timeout = 0
-	client, closeTransport, err := NewHTTP3ClientWithOptions(opts)
+	transport, err := NewHTTP3TransportWithOptions(opts)
 	if err != nil {
 		return nil, err
 	}
-	stream, err := openDuplexMessageStream(ctx, client.Transport, closeTransport, opts.URL, token)
-	if err != nil {
-		return nil, err
-	}
-	return stream, nil
+	return openDuplexMessageStream(ctx, transport, transport.Close, opts.URL, token)
 }
 
-// openDuplexMessageStream keeps transport ownership explicit for a provider
-// and permits an HTTP/2 origin integration test of the same body protocol.
+// NewH3MessageStreamOnTransport borrows transport for one duplex request.
+// The caller must keep it open until the stream closes. Closing the stream,
+// including after setup failure, never closes transport.
+func NewH3MessageStreamOnTransport(ctx context.Context, transport *http3.Transport, rawURL, token string) (*H3MessageStream, error) {
+	if transport == nil {
+		return nil, errors.New("nil HTTP/3 transport")
+	}
+	return openDuplexMessageStream(ctx, transport, nil, rawURL, token)
+}
+
+// openDuplexMessageStream implements both ownership modes and also permits
+// an HTTP/2 origin integration test of the same body protocol.
 func openDuplexMessageStream(ctx context.Context, transport http.RoundTripper, closeTransport func() error, rawURL, token string) (*H3MessageStream, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Scheme != "https" || u.Host == "" {

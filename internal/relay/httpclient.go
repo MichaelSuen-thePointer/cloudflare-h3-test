@@ -25,10 +25,21 @@ func NewHTTP3Client(rawURL string, timeout time.Duration) (*http.Client, func() 
 }
 
 func NewHTTP3ClientWithOptions(opts HTTP3ClientOptions) (*http.Client, func() error, error) {
+	tr, err := NewHTTP3TransportWithOptions(opts)
+	if err != nil {
+		return nil, nil, err
+	}
+	client := &http.Client{Transport: tr, Timeout: opts.Timeout}
+	return client, tr.Close, nil
+}
+
+// NewHTTP3TransportWithOptions returns a transport owned by the caller.
+// Timeout belongs to the optional http.Client wrapper and is ignored here.
+func NewHTTP3TransportWithOptions(opts HTTP3ClientOptions) (*http3.Transport, error) {
 	rawURL := opts.URL
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	tr := &http3.Transport{
 		TLSClientConfig: &tls.Config{
@@ -48,6 +59,5 @@ func NewHTTP3ClientWithOptions(opts HTTP3ClientOptions) (*http.Client, func() er
 			return quic.DialAddrEarly(ctx, dialAddr, tlsCfg, cfg)
 		}
 	}
-	client := &http.Client{Transport: tr, Timeout: opts.Timeout}
-	return client, tr.Close, nil
+	return tr, nil
 }
