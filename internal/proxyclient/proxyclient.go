@@ -91,7 +91,7 @@ const streamEncodeBufferRetainLimit = 512 << 10
 
 func Main(args []string) {
 	var listen, remote, token, connectIP, metricsOut, transport, logLevel, pprofAddr string
-	var lanesN, wsLanesN, wsPoolSize, h3StreamsPerTransport, batchSize, sendQueue, wsSocketSendBuffer, wsSocketReceiveBuffer int
+	var lanesN, wsLanesN, poolSize, wsPoolSize, h3StreamsPerTransport, batchSize, sendQueue, wsSocketSendBuffer, wsSocketReceiveBuffer int
 	var lanesIncremental, wsLanesIncremental, metrics, useSyslog bool
 	var timeout, metricsInterval, batchDelay, idle time.Duration
 	var quicWindows relay.QUICReceiveWindows
@@ -103,7 +103,8 @@ func Main(args []string) {
 	fs.StringVar(&transport, "transport", "ws", "relay transport: ws or h3")
 	fs.IntVar(&lanesN, "lanes", 1, "lanes per UDP session")
 	fs.IntVar(&wsLanesN, "ws-lanes", 1, "compatibility alias for -lanes")
-	fs.IntVar(&wsPoolSize, "ws-pool-size", 10, "target number of idle preconnected WebSocket connections")
+	fs.IntVar(&poolSize, "pool-size", 10, "target number of idle preconnected streams for the selected transport")
+	fs.IntVar(&wsPoolSize, "ws-pool-size", 10, "compatibility alias for -pool-size")
 	fs.BoolVar(&lanesIncremental, "lanes-incremental", false, "start sessions with one lane and add lanes when batch queue backs up")
 	fs.BoolVar(&wsLanesIncremental, "ws-lanes-incremental", false, "compatibility alias for -lanes-incremental")
 	fs.IntVar(&h3StreamsPerTransport, "h3-streams-per-transport", 1, "maximum active HTTP/3 streams per transport")
@@ -128,6 +129,7 @@ func Main(args []string) {
 	seenFlags := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { seenFlags[f.Name] = true })
 	flagLanes, flagWSLanes := lanesN, wsLanesN
+	flagPool, flagWSPool := poolSize, wsPoolSize
 	flagIncremental, flagWSIncremental := lanesIncremental, wsLanesIncremental
 
 	if err := configureLogger("proxy-client", logLevel, useSyslog); err != nil {
@@ -168,6 +170,10 @@ func Main(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
+	poolSize, err = resolveIntPoolOption(flagPool, flagWSPool, seenFlags["pool-size"], seenFlags["ws-pool-size"], pluginEnv.Options)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	if transport != "ws" && transport != "h3" {
 		log.Fatalf("invalid -transport %q: expected ws or h3", transport)
@@ -184,8 +190,8 @@ func Main(args []string) {
 			log.Fatalf("H3 remote must be an HTTPS URL with path /: %q", remote)
 		}
 	}
-	if wsPoolSize < 0 {
-		wsPoolSize = 0
+	if poolSize < 0 {
+		log.Fatal("pool-size must not be negative")
 	}
 	normalizeBatchSettings(&batchSize, &batchDelay)
 	if sendQueue < 1 {
@@ -233,9 +239,9 @@ func Main(args []string) {
 	wsSocketOptions := relay.WebSocketSocketOptions{SendBuffer: wsSocketSendBuffer, ReceiveBuffer: wsSocketReceiveBuffer}
 	state := &clientState{transport: transport, laneTarget: lanesN, lanesIncremental: lanesIncremental, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, idle: idle, udp: udp, sessions: map[netip.AddrPort]*session{}, stats: stats, metrics: metrics}
 	if transport == "ws" {
-		state.provider = newWSProvider(remote, connectIP, token, wsPoolSize, timeout, wsSocketOptions, metrics)
+		state.provider = newWSProvider(remote, connectIP, token, poolSize, timeout, wsSocketOptions, metrics)
 	} else {
-		state.provider, err = newH3Provider(relay.HTTP3ClientOptions{URL: remote, ConnectIP: connectIP, QUICReceiveWindows: quicWindows}, token, h3StreamsPerTransport, metrics)
+		state.provider, err = newH3Provider(relay.HTTP3ClientOptions{URL: remote, ConnectIP: connectIP, QUICReceiveWindows: quicWindows}, token, h3StreamsPerTransport, poolSize, timeout, metrics)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -245,7 +251,7 @@ func Main(args []string) {
 		go state.writeMetrics(metricsOut, metricsInterval)
 	}
 	go state.cleanupLoop()
-	appLog.Info("proxy-client-start", "listen", listen, "remote", remote, "connect_ip", connectIP, "transport", transport, "lanes", lanesN, "ws_pool_size", wsPoolSize, "lanes_incremental", lanesIncremental, "h3_streams_per_transport", h3StreamsPerTransport, "ws_socket_send_buffer", wsSocketSendBuffer, "ws_socket_recv_buffer", wsSocketReceiveBuffer)
+	appLog.Info("proxy-client-start", "listen", listen, "remote", remote, "connect_ip", connectIP, "transport", transport, "lanes", lanesN, "pool_size", poolSize, "lanes_incremental", lanesIncremental, "h3_streams_per_transport", h3StreamsPerTransport, "ws_socket_send_buffer", wsSocketSendBuffer, "ws_socket_recv_buffer", wsSocketReceiveBuffer)
 	buf := make([]byte, 65535)
 	for {
 		n, peer, err := udp.ReadFromUDP(buf)
@@ -1261,6 +1267,35 @@ func resolveIntLaneOption(canonical, alias int, canonicalSet, aliasSet bool, opt
 	return canonical, nil
 }
 
+func resolveIntPoolOption(canonical, alias int, canonicalSet, aliasSet bool, opts PluginEnv.Options) (int, error) {
+	if value, ok, err := opts.Int("pool-size"); err != nil {
+		return 0, err
+	} else if ok {
+		canonical, canonicalSet = value, true
+		if other, aliasOK, err := opts.Int("ws-pool-size"); err != nil {
+			return 0, err
+		} else if aliasOK {
+			alias, aliasSet = other, true
+		} else {
+			aliasSet = false
+		}
+	} else if value, ok, err := opts.Int("ws-pool-size"); err != nil {
+		return 0, err
+	} else if ok {
+		alias, aliasSet, canonicalSet = value, true, false
+	}
+	if canonicalSet && aliasSet && canonical != alias {
+		return 0, fmt.Errorf("conflicting pool-size=%d and ws-pool-size=%d", canonical, alias)
+	}
+	if canonicalSet {
+		return canonical, nil
+	}
+	if aliasSet {
+		return alias, nil
+	}
+	return canonical, nil
+}
+
 func resolveBoolLaneOption(canonical, alias, canonicalSet, aliasSet bool, opts PluginEnv.Options) (bool, error) {
 	if value, ok, err := opts.Bool("lanes-incremental"); err != nil {
 		return false, err
@@ -1303,7 +1338,7 @@ var knownClientPluginEnvOptions = map[string]struct{}{
 	"scheme": {}, "tls": {}, "host": {}, "path": {}, "connect-ip": {}, "token": {}, "transport": {}, "metrics-out": {}, "log-level": {}, "use-syslog": {},
 	"lanes": {}, "lanes-incremental": {}, "h3-streams-per-transport": {}, "ws-lanes": {}, "batch-size": {}, "send-queue": {},
 	"quic-initial-stream-window": {}, "quic-max-stream-window": {}, "quic-initial-conn-window": {}, "quic-max-conn-window": {},
-	"ws-pool-size": {}, "ws-lanes-incremental": {}, "ws-socket-send-buffer": {}, "ws-socket-recv-buffer": {}, "metrics": {},
+	"pool-size": {}, "ws-pool-size": {}, "ws-lanes-incremental": {}, "ws-socket-send-buffer": {}, "ws-socket-recv-buffer": {}, "metrics": {},
 	"http-timeout": {}, "metrics-interval": {}, "batch-delay": {}, "idle": {},
 }
 

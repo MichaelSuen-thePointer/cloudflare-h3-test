@@ -172,7 +172,21 @@ func (s *H3MessageStream) ReadMessageView() ([]byte, error) { return s.ReadMessa
 func (s *H3MessageStream) Probe(ctx context.Context) error {
 	return s.runSetup(ctx, func() error {
 		body, _ := EncodeControl(ControlOpPing, nil)
-		return s.WriteMessage(body)
+		if err := s.WriteMessage(body); err != nil {
+			return err
+		}
+		response, err := ReadStreamMessage(s.responseBody)
+		if err != nil {
+			return err
+		}
+		op, payload, err := DecodeControl(response)
+		if err != nil {
+			return err
+		}
+		if op != ControlOpPong || len(payload) != 0 {
+			return errors.New("bad probe pong")
+		}
+		return nil
 	})
 }
 
