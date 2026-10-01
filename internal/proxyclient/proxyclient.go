@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"net/url"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -93,6 +94,7 @@ func Main(args []string) {
 	var lanesN, wsLanesN, wsPoolSize, h3StreamsPerTransport, batchSize, sendQueue, wsSocketSendBuffer, wsSocketReceiveBuffer int
 	var lanesIncremental, wsLanesIncremental, metrics, useSyslog bool
 	var timeout, metricsInterval, batchDelay, idle time.Duration
+	var quicWindows relay.QUICReceiveWindows
 	fs := flag.NewFlagSet("proxy-client", flag.ExitOnError)
 	fs.StringVar(&listen, "listen", "127.0.0.1:15353", "local UDP listen address")
 	fs.StringVar(&remote, "remote", "https://relay.example.com:2083/", "relay server URL")
@@ -105,6 +107,10 @@ func Main(args []string) {
 	fs.BoolVar(&lanesIncremental, "lanes-incremental", false, "start sessions with one lane and add lanes when batch queue backs up")
 	fs.BoolVar(&wsLanesIncremental, "ws-lanes-incremental", false, "compatibility alias for -lanes-incremental")
 	fs.IntVar(&h3StreamsPerTransport, "h3-streams-per-transport", 1, "maximum active HTTP/3 streams per transport")
+	fs.Uint64Var(&quicWindows.InitialStream, "quic-initial-stream-window", 0, "HTTP/3 QUIC initial stream receive window bytes; 0 keeps quic-go default")
+	fs.Uint64Var(&quicWindows.MaxStream, "quic-max-stream-window", 0, "HTTP/3 QUIC maximum stream receive window bytes; 0 keeps quic-go default")
+	fs.Uint64Var(&quicWindows.InitialConnection, "quic-initial-conn-window", 0, "HTTP/3 QUIC initial connection receive window bytes; 0 keeps quic-go default")
+	fs.Uint64Var(&quicWindows.MaxConnection, "quic-max-conn-window", 0, "HTTP/3 QUIC maximum connection receive window bytes; 0 keeps quic-go default")
 	fs.IntVar(&wsSocketSendBuffer, "ws-socket-send-buffer", 0, "WebSocket TCP socket send buffer bytes, 0 keeps OS default")
 	fs.IntVar(&wsSocketReceiveBuffer, "ws-socket-recv-buffer", 0, "WebSocket TCP socket receive buffer bytes, 0 keeps OS default")
 	fs.IntVar(&batchSize, "batch-size", 1, "maximum UDP packets per stream message")
@@ -148,6 +154,9 @@ func Main(args []string) {
 			log.Fatal(err)
 		}
 		if err := applyIntOption(pluginEnv.Options, "h3-streams-per-transport", &h3StreamsPerTransport); err != nil {
+			log.Fatal(err)
+		}
+		if err := applyQUICWindowOptions(pluginEnv.Options, &quicWindows); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -226,7 +235,7 @@ func Main(args []string) {
 	if transport == "ws" {
 		state.provider = newWSProvider(remote, connectIP, token, wsPoolSize, timeout, wsSocketOptions, metrics)
 	} else {
-		state.provider, err = newH3Provider(relay.HTTP3ClientOptions{URL: remote, ConnectIP: connectIP}, token, h3StreamsPerTransport, metrics)
+		state.provider, err = newH3Provider(relay.HTTP3ClientOptions{URL: remote, ConnectIP: connectIP, QUICReceiveWindows: quicWindows}, token, h3StreamsPerTransport, metrics)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -1191,6 +1200,29 @@ func applyIntOption(opts PluginEnv.Options, key string, dst *int) error {
 	return nil
 }
 
+func applyQUICWindowOptions(opts PluginEnv.Options, windows *relay.QUICReceiveWindows) error {
+	for _, option := range []struct {
+		name string
+		dst  *uint64
+	}{
+		{"quic-initial-stream-window", &windows.InitialStream},
+		{"quic-max-stream-window", &windows.MaxStream},
+		{"quic-initial-conn-window", &windows.InitialConnection},
+		{"quic-max-conn-window", &windows.MaxConnection},
+	} {
+		value, ok := opts.Get(option.name)
+		if !ok {
+			continue
+		}
+		parsed, err := strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid uint64 option %s=%q", option.name, value)
+		}
+		*option.dst = parsed
+	}
+	return nil
+}
+
 func applyBoolOption(opts PluginEnv.Options, key string, dst *bool) error {
 	if v, ok, err := opts.Bool(key); err != nil {
 		return err
@@ -1270,6 +1302,7 @@ func applyDurationOption(opts PluginEnv.Options, key string, dst *time.Duration)
 var knownClientPluginEnvOptions = map[string]struct{}{
 	"scheme": {}, "tls": {}, "host": {}, "path": {}, "connect-ip": {}, "token": {}, "transport": {}, "metrics-out": {}, "log-level": {}, "use-syslog": {},
 	"lanes": {}, "lanes-incremental": {}, "h3-streams-per-transport": {}, "ws-lanes": {}, "batch-size": {}, "send-queue": {},
+	"quic-initial-stream-window": {}, "quic-max-stream-window": {}, "quic-initial-conn-window": {}, "quic-max-conn-window": {},
 	"ws-pool-size": {}, "ws-lanes-incremental": {}, "ws-socket-send-buffer": {}, "ws-socket-recv-buffer": {}, "metrics": {},
 	"http-timeout": {}, "metrics-interval": {}, "batch-delay": {}, "idle": {},
 }

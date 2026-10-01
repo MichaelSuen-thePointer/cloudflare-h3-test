@@ -942,6 +942,27 @@ func TestApplyClientPluginEnvTLSFalse(t *testing.T) {
 	}
 }
 
+func TestApplyQUICWindowOptions(t *testing.T) {
+	opts, err := PluginEnv.ParseOptions("quic-initial-stream-window=8388608;quic-max-stream-window=33554432;quic-initial-conn-window=16777216;quic-max-conn-window=67108864")
+	if err != nil {
+		t.Fatal(err)
+	}
+	windows := relay.QUICReceiveWindows{}
+	if err := applyQUICWindowOptions(opts, &windows); err != nil {
+		t.Fatal(err)
+	}
+	if windows != (relay.QUICReceiveWindows{InitialStream: 8 << 20, MaxStream: 32 << 20, InitialConnection: 16 << 20, MaxConnection: 64 << 20}) {
+		t.Fatalf("QUIC windows=%+v", windows)
+	}
+	invalid, err := PluginEnv.ParseOptions("quic-max-conn-window=-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyQUICWindowOptions(invalid, &windows); err == nil {
+		t.Fatal("negative QUIC window accepted")
+	}
+}
+
 func TestApplyClientLogLevelOptionRejectsInvalid(t *testing.T) {
 	opts, err := PluginEnv.ParseOptions("log-level=verbose")
 	if err != nil {
