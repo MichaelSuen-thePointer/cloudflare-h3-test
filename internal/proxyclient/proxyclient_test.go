@@ -18,6 +18,13 @@ import (
 	"cloudflare-h3-test/internal/relay"
 )
 
+func installTestWSProvider(t *testing.T, c *clientState, remote string) {
+	t.Helper()
+	p := newWSProvider(remote, "", "example-token", 0, c.timeout, relay.WebSocketSocketOptions{}, c.metrics)
+	c.provider = p
+	t.Cleanup(func() { _ = p.Close() })
+}
+
 func TestEnsureWebSocketLanesDoesNotAppendAfterClose(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -49,10 +56,9 @@ func TestEnsureWebSocketLanesDoesNotAppendAfterClose(t *testing.T) {
 		batchQ: make(chan []relay.Frame, 2),
 	}
 	c := &clientState{
-		remote:  "http://" + ln.Addr().String() + "/",
-		token:   "example-token",
 		timeout: 10 * time.Second,
 	}
+	installTestWSProvider(t, c, "http://"+ln.Addr().String()+"/")
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -121,12 +127,11 @@ func TestInitialWebSocketConnectFailureClosesSession(t *testing.T) {
 	}
 	peerKey := netip.MustParseAddrPort("127.0.0.1:12345")
 	c := &clientState{
-		remote:     "http://" + addr + "/",
-		token:      "example-token",
 		laneTarget: 1,
 		timeout:    50 * time.Millisecond,
 		sessions:   map[netip.AddrPort]*session{peerKey: sess},
 	}
+	installTestWSProvider(t, c, "http://"+addr+"/")
 	sess.state = c
 
 	c.connectInitialLanes(sess, peerKey, "peer")
@@ -172,12 +177,11 @@ func TestInitialIncrementalWebSocketConnectsOneLane(t *testing.T) {
 	}
 	defer sess.close()
 	c := &clientState{
-		remote:           "http://" + ln.Addr().String() + "/",
-		token:            "example-token",
 		laneTarget:       3,
 		lanesIncremental: true,
 		timeout:          time.Second,
 	}
+	installTestWSProvider(t, c, "http://"+ln.Addr().String()+"/")
 	sess.state = c
 
 	c.connectInitialLanes(sess, netip.AddrPort{}, "peer")
@@ -230,10 +234,9 @@ func TestEnsureWebSocketLanesClosesSuccessfulLaneAfterParallelFailure(t *testing
 		sendQ:  make(chan []byte, 1),
 	}
 	c := &clientState{
-		remote:  "http://" + ln.Addr().String() + "/",
-		token:   "example-token",
 		timeout: time.Second,
 	}
+	installTestWSProvider(t, c, "http://"+ln.Addr().String()+"/")
 
 	err = c.ensureLanes(sess, 2)
 	if err == nil {
@@ -276,12 +279,11 @@ func TestIncrementalWebSocketLaneAddsLaneWhenBatchQueueBacklogged(t *testing.T) 
 		batchQ: make(chan []relay.Frame, 2),
 	}
 	c := &clientState{
-		remote:           "http://" + ln.Addr().String() + "/",
-		token:            "example-token",
 		laneTarget:       2,
 		lanesIncremental: true,
 		timeout:          time.Second,
 	}
+	installTestWSProvider(t, c, "http://"+ln.Addr().String()+"/")
 	sess.state = c
 	sess.lanes = append(sess.lanes, &streamLane{index: 0})
 	publishTestWSSnapshot(sess)
@@ -484,14 +486,13 @@ func TestWebSocketExpandHintTriggersIncrementalLane(t *testing.T) {
 		metrics: true,
 	}
 	c := &clientState{
-		remote:           "http://" + ln.Addr().String() + "/",
-		token:            "example-token",
 		laneTarget:       2,
 		lanesIncremental: true,
 		timeout:          time.Second,
 		stats:            stats,
 		metrics:          true,
 	}
+	installTestWSProvider(t, c, "http://"+ln.Addr().String()+"/")
 	sess.state = c
 	sess.lanes = append(sess.lanes, &streamLane{index: 0})
 	publishTestWSSnapshot(sess)
@@ -579,12 +580,11 @@ func TestIncrementalWebSocketLaneAcquireFailureKeepsSession(t *testing.T) {
 	}
 	defer sess.close()
 	c := &clientState{
-		remote:           "http://" + addr + "/",
-		token:            "example-token",
 		laneTarget:       2,
 		lanesIncremental: true,
 		timeout:          50 * time.Millisecond,
 	}
+	installTestWSProvider(t, c, "http://"+addr+"/")
 	sess.state = c
 	sess.lanes = append(sess.lanes, &streamLane{index: 0})
 	publishTestWSSnapshot(sess)
