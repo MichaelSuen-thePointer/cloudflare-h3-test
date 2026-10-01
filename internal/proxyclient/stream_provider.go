@@ -37,6 +37,8 @@ type providerStatsSnapshot struct {
 	StreamsPerTransport int
 	WSIdle              int
 	WSDialing           int
+	H3Idle              int
+	H3Opening           int
 }
 
 func (s *providerStats) snapshot() providerStatsSnapshot {
@@ -107,16 +109,25 @@ type h3Provider struct {
 	maxStreams     int
 	counters       providerStats
 	privateStreams atomic.Int64 // metrics-only count for the one-stream fast path
+	pool           *h3Pool
+	closeOnce      sync.Once
 }
 
-func newH3Provider(opts relay.HTTP3ClientOptions, token string, maxStreams int, metrics bool) (*h3Provider, error) {
+func newH3Provider(opts relay.HTTP3ClientOptions, token string, maxStreams, poolSize int, timeout time.Duration, metrics bool) (*h3Provider, error) {
 	if maxStreams <= 0 {
 		return nil, errors.New("h3-streams-per-transport must be positive")
+	}
+	if poolSize < 0 {
+		return nil, errors.New("pool-size must not be negative")
 	}
 	if err := opts.QUICReceiveWindows.Validate(); err != nil {
 		return nil, err
 	}
-	return &h3Provider{opts: opts, token: token, maxStreams: maxStreams, counters: providerStats{enabled: metrics}}, nil
+	p := &h3Provider{opts: opts, token: token, maxStreams: maxStreams, counters: providerStats{enabled: metrics}}
+	if poolSize > 0 {
+		p.pool = newH3Pool(p, poolSize, timeout)
+	}
+	return p, nil
 }
 
 func (p *h3Provider) reserve() (*h3TransportSlot, error) {
@@ -169,17 +180,20 @@ func (p *h3Provider) Acquire(ctx context.Context, sessionID string) (relay.Messa
 		p.counters.started.Add(1)
 		defer func() { p.counters.acquireNanos.Add(time.Since(start).Nanoseconds()) }()
 	}
+	if p.pool != nil {
+		stream, err := p.pool.acquire(ctx, sessionID)
+		if err != nil {
+			p.countAcquireFailed()
+			return nil, err
+		}
+		p.countAcquireSucceeded()
+		return stream, nil
+	}
 	if p.maxStreams == 1 {
 		return p.acquirePrivate(ctx, sessionID)
 	}
-	slot, err := p.reserve()
+	stream, err := p.open(ctx)
 	if err != nil {
-		p.countAcquireFailed()
-		return nil, err
-	}
-	stream, err := relay.NewH3MessageStreamOnTransport(ctx, slot.transport, p.opts.URL, p.token)
-	if err != nil {
-		p.release(slot)
 		p.countAcquireFailed()
 		return nil, err
 	}
@@ -187,24 +201,22 @@ func (p *h3Provider) Acquire(ctx context.Context, sessionID string) (relay.Messa
 	if p.counters.enabled {
 		attachStart = time.Now()
 	}
-	err = stream.Attach(ctx, sessionID)
+	err = stream.stream.Attach(ctx, sessionID)
 	if p.counters.enabled {
 		p.counters.attachNanos.Add(time.Since(attachStart).Nanoseconds())
 	}
 	if err != nil {
 		_ = stream.Close()
-		p.release(slot)
 		p.countAcquireFailed()
 		return nil, err
 	}
 	if p.closed.Load() {
 		_ = stream.Close()
-		p.release(slot)
 		p.countAcquireFailed()
 		return nil, http3.ErrTransportClosed
 	}
 	p.countAcquireSucceeded()
-	return &h3ProviderStream{stream: stream, provider: p, slot: slot}, nil
+	return stream, nil
 }
 
 func (p *h3Provider) acquirePrivate(ctx context.Context, sessionID string) (relay.MessageStream, error) {
@@ -265,13 +277,21 @@ func (p *h3Provider) countAcquireSucceeded() {
 }
 
 func (p *h3Provider) Close() error {
-	p.closed.Store(true)
+	p.closeOnce.Do(func() {
+		p.closed.Store(true)
+		if p.pool != nil {
+			p.pool.close()
+		}
+	})
 	return nil
 }
 
 func (p *h3Provider) stats() providerStatsSnapshot {
 	s := p.counters.snapshot()
-	if p.maxStreams == 1 {
+	if p.pool != nil && p.counters.enabled {
+		s.H3Idle, s.H3Opening = p.pool.stats()
+	}
+	if p.maxStreams == 1 && p.pool == nil {
 		s.TransportCount = int(p.privateStreams.Load())
 		s.ActiveStreams = s.TransportCount
 		s.StreamsPerTransport = 1
@@ -285,6 +305,19 @@ func (p *h3Provider) stats() providerStatsSnapshot {
 	p.mu.Unlock()
 	s.StreamsPerTransport = p.maxStreams
 	return s
+}
+
+func (p *h3Provider) open(ctx context.Context) (*h3ProviderStream, error) {
+	slot, err := p.reserve()
+	if err != nil {
+		return nil, err
+	}
+	stream, err := relay.NewH3MessageStreamOnTransport(ctx, slot.transport, p.opts.URL, p.token)
+	if err != nil {
+		p.release(slot)
+		return nil, err
+	}
+	return &h3ProviderStream{stream: stream, provider: p, slot: slot}, nil
 }
 
 type h3ProviderStream struct {

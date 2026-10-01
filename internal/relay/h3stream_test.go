@@ -317,6 +317,51 @@ func TestH3MessageStreamControlFiltering(t *testing.T) {
 	}
 }
 
+func TestH3MessageStreamProbeValidatesPong(t *testing.T) {
+	requestReader, requestWriter := io.Pipe()
+	defer requestReader.Close()
+	go func() { _, _ = io.Copy(io.Discard, requestReader) }()
+	var wire bytes.Buffer
+	wrong, _ := EncodeControl(ControlOpAttachOK, nil)
+	if err := WriteStreamMessage(&wire, wrong); err != nil {
+		t.Fatal(err)
+	}
+	stream := &H3MessageStream{
+		requestWriter: requestWriter,
+		responseBody:  io.NopCloser(&wire),
+		cancel:        func() {},
+		closed:        make(chan struct{}),
+	}
+	defer stream.Close()
+	if err := stream.Probe(context.Background()); err == nil {
+		t.Fatal("probe accepted a response other than Pong")
+	}
+}
+
+func TestH3MessageStreamProbeTimeoutClosesStream(t *testing.T) {
+	requestReader, requestWriter := io.Pipe()
+	defer requestReader.Close()
+	go func() { _, _ = io.Copy(io.Discard, requestReader) }()
+	responseReader, responseWriter := io.Pipe()
+	defer responseWriter.Close()
+	stream := &H3MessageStream{
+		requestWriter: requestWriter,
+		responseBody:  responseReader,
+		cancel:        func() {},
+		closed:        make(chan struct{}),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := stream.Probe(ctx); err != context.DeadlineExceeded {
+		t.Fatalf("probe error=%v, want deadline exceeded", err)
+	}
+	select {
+	case <-stream.closed:
+	default:
+		t.Fatal("timed-out probe left stream open")
+	}
+}
+
 func TestH3MessageStreamCloseUnblocksWrite(t *testing.T) {
 	reader, writer := io.Pipe()
 	defer reader.Close()

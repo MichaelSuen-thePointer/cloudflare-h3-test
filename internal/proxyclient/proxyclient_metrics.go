@@ -177,6 +177,8 @@ func (c *clientState) snapshot() map[string]any {
 			"attach_total_ns":          s.AttachNanos,
 			"ws_idle":                  s.WSIdle,
 			"ws_dialing":               s.WSDialing,
+			"h3_idle":                  s.H3Idle,
+			"h3_opening":               s.H3Opening,
 			"h3_transports":            s.TransportCount,
 			"h3_active_streams":        s.ActiveStreams,
 			"h3_streams_per_transport": s.StreamsPerTransport,

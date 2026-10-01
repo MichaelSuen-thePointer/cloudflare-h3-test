@@ -18,6 +18,10 @@ import (
 )
 
 func newProviderH3Server(t *testing.T) (string, *x509.CertPool) {
+	return newProviderH3ServerWithProbe(t, true)
+}
+
+func newProviderH3ServerWithProbe(t *testing.T, replyToPing bool) (string, *x509.CertPool) {
 	t.Helper()
 	certificateServer := httptest.NewTLSServer(http.NotFoundHandler())
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -40,14 +44,34 @@ func newProviderH3Server(t *testing.T) (string, *x509.CertPool) {
 			if err := http.NewResponseController(w).Flush(); err != nil {
 				return
 			}
-			attach, err := relay.ReadStreamMessage(r.Body)
-			if err != nil {
-				return
-			}
-			op, _, err := relay.DecodeControl(attach)
-			if err != nil || op != relay.ControlOpAttach {
-				t.Errorf("bad attach: op=%d err=%v", op, err)
-				return
+			for {
+				control, err := relay.ReadStreamMessage(r.Body)
+				if err != nil {
+					return
+				}
+				op, _, err := relay.DecodeControl(control)
+				if err != nil {
+					t.Errorf("bad pre-attach control: %v", err)
+					return
+				}
+				if op == relay.ControlOpAttach {
+					break
+				}
+				if op != relay.ControlOpPing {
+					t.Errorf("bad pre-attach op=%d", op)
+					return
+				}
+				if !replyToPing {
+					<-r.Context().Done()
+					return
+				}
+				pong, _ := relay.EncodeControl(relay.ControlOpPong, nil)
+				if err := relay.WriteStreamMessage(w, pong); err != nil {
+					return
+				}
+				if err := http.NewResponseController(w).Flush(); err != nil {
+					return
+				}
 			}
 			ack, _ := relay.EncodeControl(relay.ControlOpAttachOK, nil)
 			if err := relay.WriteStreamMessage(w, ack); err != nil {
@@ -83,7 +107,7 @@ func newProviderH3Server(t *testing.T) (string, *x509.CertPool) {
 
 func TestH3ProviderSharesAndRetiresTransports(t *testing.T) {
 	remote, certs := newProviderH3Server(t)
-	p, err := newH3Provider(relay.HTTP3ClientOptions{URL: remote, RootCAs: certs}, "token", 2, true)
+	p, err := newH3Provider(relay.HTTP3ClientOptions{URL: remote, RootCAs: certs}, "token", 2, 0, time.Second, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +166,7 @@ func TestH3ProviderSharesAndRetiresTransports(t *testing.T) {
 
 func TestH3ProviderConcurrentAcquisitionAndShutdown(t *testing.T) {
 	remote, certs := newProviderH3Server(t)
-	p, err := newH3Provider(relay.HTTP3ClientOptions{URL: remote, RootCAs: certs}, "token", 3, true)
+	p, err := newH3Provider(relay.HTTP3ClientOptions{URL: remote, RootCAs: certs}, "token", 3, 0, time.Second, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +215,7 @@ func TestH3ProviderConcurrentAcquisitionAndShutdown(t *testing.T) {
 }
 
 func TestH3ProviderReserveReleaseRace(t *testing.T) {
-	p, err := newH3Provider(relay.HTTP3ClientOptions{URL: "https://example.com/"}, "token", 4, true)
+	p, err := newH3Provider(relay.HTTP3ClientOptions{URL: "https://example.com/"}, "token", 4, 0, time.Second, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +250,7 @@ func TestH3ProviderFixedAndIncrementalSessions(t *testing.T) {
 			name = "incremental"
 		}
 		t.Run(name, func(t *testing.T) {
-			provider, err := newH3Provider(relay.HTTP3ClientOptions{URL: remote, RootCAs: certs}, "token", 1, true)
+			provider, err := newH3Provider(relay.HTTP3ClientOptions{URL: remote, RootCAs: certs}, "token", 1, 0, time.Second, true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -274,7 +298,7 @@ func TestH3ProviderFixedAndIncrementalSessions(t *testing.T) {
 
 func TestH3ProviderCanceledSetupRetiresSlot(t *testing.T) {
 	remote, certs := newProviderH3Server(t)
-	p, err := newH3Provider(relay.HTTP3ClientOptions{URL: remote + "blocked", RootCAs: certs}, "token", 1, true)
+	p, err := newH3Provider(relay.HTTP3ClientOptions{URL: remote + "blocked", RootCAs: certs}, "token", 1, 0, time.Second, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,7 +315,7 @@ func TestH3ProviderCanceledSetupRetiresSlot(t *testing.T) {
 
 func TestH3ProviderSingleStreamWithoutMetrics(t *testing.T) {
 	remote, certs := newProviderH3Server(t)
-	p, err := newH3Provider(relay.HTTP3ClientOptions{URL: remote, RootCAs: certs}, "token", 1, false)
+	p, err := newH3Provider(relay.HTTP3ClientOptions{URL: remote, RootCAs: certs}, "token", 1, 0, time.Second, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -321,6 +345,167 @@ func TestH3ProviderSingleStreamWithoutMetrics(t *testing.T) {
 	}
 	if err := stream.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func waitH3PoolIdle(t *testing.T, p *h3Provider, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if idle, opening := p.pool.stats(); idle == want && opening == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	idle, opening := p.pool.stats()
+	t.Fatalf("H3 pool idle=%d opening=%d, want idle=%d", idle, opening, want)
+}
+
+func TestH3ProviderStandbyProbeAttachAndShutdown(t *testing.T) {
+	remote, certs := newProviderH3Server(t)
+	p, err := newH3Provider(relay.HTTP3ClientOptions{URL: remote, RootCAs: certs}, "token", 2, 2, time.Second, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	waitH3PoolIdle(t, p, 2)
+	if got := p.stats(); got.TransportCount != 1 || got.ActiveStreams != 2 || got.H3Idle != 2 {
+		t.Fatalf("prewarmed stats: %+v", got)
+	}
+	p.pool.probeIdle()
+	waitH3PoolIdle(t, p, 2)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	stream, err := p.Acquire(ctx, "standby")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	waitH3PoolIdle(t, p, 2)
+	if got := p.stats(); got.TransportCount != 2 || got.ActiveStreams != 3 || got.H3Idle != 2 {
+		t.Fatalf("refilled stats: %+v", got)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := p.stats(); got.TransportCount != 1 || got.ActiveStreams != 1 || got.H3Idle != 0 {
+		t.Fatalf("shutdown closed attached stream or retained idle streams: %+v", got)
+	}
+	if err := stream.WriteMessage([]byte("still-active")); err != nil {
+		t.Fatal(err)
+	}
+	if body, err := stream.ReadMessage(); err != nil || string(body) != "still-active" {
+		t.Fatalf("body=%q err=%v", body, err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := p.stats(); got.TransportCount != 0 || got.ActiveStreams != 0 {
+		t.Fatalf("final transport retained: %+v", got)
+	}
+}
+
+func TestH3ProviderStandbySingleStreamDirectFallback(t *testing.T) {
+	remote, certs := newProviderH3Server(t)
+	p, err := newH3Provider(relay.HTTP3ClientOptions{URL: remote, RootCAs: certs}, "token", 1, 1, time.Second, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	waitH3PoolIdle(t, p, 1)
+	// Hold the only standby stream to force the no-wait direct acquisition.
+	held := <-p.pool.idle
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	stream, err := p.Acquire(ctx, "fallback")
+	if err != nil {
+		_ = held.Close()
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	if _, ok := stream.(*h3ProviderStream); !ok {
+		t.Fatalf("pooled one-stream mode lost slot ownership: %T", stream)
+	}
+	_ = held.Close()
+	waitH3PoolIdle(t, p, 1)
+	if err := stream.WriteMessage([]byte("fallback-active")); err != nil {
+		t.Fatal(err)
+	}
+	if body, err := stream.ReadMessage(); err != nil || string(body) != "fallback-active" {
+		t.Fatalf("body=%q err=%v", body, err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.slots) != 0 {
+		t.Fatal("single-stream fallback retained a transport")
+	}
+}
+
+func TestH3ProviderFailedProbeReplacesStandbyStream(t *testing.T) {
+	remote, certs := newProviderH3ServerWithProbe(t, false)
+	p, err := newH3Provider(relay.HTTP3ClientOptions{URL: remote, RootCAs: certs}, "token", 1, 1, 500*time.Millisecond, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	waitH3PoolIdle(t, p, 1)
+	old := <-p.pool.idle
+	p.pool.idle <- old
+	p.pool.probeIdle()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		p.mu.Lock()
+		retired := true
+		for _, slot := range p.slots {
+			if slot == old.slot {
+				retired = false
+				break
+			}
+		}
+		p.mu.Unlock()
+		if retired {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("failed probe retained its transport slot")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	waitH3PoolIdle(t, p, 1)
+}
+
+func TestPoolOptionAliases(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts string
+		want int
+		bad  bool
+	}{
+		{"canonical", "pool-size=3", 3, false},
+		{"alias", "ws-pool-size=4", 4, false},
+		{"equal", "pool-size=2;ws-pool-size=2", 2, false},
+		{"conflict", "pool-size=2;ws-pool-size=3", 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts, err := PluginEnv.ParseOptions(tc.opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := resolveIntPoolOption(10, 10, false, false, opts)
+			if (err != nil) != tc.bad || (!tc.bad && got != tc.want) {
+				t.Fatalf("pool size=%d err=%v", got, err)
+			}
+		})
+	}
+	if _, err := resolveIntPoolOption(2, 3, true, true, nil); err == nil {
+		t.Fatal("conflicting CLI pool aliases accepted")
+	}
+	if _, err := newH3Provider(relay.HTTP3ClientOptions{}, "token", 1, -1, time.Second, false); err == nil {
+		t.Fatal("negative H3 pool size accepted")
 	}
 }
 
@@ -357,7 +542,7 @@ func TestLaneOptionAliases(t *testing.T) {
 	if _, err := resolveBoolLaneOption(false, false, false, false, boolOpts); err == nil {
 		t.Fatal("conflicting PluginEnv incremental aliases accepted")
 	}
-	if _, err := newH3Provider(relay.HTTP3ClientOptions{}, "token", 0, false); err == nil {
+	if _, err := newH3Provider(relay.HTTP3ClientOptions{}, "token", 0, 0, time.Second, false); err == nil {
 		t.Fatal("zero stream limit accepted")
 	}
 }
@@ -366,7 +551,7 @@ func TestH3MetricsTransportLabels(t *testing.T) {
 	if !metricsBuild {
 		t.Skip("metrics build required")
 	}
-	p, err := newH3Provider(relay.HTTP3ClientOptions{URL: "https://example.com/"}, "token", 2, true)
+	p, err := newH3Provider(relay.HTTP3ClientOptions{URL: "https://example.com/"}, "token", 2, 0, time.Second, true)
 	if err != nil {
 		t.Fatal(err)
 	}
