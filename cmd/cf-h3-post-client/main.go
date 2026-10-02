@@ -35,6 +35,11 @@ func main() {
 	var duplex bool
 	var allowDNS bool
 	var expectedResponseChunks int
+	var idleDelay, idleKeepalive time.Duration
+	var idleQlog string
+	flag.DurationVar(&idleDelay, "idle-delay", -1, "idle probe: wait after response headers before sending one body; negative disables")
+	flag.DurationVar(&idleKeepalive, "idle-keepalive", 0, "idle probe QUIC keepalive interval; zero disables")
+	flag.StringVar(&idleQlog, "idle-qlog", "", "idle probe QUIC qlog output")
 	flag.StringVar(&rawURL, "url", "https://relay.example.com:2096/", "request URL")
 	flag.StringVar(&connectIP, "connect-ip", "", "optional Cloudflare edge IP")
 	flag.BoolVar(&allowDNS, "allow-dns", false, "explicitly allow DNS selection instead of pinning an edge IP")
@@ -61,6 +66,15 @@ func main() {
 	}
 	if firstWriteDelay < 0 {
 		log.Fatal("-first-write-delay must not be negative")
+	}
+	if idleDelay >= 0 {
+		if idleKeepalive < 0 || chunkSize < 1 || timeout <= idleDelay {
+			log.Fatal("idle probe requires nonnegative keepalive, positive chunk-size, and timeout greater than idle-delay")
+		}
+		if !runIdleProbe(rawURL, connectIP, idleDelay, idleKeepalive, timeout, chunkSize, idleQlog) {
+			log.Fatal("idle probe failed; see idle_result and origin events")
+		}
+		return
 	}
 	if duplex && (!closeBody || expectedResponseChunks < 1) {
 		log.Fatal("duplex requires -close-body and positive -response-chunks")

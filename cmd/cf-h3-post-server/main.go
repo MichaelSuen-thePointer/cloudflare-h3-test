@@ -20,7 +20,7 @@ var eventMu sync.Mutex
 func main() {
 	var listen, cert, key, proto string
 	var readSize int
-	var duplex bool
+	var duplex, idleProbe bool
 	var responseChunks int
 	var responseInterval time.Duration
 	flag.StringVar(&listen, "listen", ":2096", "listen address")
@@ -29,9 +29,13 @@ func main() {
 	flag.StringVar(&proto, "proto", "http1", "origin protocol: http1, http2, or default")
 	flag.IntVar(&readSize, "read-size", 1024, "request body read buffer size")
 	flag.BoolVar(&duplex, "duplex", false, "stream response frames while reading the request body")
+	flag.BoolVar(&idleProbe, "idle-probe", false, "flush response headers, then wait for body without response traffic")
 	flag.IntVar(&responseChunks, "response-chunks", 12, "number of duplex response frames")
 	flag.DurationVar(&responseInterval, "response-interval", time.Second, "duplex response frame interval")
 	flag.Parse()
+	if idleProbe && (proto != "http2" || duplex) {
+		log.Fatal("-idle-probe requires -proto http2 and excludes -duplex")
+	}
 	if proto != "http1" && proto != "http2" && proto != "default" {
 		log.Fatal("-proto must be http1, http2, or default")
 	}
@@ -57,9 +61,14 @@ func main() {
 			"proto":          r.Proto,
 			"content_length": r.ContentLength,
 			"remote_addr":    r.RemoteAddr,
+			"url":            r.URL.String(),
 			"t_ms":           0,
 			"time":           start.Format(time.RFC3339Nano),
 		})
+		if idleProbe {
+			runIdleOrigin(w, r, id, start)
+			return
+		}
 		if duplex {
 			runDuplex(w, r, id, start, readSize, responseChunks, responseInterval)
 			return
