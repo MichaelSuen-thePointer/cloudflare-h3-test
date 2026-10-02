@@ -1,7 +1,7 @@
 # Cloudflare UDP Relay Test Workspace
 
-The production Go relay currently supports WebSocket only. Its old HTTP/3
-relay mode has been removed. A new duplex HTTP/3 implementation is being developed. The independent
+The production Go relay supports WebSocket and duplex HTTP/3 message streams.
+The independent
 `cmd/cf-h3-post-client` and `cmd/cf-h3-post-server` probes remain available for
 full-duplex HTTP/3-to-HTTP/2 experiments.
 
@@ -16,10 +16,12 @@ full-duplex HTTP/3-to-HTTP/2 experiments.
 .\bin\udp-proxy.exe -listen 127.0.0.1:15353 -remote http://127.0.0.1:18083/ -transport ws
 ```
 
-The WebSocket upgrade carries `X-Relay-Token`. The first binary control
+WebSocket upgrades and duplex HTTP/3 POST requests carry `X-Relay-Token`.
+The first binary control
 message binds the lane to a session with `ATTACH`; the server replies with
 `ATTACH_OK`. Subsequent binary messages carry UDP relay frames in both
-directions. The server rejects ordinary HTTP relay requests.
+directions. HTTP/3 clients connect to Cloudflare, which can forward the duplex
+request to the origin over HTTP/2. The legacy HTTP polling relay is removed.
 
 ## Metrics
 
@@ -28,4 +30,3 @@ to enable them. Both proxy binaries accept `-metrics` and `-metrics-out`; a
 JSONL output path also enables metrics. The client additionally accepts
 `-metrics-interval` (default `1s`). Server metrics without an output path are
 written to the process log.
-

@@ -27,26 +27,29 @@ import (
 )
 
 type streamLane struct {
-	index        int
-	stream       relay.MessageStream
-	done         chan struct{}
-	doneOnce     sync.Once
-	encodeBuf    []byte
-	requests     atomic.Int64
-	posts        atomic.Int64
-	postOK       atomic.Int64
-	postErr      atomic.Int64
-	readErr      atomic.Int64
-	closed       atomic.Bool
-	reconnecting atomic.Bool
+	index       int
+	stream      relay.KeepaliveMessageStream
+	done        chan struct{}
+	doneOnce    sync.Once
+	encodeBuf   []byte
+	lastWriteAt time.Time
+	// After publication, lastWriteAt and keepaliveTimer belong to the writer.
+	keepaliveTimer *time.Timer
+	requests       atomic.Int64
+	posts          atomic.Int64
+	postOK         atomic.Int64
+	postErr        atomic.Int64
+	readErr        atomic.Int64
+	closed         atomic.Bool
+	reconnecting   atomic.Bool
 }
 
 type streamLaneSnapshot struct {
 	lanes []*streamLane
 }
 
-func newStreamLane(index int, stream relay.MessageStream) *streamLane {
-	return &streamLane{index: index, stream: stream, done: make(chan struct{})}
+func newStreamLane(index int, stream relay.KeepaliveMessageStream) *streamLane {
+	return &streamLane{index: index, stream: stream, done: make(chan struct{}), lastWriteAt: time.Now()}
 }
 
 func (ln *streamLane) closeWorker() {
@@ -88,6 +91,8 @@ var (
 )
 
 const streamEncodeBufferRetainLimit = 512 << 10
+
+const streamKeepaliveInterval = 10 * time.Second
 
 func Main(args []string) {
 	var listen, remote, token, connectIP, metricsOut, transport, logLevel, pprofAddr string
@@ -379,7 +384,7 @@ func (c *clientState) closeSession(key netip.AddrPort, sess *session) {
 	sess.close()
 }
 
-func (c *clientState) acquireMessageStream(ctx context.Context, sessionID string) (relay.MessageStream, error) {
+func (c *clientState) acquireMessageStream(ctx context.Context, sessionID string) (relay.KeepaliveMessageStream, error) {
 	return c.provider.Acquire(ctx, sessionID)
 }
 
@@ -417,11 +422,11 @@ func (c *clientState) ensureLanes(sess *session, target int) error {
 	}
 	sess.lanesMu.Unlock()
 
-	lanes := make([]*streamLane, target-current)
-	errCh := make(chan error, len(lanes))
-	for i := range lanes {
+	acquisitionCount := target - current
+	errCh := make(chan error, acquisitionCount)
+	for i := range acquisitionCount {
 		index := current + i
-		go func(pos, index int) {
+		go func(index int) {
 			if sess.isClosed() {
 				errCh <- errSessionClosed
 				return
@@ -442,43 +447,56 @@ func (c *clientState) ensureLanes(sess *session, target int) error {
 				errCh <- errSessionClosed
 				return
 			}
-			lanes[pos] = newStreamLane(index, stream)
+			// Start keepalive before slower sibling acquisitions finish.
+			// Publish first so failures use the normal replacement path.
+			ln := newStreamLane(index, stream)
+			sess.lanesMu.Lock()
+			if sess.isClosed() {
+				sess.lanesMu.Unlock()
+				_ = stream.Close()
+				errCh <- errSessionClosed
+				return
+			}
+			sess.lanes = append(sess.lanes, ln)
+			sess.publishLaneSnapshotLocked()
+			sess.lanesMu.Unlock()
+			sess.goRun(func() { sess.laneReadLoop(c, ln) })
+			sess.goRun(func() { sess.laneWriteLoop(c, ln) })
 			errCh <- nil
-		}(i, index)
+		}(index)
 	}
 	var firstErr error
-	for range lanes {
+	for range acquisitionCount {
 		if err := <-errCh; err != nil {
+			// Stop early workers and pending acquisitions before cleanup
+			// can trigger a reconnect for a lane being discarded.
+			sess.cancel()
 			if firstErr == nil || errors.Is(firstErr, errSessionClosed) {
 				firstErr = err
 			}
 		}
 	}
 	if firstErr != nil {
-		for _, ln := range lanes {
-			if ln != nil {
-				_ = ln.stream.Close()
-			}
+		// Include early reconnect replacements in terminal startup cleanup.
+		sess.lanesMu.Lock()
+		published := sess.lanes
+		sess.lanes = nil
+		sess.publishLaneSnapshotLocked()
+		sess.lanesMu.Unlock()
+		for _, ln := range published {
+			ln.closeWorker()
+			_ = ln.stream.Close()
 		}
 		return firstErr
 	}
 
 	sess.lanesMu.Lock()
 	if sess.isClosed() {
-		for _, ln := range lanes {
-			if ln != nil {
-				_ = ln.stream.Close()
-			}
-		}
 		sess.lanesMu.Unlock()
 		return errSessionClosed
 	}
-	for _, ln := range lanes {
-		ln := ln
+	for range acquisitionCount {
 		c.countTransport()
-		sess.lanes = append(sess.lanes, ln)
-		sess.goRun(func() { sess.laneReadLoop(c, ln) })
-		sess.goRun(func() { sess.laneWriteLoop(c, ln) })
 	}
 	sess.publishLaneSnapshotLocked()
 	sess.lanesMu.Unlock()
@@ -821,8 +839,11 @@ func (c *clientState) usesDirectLaneWrite() bool {
 }
 
 func (s *session) laneWriteLoop(c *clientState, ln *streamLane) {
+	ln.keepaliveTimer = time.NewTimer(time.Until(ln.lastWriteAt.Add(streamKeepaliveInterval)))
+	defer ln.keepaliveTimer.Stop()
+	keepalive := ln.keepaliveTimer.C
 	if c.usesDirectLaneWrite() {
-		s.directLaneWriteLoop(c, ln)
+		s.directLaneWriteLoop(c, ln, keepalive)
 		return
 	}
 	for {
@@ -833,6 +854,10 @@ func (s *session) laneWriteLoop(c *clientState, ln *streamLane) {
 			return
 		case <-ln.done:
 			return
+		case <-keepalive:
+			if !s.writeLanePing(ln) {
+				return
+			}
 		case frames := <-s.batchQ:
 			if ln.closed.Load() {
 				s.returnBatch(frames)
@@ -846,7 +871,9 @@ func (s *session) laneWriteLoop(c *clientState, ln *streamLane) {
 	}
 }
 
-func (s *session) directLaneWriteLoop(c *clientState, ln *streamLane) {
+func (s *session) directLaneWriteLoop(c *clientState, ln *streamLane, keepalive <-chan time.Time) {
+	var sendQ <-chan []byte
+	ready := (<-chan struct{})(s.ready)
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -855,7 +882,14 @@ func (s *session) directLaneWriteLoop(c *clientState, ln *streamLane) {
 			return
 		case <-ln.done:
 			return
-		case payload := <-s.sendQ:
+		case <-ready:
+			sendQ = s.sendQ
+			ready = nil
+		case <-keepalive:
+			if !s.writeLanePing(ln) {
+				return
+			}
+		case payload := <-sendQ:
 			if ln.closed.Load() {
 				return
 			}
@@ -946,15 +980,49 @@ func (s *session) writeEncodedFrameChunk(ln *streamLane, frames []relay.Frame, b
 	defer s.countLaneWriteDone(ln)
 	if err := ln.stream.WriteMessageOwned(body); err != nil {
 		s.countLaneWriteError(ln)
-		ln.closed.Store(true)
-		ln.closeWorker()
-		s.notifyLanesChanged()
-		s.goRun(func() { s.reconnectLane(s.state, ln) })
-		appLog.WarnRate("stream_write_failed", 10*time.Second, "stream-write-failed", "session", s.id, "lane", ln.index, "err", err, "transport", s.state.transport)
+		s.failLaneWrite(ln, err)
 		return false
+	}
+	if ln.keepaliveTimer != nil {
+		ln.lastWriteAt = time.Now()
 	}
 	s.countLaneWriteOK(ln)
 	return true
+}
+
+// writeLanePing runs in the existing writer; the lane reader consumes Pong.
+func (s *session) writeLanePing(ln *streamLane) bool {
+	select {
+	case <-s.ctx.Done():
+		return false
+	case <-s.closed:
+		return false
+	case <-ln.done:
+		return false
+	default:
+	}
+	if ln.closed.Load() {
+		return false
+	}
+	if remaining := time.Until(ln.lastWriteAt.Add(streamKeepaliveInterval)); remaining > 0 {
+		ln.keepaliveTimer.Reset(remaining)
+		return true
+	}
+	if err := ln.stream.SendPing(); err != nil {
+		s.failLaneWrite(ln, err)
+		return false
+	}
+	ln.lastWriteAt = time.Now()
+	ln.keepaliveTimer.Reset(streamKeepaliveInterval)
+	return true
+}
+
+func (s *session) failLaneWrite(ln *streamLane, err error) {
+	ln.closed.Store(true)
+	ln.closeWorker()
+	s.notifyLanesChanged()
+	s.goRun(func() { s.reconnectLane(s.state, ln) })
+	appLog.WarnRate("stream_write_failed", 10*time.Second, "stream-write-failed", "session", s.id, "lane", ln.index, "err", err, "transport", s.state.transport)
 }
 
 func (ln *streamLane) retainEncodeBuffer(body []byte) {

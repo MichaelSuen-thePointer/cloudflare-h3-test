@@ -11,7 +11,7 @@ import (
 
 const (
 	h3PoolRefillInterval = 200 * time.Millisecond
-	h3PoolPingInterval   = 10 * time.Second
+	h3PingInterval       = 10 * time.Second
 )
 
 // h3Pool owns only unattached streams. A stream taken by Acquire belongs to
@@ -42,7 +42,7 @@ func newH3Pool(provider *h3Provider, target int, timeout time.Duration) *h3Pool 
 func (p *h3Pool) run() {
 	refill := time.NewTicker(h3PoolRefillInterval)
 	defer refill.Stop()
-	ping := time.NewTicker(h3PoolPingInterval)
+	ping := time.NewTicker(h3PingInterval)
 	defer ping.Stop()
 	for {
 		select {
