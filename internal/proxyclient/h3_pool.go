@@ -11,7 +11,7 @@ import (
 
 const (
 	h3PoolRefillInterval = 200 * time.Millisecond
-	h3PoolPingInterval   = 15 * time.Second
+	h3PoolPingInterval   = 10 * time.Second
 )
 
 // h3Pool owns only unattached streams. A stream taken by Acquire belongs to
