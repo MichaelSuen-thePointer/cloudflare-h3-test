@@ -85,6 +85,14 @@ func newProviderH3ServerWithProbe(t *testing.T, replyToPing bool) (string, *x509
 				if err != nil {
 					return
 				}
+				if relay.IsControlMessage(body) {
+					op, payload, err := relay.DecodeControl(body)
+					if err != nil || op != relay.ControlOpPing || len(payload) != 0 {
+						t.Errorf("bad attached control: op=%v payload=%x err=%v", op, payload, err)
+						return
+					}
+					body, _ = relay.EncodeControl(relay.ControlOpPong, nil)
+				}
 				if err := relay.WriteStreamMessage(w, body); err != nil {
 					return
 				}
@@ -173,7 +181,7 @@ func TestH3ProviderConcurrentAcquisitionAndShutdown(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	const count = 9
-	streams := make([]relay.MessageStream, count)
+	streams := make([]relay.KeepaliveMessageStream, count)
 	errCh := make(chan error, count)
 	var wg sync.WaitGroup
 	for i := range streams {
@@ -206,7 +214,7 @@ func TestH3ProviderConcurrentAcquisitionAndShutdown(t *testing.T) {
 	}
 	for _, stream := range streams {
 		wg.Add(1)
-		go func(stream relay.MessageStream) { defer wg.Done(); _ = stream.Close() }(stream)
+		go func(stream relay.KeepaliveMessageStream) { defer wg.Done(); _ = stream.Close() }(stream)
 	}
 	wg.Wait()
 	if got := p.stats(); got.TransportCount != 0 || got.ActiveStreams != 0 {

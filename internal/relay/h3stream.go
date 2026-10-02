@@ -124,6 +124,11 @@ func (s *H3MessageStream) WriteMessageOwned(payload []byte) error {
 	return s.writeMessage(payload)
 }
 
+func (s *H3MessageStream) SendPing() error {
+	body, _ := EncodeControl(ControlOpPing, nil)
+	return s.writeMessage(body)
+}
+
 func (s *H3MessageStream) writeMessage(payload []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -171,8 +176,7 @@ func (s *H3MessageStream) ReadMessageView() ([]byte, error) { return s.ReadMessa
 
 func (s *H3MessageStream) Probe(ctx context.Context) error {
 	return s.runSetup(ctx, func() error {
-		body, _ := EncodeControl(ControlOpPing, nil)
-		if err := s.WriteMessage(body); err != nil {
+		if err := s.SendPing(); err != nil {
 			return err
 		}
 		response, err := ReadStreamMessage(s.responseBody)

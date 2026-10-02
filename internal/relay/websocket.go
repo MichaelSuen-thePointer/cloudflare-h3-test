@@ -210,7 +210,7 @@ func (c *WebSocketConn) Probe(ctx context.Context) (err error) {
 			err = ctxErr
 		}
 	}()
-	return c.Ping(nil)
+	return c.SendPing()
 }
 
 func AcceptWebSocket(w http.ResponseWriter, r *http.Request) (*WebSocketConn, error) {
@@ -359,6 +359,8 @@ func (c *WebSocketConn) writeBinary(payload []byte, owned bool) error {
 func (c *WebSocketConn) Ping(payload []byte) error {
 	return c.writeControl(0x9, payload)
 }
+
+func (c *WebSocketConn) SendPing() error { return c.Ping(nil) }
 
 func (c *WebSocketConn) ReadWebSocketMessage() (byte, []byte, error) {
 	return c.readMessage(false)

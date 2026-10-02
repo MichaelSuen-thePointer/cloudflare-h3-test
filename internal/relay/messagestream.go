@@ -11,9 +11,16 @@ type MessageStream interface {
 	Close() error
 }
 
+// KeepaliveMessageStream is a client stream with send-only control keepalive.
+type KeepaliveMessageStream interface {
+	MessageStream
+	// SendPing serializes with other writes and never reads the response.
+	SendPing() error
+}
+
 // AttachableMessageStream is a ready stream before it joins a UDP session.
 type AttachableMessageStream interface {
-	MessageStream
+	KeepaliveMessageStream
 	Attach(context.Context, string) error
 	Probe(context.Context) error
 }

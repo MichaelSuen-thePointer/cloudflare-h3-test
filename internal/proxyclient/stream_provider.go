@@ -12,7 +12,7 @@ import (
 )
 
 type streamProvider interface {
-	Acquire(context.Context, string) (relay.MessageStream, error)
+	Acquire(context.Context, string) (relay.KeepaliveMessageStream, error)
 	Close() error
 	stats() providerStatsSnapshot
 }
@@ -59,7 +59,7 @@ func newWSProvider(remote, connectIP, token string, target int, timeout time.Dur
 	return &wsProvider{pool: newWSPool(remote, connectIP, token, target, timeout, socketOptions), token: token, counters: providerStats{enabled: metrics}}
 }
 
-func (p *wsProvider) Acquire(ctx context.Context, sessionID string) (relay.MessageStream, error) {
+func (p *wsProvider) Acquire(ctx context.Context, sessionID string) (relay.KeepaliveMessageStream, error) {
 	var start time.Time
 	if p.counters.enabled {
 		start = time.Now()
@@ -173,7 +173,7 @@ func (p *h3Provider) release(slot *h3TransportSlot) {
 	}
 }
 
-func (p *h3Provider) Acquire(ctx context.Context, sessionID string) (relay.MessageStream, error) {
+func (p *h3Provider) Acquire(ctx context.Context, sessionID string) (relay.KeepaliveMessageStream, error) {
 	var start time.Time
 	if p.counters.enabled {
 		start = time.Now()
@@ -219,7 +219,7 @@ func (p *h3Provider) Acquire(ctx context.Context, sessionID string) (relay.Messa
 	return stream, nil
 }
 
-func (p *h3Provider) acquirePrivate(ctx context.Context, sessionID string) (relay.MessageStream, error) {
+func (p *h3Provider) acquirePrivate(ctx context.Context, sessionID string) (relay.KeepaliveMessageStream, error) {
 	if p.closed.Load() {
 		p.countAcquireFailed()
 		return nil, http3.ErrTransportClosed
@@ -332,6 +332,7 @@ func (s *h3ProviderStream) WriteMessage(p []byte) error      { return s.stream.W
 func (s *h3ProviderStream) WriteMessageOwned(p []byte) error { return s.stream.WriteMessageOwned(p) }
 func (s *h3ProviderStream) ReadMessage() ([]byte, error)     { return s.stream.ReadMessage() }
 func (s *h3ProviderStream) ReadMessageView() ([]byte, error) { return s.stream.ReadMessageView() }
+func (s *h3ProviderStream) SendPing() error                  { return s.stream.SendPing() }
 func (s *h3ProviderStream) Close() error {
 	s.once.Do(func() {
 		s.closeErr = s.stream.Close()
@@ -347,4 +348,4 @@ func (s *h3ProviderStream) Close() error {
 var _ streamProvider = (*wsProvider)(nil)
 var _ streamProvider = (*h3Provider)(nil)
 var _ relay.MessageViewReader = (*h3ProviderStream)(nil)
-var _ relay.MessageStream = (*h3ProviderStream)(nil)
+var _ relay.KeepaliveMessageStream = (*h3ProviderStream)(nil)
