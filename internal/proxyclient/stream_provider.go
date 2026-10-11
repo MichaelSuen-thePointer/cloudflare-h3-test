@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"cloudflare-h3-test/internal/quality"
 	"cloudflare-h3-test/internal/relay"
 	"github.com/quic-go/quic-go/http3"
 )
@@ -55,8 +56,8 @@ type wsProvider struct {
 	counters  providerStats
 }
 
-func newWSProvider(remote, connectIP, token string, target int, timeout time.Duration, socketOptions relay.WebSocketSocketOptions, metrics bool) *wsProvider {
-	return &wsProvider{pool: newWSPool(remote, connectIP, token, target, timeout, socketOptions), token: token, counters: providerStats{enabled: metrics}}
+func newWSProvider(remote, connectIP, token string, target int, timeout time.Duration, socketOptions relay.WebSocketSocketOptions, metrics bool, recorders ...*quality.Recorder) *wsProvider {
+	return &wsProvider{pool: newWSPool(remote, connectIP, token, target, timeout, socketOptions, recorders...), token: token, counters: providerStats{enabled: metrics}}
 }
 
 func (p *wsProvider) Acquire(ctx context.Context, sessionID string) (relay.KeepaliveMessageStream, error) {
@@ -101,6 +102,7 @@ type h3TransportSlot struct {
 }
 
 type h3Provider struct {
+	quality        *quality.Recorder
 	mu             sync.Mutex
 	slots          []*h3TransportSlot
 	closed         atomic.Bool
@@ -113,7 +115,7 @@ type h3Provider struct {
 	closeOnce      sync.Once
 }
 
-func newH3Provider(opts relay.HTTP3ClientOptions, token string, maxStreams, poolSize int, timeout time.Duration, metrics bool) (*h3Provider, error) {
+func newH3Provider(opts relay.HTTP3ClientOptions, token string, maxStreams, poolSize int, timeout time.Duration, metrics bool, recorders ...*quality.Recorder) (*h3Provider, error) {
 	if maxStreams <= 0 {
 		return nil, errors.New("h3-streams-per-transport must be positive")
 	}
@@ -124,6 +126,9 @@ func newH3Provider(opts relay.HTTP3ClientOptions, token string, maxStreams, pool
 		return nil, err
 	}
 	p := &h3Provider{opts: opts, token: token, maxStreams: maxStreams, counters: providerStats{enabled: metrics}}
+	if len(recorders) > 0 {
+		p.quality = recorders[0]
+	}
 	if poolSize > 0 {
 		p.pool = newH3Pool(p, poolSize, timeout)
 	}
@@ -201,7 +206,9 @@ func (p *h3Provider) Acquire(ctx context.Context, sessionID string) (relay.Keepa
 	if p.counters.enabled {
 		attachStart = time.Now()
 	}
+	attach := p.quality.Begin(quality.Subject{}, "h3-attach")
 	err = stream.stream.Attach(ctx, sessionID)
+	attach.End(err)
 	if p.counters.enabled {
 		p.counters.attachNanos.Add(time.Since(attachStart).Nanoseconds())
 	}
@@ -233,7 +240,9 @@ func (p *h3Provider) acquirePrivate(ctx context.Context, sessionID string) (rela
 			p.privateStreams.Add(-1)
 		}
 	}()
+	open := p.quality.Begin(quality.Subject{}, "h3-open-private")
 	stream, err := relay.NewH3MessageStream(ctx, p.opts, p.token)
+	open.End(err)
 	if err != nil {
 		p.countAcquireFailed()
 		return nil, err
@@ -242,7 +251,9 @@ func (p *h3Provider) acquirePrivate(ctx context.Context, sessionID string) (rela
 	if p.counters.enabled {
 		attachStart = time.Now()
 	}
+	attach := p.quality.Begin(quality.Subject{}, "h3-attach")
 	err = stream.Attach(ctx, sessionID)
+	attach.End(err)
 	if p.counters.enabled {
 		p.counters.attachNanos.Add(time.Since(attachStart).Nanoseconds())
 	}
@@ -307,7 +318,9 @@ func (p *h3Provider) stats() providerStatsSnapshot {
 	return s
 }
 
-func (p *h3Provider) open(ctx context.Context) (*h3ProviderStream, error) {
+func (p *h3Provider) open(ctx context.Context) (result *h3ProviderStream, resultErr error) {
+	op := p.quality.Begin(quality.Subject{}, "h3-open")
+	defer func() { op.End(resultErr) }()
 	slot, err := p.reserve()
 	if err != nil {
 		return nil, err

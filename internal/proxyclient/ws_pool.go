@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"cloudflare-h3-test/internal/quality"
 	"cloudflare-h3-test/internal/relay"
 )
 
@@ -15,6 +16,7 @@ const (
 )
 
 type wsPool struct {
+	quality       *quality.Recorder
 	remote        string
 	connectIP     string
 	token         string
@@ -36,7 +38,7 @@ type pooledWebSocket struct {
 	conn *relay.WebSocketConn
 }
 
-func newWSPool(remote, connectIP, token string, target int, timeout time.Duration, socketOptions relay.WebSocketSocketOptions) *wsPool {
+func newWSPool(remote, connectIP, token string, target int, timeout time.Duration, socketOptions relay.WebSocketSocketOptions, recorders ...*quality.Recorder) *wsPool {
 	if target < 0 {
 		target = 0
 	}
@@ -52,12 +54,16 @@ func newWSPool(remote, connectIP, token string, target int, timeout time.Duratio
 		cancel:        cancel,
 		idle:          make(chan pooledWebSocket, target),
 	}
+	if len(recorders) > 0 {
+		p.quality = recorders[0]
+	}
 	p.refill()
 	go p.run()
 	return p
 }
 
 func (p *wsPool) Close() {
+	p.quality.Life(quality.Subject{}, "pool-lifecycle", "ws-close")
 	p.mu.Lock()
 	p.closing = true
 	p.mu.Unlock()
@@ -66,6 +72,7 @@ func (p *wsPool) Close() {
 	for {
 		select {
 		case item := <-p.idle:
+			p.quality.Life(quality.Subject{}, "pool-lifecycle", "ws-evict")
 			_ = item.conn.Close()
 		default:
 			return
@@ -81,8 +88,10 @@ func (p *wsPool) Acquire(ctx context.Context, token, sessionID string) (*relay.W
 		case <-p.ctx.Done():
 			return nil, p.ctx.Err()
 		case item := <-p.idle:
+			p.quality.Life(quality.Subject{}, "pool-lifecycle", "ws-take")
 			p.refill()
-			if err := attachWebSocket(ctx, item.conn, sessionID); err != nil {
+			if err := attachWebSocket(ctx, item.conn, sessionID, p.quality); err != nil {
+				p.quality.Life(quality.Subject{}, "pool-lifecycle", "ws-evict")
 				_ = item.conn.Close()
 				continue
 			}
@@ -92,7 +101,8 @@ func (p *wsPool) Acquire(ctx context.Context, token, sessionID string) (*relay.W
 			if err != nil {
 				return nil, err
 			}
-			if err := attachWebSocket(ctx, ws, sessionID); err != nil {
+			if err := attachWebSocket(ctx, ws, sessionID, p.quality); err != nil {
+				p.quality.Life(quality.Subject{}, "pool-lifecycle", "ws-evict")
 				_ = ws.Close()
 				return nil, err
 			}
@@ -125,7 +135,11 @@ func (p *wsPool) pingIdle() {
 	for {
 		select {
 		case item := <-p.idle:
-			if err := item.conn.Ping(nil); err != nil {
+			op := p.quality.Begin(quality.Subject{}, "ws-pool-ping")
+			err := item.conn.Ping(nil)
+			op.End(err)
+			if err != nil {
+				p.quality.Life(quality.Subject{}, "pool-lifecycle", "ws-evict")
 				_ = item.conn.Close()
 				continue
 			}
@@ -134,9 +148,12 @@ func (p *wsPool) pingIdle() {
 			for _, item := range keep {
 				select {
 				case p.idle <- item:
+					p.quality.Life(quality.Subject{}, "pool-lifecycle", "ws-idle")
 				case <-p.ctx.Done():
+					p.quality.Life(quality.Subject{}, "pool-lifecycle", "ws-evict")
 					_ = item.conn.Close()
 				default:
+					p.quality.Life(quality.Subject{}, "pool-lifecycle", "ws-evict")
 					_ = item.conn.Close()
 				}
 			}
@@ -166,6 +183,7 @@ func (p *wsPool) refill() {
 }
 
 func (p *wsPool) dialIdle() {
+	p.quality.Life(quality.Subject{}, "pool-lifecycle", "ws-dial-idle")
 	defer func() {
 		p.mu.Lock()
 		p.dialing--
@@ -184,17 +202,30 @@ func (p *wsPool) dialIdle() {
 	item := pooledWebSocket{conn: ws}
 	select {
 	case p.idle <- item:
+		p.quality.Life(quality.Subject{}, "pool-lifecycle", "ws-idle")
 	case <-p.ctx.Done():
+		p.quality.Life(quality.Subject{}, "pool-lifecycle", "ws-evict")
 		_ = ws.Close()
 	default:
+		p.quality.Life(quality.Subject{}, "pool-lifecycle", "ws-evict")
 		_ = ws.Close()
 	}
 }
 
 func (p *wsPool) dial(ctx context.Context, token string) (*relay.WebSocketConn, error) {
-	return relay.DialWebSocketWithOptions(ctx, p.remote, p.connectIP, token, p.timeout, p.socketOptions)
+	op := p.quality.Begin(quality.Subject{}, "ws-pool-dial")
+	conn, err := relay.DialWebSocketWithOptions(ctx, p.remote, p.connectIP, token, p.timeout, p.socketOptions)
+	op.End(err)
+	return conn, err
 }
 
-func attachWebSocket(ctx context.Context, ws *relay.WebSocketConn, sessionID string) error {
-	return relay.AttachWebSocketSession(ctx, ws, sessionID)
+func attachWebSocket(ctx context.Context, ws *relay.WebSocketConn, sessionID string, recorders ...*quality.Recorder) error {
+	var r *quality.Recorder
+	if len(recorders) > 0 {
+		r = recorders[0]
+	}
+	op := r.Begin(quality.Subject{}, "ws-attach")
+	err := relay.AttachWebSocketSession(ctx, ws, sessionID)
+	op.End(err)
+	return err
 }

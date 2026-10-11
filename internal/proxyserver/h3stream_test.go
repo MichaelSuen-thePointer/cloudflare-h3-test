@@ -12,12 +12,15 @@ import (
 	"testing"
 	"time"
 
+	"cloudflare-h3-test/internal/quality"
 	"cloudflare-h3-test/internal/relay"
 )
 
-func TestH3OriginDuplexOverHTTP2(t *testing.T) {
-	s := &server{token: "example-token", benchEcho: true, batchSize: 1, sessions: map[string]*session{}}
-	origin := httptest.NewUnstartedServer(http.HandlerFunc(s.handle))
+func TestH3OriginDuplexOverHTTP2(t *testing.T) { testH3OriginDuplexOverHTTP2(t, nil) }
+func testH3OriginDuplexOverHTTP2(t *testing.T, recorder *quality.Recorder) {
+	s := &server{quality: recorder, token: "example-token", benchEcho: true, batchSize: 1, sessions: map[string]*session{}}
+	handlerDone := make(chan struct{})
+	origin := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) { defer close(handlerDone); s.handle(w, req) }))
 	origin.EnableHTTP2 = true
 	origin.StartTLS()
 	defer origin.Close()
@@ -120,6 +123,11 @@ func TestH3OriginDuplexOverHTTP2(t *testing.T) {
 	}
 	_ = write.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
+	select {
+	case <-handlerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not exit")
+	}
 	deadline := time.After(2 * time.Second)
 	for sess.laneCount() != 0 {
 		select {

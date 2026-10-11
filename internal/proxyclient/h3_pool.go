@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"cloudflare-h3-test/internal/quality"
 	"github.com/quic-go/quic-go/http3"
 )
 
@@ -72,6 +73,7 @@ func (p *h3Pool) refill() {
 }
 
 func (p *h3Pool) openIdle() {
+	p.provider.quality.Life(quality.Subject{}, "pool-lifecycle", "h3-open-idle")
 	defer func() {
 		p.mu.Lock()
 		p.opening--
@@ -90,14 +92,17 @@ func (p *h3Pool) openIdle() {
 	p.mu.Lock()
 	if p.closing {
 		p.mu.Unlock()
+		p.provider.quality.Life(quality.Subject{}, "pool-lifecycle", "h3-evict")
 		_ = stream.Close()
 		return
 	}
 	select {
 	case p.idle <- stream:
+		p.provider.quality.Life(quality.Subject{}, "pool-lifecycle", "h3-idle")
 		p.mu.Unlock()
 	default:
 		p.mu.Unlock()
+		p.provider.quality.Life(quality.Subject{}, "pool-lifecycle", "h3-evict")
 		_ = stream.Close()
 	}
 }
@@ -134,21 +139,28 @@ func (p *h3Pool) probe(stream *h3ProviderStream) {
 	}()
 	ctx, cancel := context.WithTimeout(p.ctx, p.timeout)
 	defer cancel()
-	if err := stream.stream.Probe(ctx); err != nil {
+	op := p.provider.quality.Begin(quality.Subject{}, "h3-pool-probe")
+	err := stream.stream.Probe(ctx)
+	op.End(err)
+	if err != nil {
+		p.provider.quality.Life(quality.Subject{}, "pool-lifecycle", "h3-evict")
 		_ = stream.Close()
 		return
 	}
 	p.mu.Lock()
 	if p.closing {
 		p.mu.Unlock()
+		p.provider.quality.Life(quality.Subject{}, "pool-lifecycle", "h3-evict")
 		_ = stream.Close()
 		return
 	}
 	select {
 	case p.idle <- stream:
+		p.provider.quality.Life(quality.Subject{}, "pool-lifecycle", "h3-idle")
 		p.mu.Unlock()
 	default:
 		p.mu.Unlock()
+		p.provider.quality.Life(quality.Subject{}, "pool-lifecycle", "h3-evict")
 		_ = stream.Close()
 	}
 }
@@ -161,8 +173,10 @@ func (p *h3Pool) acquire(ctx context.Context, sessionID string) (*h3ProviderStre
 		case <-p.ctx.Done():
 			return nil, http3.ErrTransportClosed
 		case stream := <-p.idle:
+			p.provider.quality.Life(quality.Subject{}, "pool-lifecycle", "h3-take")
 			p.refill()
 			if err := p.attach(ctx, stream, sessionID); err != nil {
+				p.provider.quality.Life(quality.Subject{}, "pool-lifecycle", "h3-evict")
 				_ = stream.Close()
 				if ctx.Err() != nil || p.ctx.Err() != nil {
 					return nil, err
@@ -180,6 +194,7 @@ func (p *h3Pool) acquire(ctx context.Context, sessionID string) (*h3ProviderStre
 				return nil, err
 			}
 			if err := p.attach(ctx, stream, sessionID); err != nil {
+				p.provider.quality.Life(quality.Subject{}, "pool-lifecycle", "h3-evict")
 				_ = stream.Close()
 				return nil, err
 			}
@@ -189,7 +204,9 @@ func (p *h3Pool) acquire(ctx context.Context, sessionID string) (*h3ProviderStre
 	}
 }
 
-func (p *h3Pool) attach(ctx context.Context, stream *h3ProviderStream, sessionID string) error {
+func (p *h3Pool) attach(ctx context.Context, stream *h3ProviderStream, sessionID string) (resultErr error) {
+	op := p.provider.quality.Begin(quality.Subject{}, "h3-attach")
+	defer func() { op.End(resultErr) }()
 	attachCtx, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(p.ctx, cancel)
 	defer func() { stop(); cancel() }()
@@ -208,6 +225,7 @@ func (p *h3Pool) attach(ctx context.Context, stream *h3ProviderStream, sessionID
 }
 
 func (p *h3Pool) close() {
+	p.provider.quality.Life(quality.Subject{}, "pool-lifecycle", "h3-close")
 	p.mu.Lock()
 	p.closing = true
 	p.mu.Unlock()
@@ -216,6 +234,7 @@ func (p *h3Pool) close() {
 	for {
 		select {
 		case stream := <-p.idle:
+			p.provider.quality.Life(quality.Subject{}, "pool-lifecycle", "h3-evict")
 			_ = stream.Close()
 		default:
 			return

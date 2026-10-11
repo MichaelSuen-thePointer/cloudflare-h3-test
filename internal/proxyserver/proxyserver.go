@@ -18,6 +18,7 @@ import (
 	"cloudflare-h3-test/internal/coarsetime"
 	"cloudflare-h3-test/internal/diaglog"
 	PluginEnv "cloudflare-h3-test/internal/pluginopts"
+	"cloudflare-h3-test/internal/quality"
 	"cloudflare-h3-test/internal/relay"
 )
 
@@ -32,6 +33,8 @@ var (
 )
 
 type session struct {
+	qr                   *quality.Recorder
+	q                    quality.Subject
 	id                   string
 	udp                  *net.UDPConn
 	queue                chan relay.Frame
@@ -52,6 +55,8 @@ type session struct {
 }
 
 type serverLane struct {
+	qr        *quality.Recorder
+	q         quality.Subject
 	stream    relay.MessageStream
 	transport string
 	id        int64
@@ -62,6 +67,7 @@ type serverLane struct {
 }
 
 type server struct {
+	quality               *quality.Recorder
 	token                 string
 	upstream              *net.UDPAddr
 	benchEcho             bool
@@ -107,6 +113,7 @@ type serverStats struct {
 }
 
 func Main(args []string) {
+	qualityConfig := quality.Defaults("server")
 	var listen, cert, key, token, upstream, metricsOut, logLevel string
 	var udpBuffer, downQueue, batchSize, downExpandLanesMax, wsSocketSendBuffer, wsSocketReceiveBuffer int
 	var benchEcho, metrics, useSyslog bool
@@ -131,6 +138,7 @@ func Main(args []string) {
 	fs.IntVar(&wsSocketReceiveBuffer, "ws-socket-recv-buffer", 0, "WebSocket TCP socket receive buffer bytes, 0 keeps OS default")
 	fs.IntVar(&downExpandLanesMax, "down-expand-lanes-max", 1, "maximum attached lanes before suppressing server downlink expand hints")
 	fs.DurationVar(&downExpandHintTimeout, "down-expand-hint-timeout", 15*time.Second, "time to wait for a hinted lane before sending another downlink expand hint")
+	qualityConfig.Flags(fs)
 	fs.Parse(args)
 
 	if err := configureLogger("proxy-server", logLevel, useSyslog); err != nil {
@@ -139,6 +147,9 @@ func Main(args []string) {
 
 	pluginEnv, err := PluginEnv.LoadFromEnv()
 	if err != nil {
+		log.Fatal(err)
+	}
+	if err := qualityConfig.ApplyOptions(pluginEnv.Options); err != nil {
 		log.Fatal(err)
 	}
 	if pluginEnv.Enabled {
@@ -183,8 +194,16 @@ func Main(args []string) {
 		metrics = false
 		metricsOut = ""
 	}
+	recorder := quality.New(qualityConfig, "server", func(path string, err error) {
+		if err != nil {
+			appLog.Warn("quality-disabled", "path", path, "err", err)
+		} else {
+			appLog.Info("quality-start", "path", path)
+		}
+	})
+	defer recorder.Stop(2 * time.Second)
 	wsSocketOptions := relay.WebSocketSocketOptions{SendBuffer: wsSocketSendBuffer, ReceiveBuffer: wsSocketReceiveBuffer}
-	s := &server{token: token, upstream: addr, benchEcho: benchEcho, idle: idle, udpBuffer: udpBuffer, downQueue: downQueue, batchSize: batchSize, batchDelay: batchDelay, wsSocketOptions: wsSocketOptions, downExpandLanesMax: downExpandLanesMax, downExpandHintTimeout: downExpandHintTimeout, metrics: metrics, sessions: map[string]*session{}}
+	s := &server{quality: recorder, token: token, upstream: addr, benchEcho: benchEcho, idle: idle, udpBuffer: udpBuffer, downQueue: downQueue, batchSize: batchSize, batchDelay: batchDelay, wsSocketOptions: wsSocketOptions, downExpandLanesMax: downExpandLanesMax, downExpandHintTimeout: downExpandHintTimeout, metrics: metrics, sessions: map[string]*session{}}
 	go s.cleanupLoop()
 	if metricsBuild && metricsOut != "" {
 		go s.writeMetrics(metricsOut, 5*time.Second)
@@ -241,10 +260,13 @@ func (s *server) handleH3Stream(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	s.countStatus(http.StatusOK)
 	if err := http.NewResponseController(w).Flush(); err != nil {
+		s.quality.Error(quality.Subject{}, "h3-response-flush", err, nil)
 		return
 	}
 	stream := &h3ServerStream{requestBody: r.Body, response: w}
+	op := s.quality.Begin(quality.Subject{}, "h3-attach-read")
 	id, err := readH3AttachSession(stream)
+	op.End(err)
 	if err != nil {
 		_ = stream.Close()
 		appLog.WarnRate("h3_attach_failed", 10*time.Second, "h3-attach-failed", "remote", r.RemoteAddr, "err", err)
@@ -256,11 +278,14 @@ func (s *server) handleH3Stream(w http.ResponseWriter, r *http.Request) {
 func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	ws, err := relay.AcceptWebSocketWithOptions(w, r, s.wsSocketOptions)
 	if err != nil {
+		s.quality.Error(quality.Subject{}, "websocket-accept-failed", err, nil)
 		appLog.WarnRate("websocket_accept_failed", 10*time.Second, "websocket-accept-failed", "remote", r.RemoteAddr, "err", err)
 		return
 	}
 	s.countUnattachedWS(1)
+	op := s.quality.Begin(quality.Subject{}, "ws-attach-read")
 	id, err := readAttachSession(ws)
+	op.End(err)
 	s.countUnattachedWS(-1)
 	if err != nil {
 		appLog.WarnRate("websocket_attach_failed", 10*time.Second, "websocket-attach-failed", "remote", r.RemoteAddr, "err", err)
@@ -271,7 +296,9 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) serveAttachedStream(stream relay.MessageStream, transport, id, remoteAddr string, requestDone <-chan struct{}) {
+	acquire := s.quality.Begin(quality.Subject{}, transport+"-session-acquire")
 	sess, err := s.getSession(id)
+	acquire.End(err)
 	if err != nil {
 		appLog.WarnRate("stream_session_failed", 10*time.Second, "stream-session-failed", "session", id, "remote", remoteAddr, "err", err, "transport", transport)
 		_ = stream.Close()
@@ -284,15 +311,20 @@ func (s *server) serveAttachedStream(stream relay.MessageStream, transport, id, 
 	}
 	ack, err := relay.EncodeControl(relay.ControlOpAttachOK, nil)
 	if err != nil {
+		lane.qr.Error(lane.q, "attach-encode", err, nil)
 		sess.removeLane(lane)
 		_ = stream.Close()
 		return
 	}
-	if err := stream.WriteMessage(ack); err != nil {
+	attach := s.quality.Begin(lane.q, "attach-ack")
+	err = stream.WriteMessage(ack)
+	attach.End(err)
+	if err != nil {
 		sess.removeLane(lane)
 		_ = stream.Close()
 		return
 	}
+	lane.qr.Life(lane.q, "lane-lifecycle", "available")
 	defer sess.removeLane(lane)
 	defer stream.Close()
 	sess.startExpandHintLoop(s)
@@ -329,15 +361,21 @@ func (s *server) serveAttachedStream(stream relay.MessageStream, transport, id, 
 		}
 	}()
 	for {
+		sample := lane.qr.Transfer()
 		body, err := relay.ReadMessageView(lane.stream)
+		sample.Returned()
 		if err != nil {
+			sample.ReadDone(lane.q, "unknown", nil, quality.EncodedSize{}, err)
 			return
 		}
 		frames, err := relay.DecodeFramesView(body)
 		if err != nil {
+			sample.ReadDone(lane.q, "unknown", nil, quality.KnownSize(len(body)), nil)
+			lane.qr.Error(lane.q, "decode", err, quality.Int(len(body)))
 			appLog.WarnRate("server_stream_decode_failed", 10*time.Second, "stream-decode-failed", "session", id, "remote", remoteAddr, "err", err, "transport", transport)
 			continue
 		}
+		sample.ReadDone(lane.q, "business", frames, quality.KnownSize(len(body)), nil)
 		if sess.isClosed() {
 			return
 		}
@@ -365,10 +403,17 @@ func (s *server) handleInboundFrameAfterTouch(sess *session, f relay.Frame) erro
 	if s.benchEcho {
 		f.Payload = append([]byte(nil), f.Payload...)
 		f = s.queueFrame(f)
-		s.countQueueDrops(relay.EnqueueDropOldest(sess.queue, f))
+		sample := sess.qr.Queue()
+		if sample.Selected() {
+			sample.QueueDone(sess.q, "sendq", len(sess.queue), cap(sess.queue), false, "")
+		}
+		dropped := relay.EnqueueDropOldest(sess.queue, f)
+		sess.qr.Drop(sess.q, "sendq", dropped)
+		s.countQueueDrops(dropped)
 		return nil
 	}
 	if _, err := sess.udp.Write(f.Payload); err != nil {
+		s.quality.Error(sess.q, "udp-write", err, nil)
 		return err
 	}
 	s.countUDPUp(len(f.Payload))
@@ -516,9 +561,15 @@ func (sess *session) enqueueDownBatch(parent *server, batch []relay.Frame) {
 		return
 	}
 	parent.markBatchQueued(batch)
+	sample := sess.qr.Queue()
+	outcome := "ok"
 	select {
 	case sess.batchQ <- batch:
 	case <-sess.done:
+		outcome = "cancelled"
+	}
+	if sample.Selected() {
+		sample.QueueDone(sess.q, "batchq", len(sess.batchQ), cap(sess.batchQ), true, outcome)
 	}
 }
 
@@ -599,11 +650,13 @@ func (s *server) writePendingExpandHint(lane *serverLane, sess *session, id, rem
 	}
 	body, err := relay.EncodeControl(relay.ControlOpExpandLanesHint, nil)
 	if err != nil {
+		lane.qr.Error(lane.q, "stream-expand-hint-encode-failed", err, nil)
 		appLog.Error("stream-expand-hint-encode-failed", "session", id, "err", err, "transport", lane.transport)
 		return false
 	}
 	if err := lane.stream.WriteMessageOwned(body); err != nil {
 		s.countExpandHintWriteFailed()
+		lane.qr.Error(lane.q, "stream-expand-hint-write-failed", err, nil)
 		appLog.WarnRate("server_stream_expand_hint_write_failed", 10*time.Second, "stream-expand-hint-write-failed", "session", id, "remote", remoteAddr, "err", err, "transport", lane.transport)
 		return false
 	}
@@ -615,6 +668,7 @@ func (s *server) writePendingExpandHint(lane *serverLane, sess *session, id, rem
 
 func (s *server) writeDownBatch(lane *serverLane, id, remoteAddr string, frames []relay.Frame, observeBatchQueue bool) bool {
 	if body, ok, err := relay.EncodeFramesWithinLimitInto(lane.encodeBuf, frames, relay.MaxMessageBytes); err != nil {
+		lane.qr.Error(lane.q, "stream-encode-failed", err, nil)
 		appLog.Error("stream-encode-failed", "session", id, "err", err, "transport", lane.transport)
 		return false
 	} else if ok {
@@ -623,12 +677,14 @@ func (s *server) writeDownBatch(lane *serverLane, id, remoteAddr string, frames 
 
 	chunks, err := relay.SplitFramesByEncodedLimit(frames, relay.MaxMessageBytes)
 	if err != nil {
+		lane.qr.Error(lane.q, "frame-split-failed", err, nil)
 		appLog.Error("frame-split-failed", "session", id, "err", err)
 		return false
 	}
 	for _, chunk := range chunks {
 		body, err := relay.EncodeFramesInto(lane.encodeBuf, chunk)
 		if err != nil {
+			lane.qr.Error(lane.q, "stream-encode-failed", err, nil)
 			appLog.Error("stream-encode-failed", "session", id, "err", err, "transport", lane.transport)
 			return false
 		}
@@ -646,7 +702,11 @@ func (s *server) writeDownEncodedChunk(lane *serverLane, id, remoteAddr string, 
 	}
 	if metricsBuild && s.metrics {
 		started := time.Now()
-		if err := lane.stream.WriteMessageOwned(body); err != nil {
+		sample := lane.qr.Transfer()
+		err := lane.stream.WriteMessageOwned(body)
+		sample.Returned()
+		sample.TransferDone(lane.q, "write", frames, quality.KnownSize(len(body)), err)
+		if err != nil {
 			appLog.WarnRate("server_stream_write_failed", 10*time.Second, "stream-write-failed", "session", id, "remote", remoteAddr, "err", err, "transport", lane.transport)
 			return false
 		}
@@ -654,7 +714,11 @@ func (s *server) writeDownEncodedChunk(lane *serverLane, id, remoteAddr string, 
 		s.observeLaneWrite(time.Since(started))
 		return true
 	}
-	if err := lane.stream.WriteMessageOwned(body); err != nil {
+	sample := lane.qr.Transfer()
+	err := lane.stream.WriteMessageOwned(body)
+	sample.Returned()
+	sample.TransferDone(lane.q, "write", frames, quality.KnownSize(len(body)), err)
+	if err != nil {
 		appLog.WarnRate("server_stream_write_failed", 10*time.Second, "stream-write-failed", "session", id, "remote", remoteAddr, "err", err, "transport", lane.transport)
 		return false
 	}
@@ -697,6 +761,9 @@ func (s *server) getSession(id string) (*session, error) {
 		batchQ = make(chan []relay.Frame, batchQueueCapacity(queueCap, s.batchSize))
 	}
 	sess := &session{id: id, udp: udp, queue: make(chan relay.Frame, queueCap), batchQ: batchQ, done: make(chan struct{}), touchEvery: touchInterval(s.idle), lanes: make(map[*serverLane]struct{})}
+	sess.qr = s.quality
+	sess.q = s.quality.NewSession(id)
+	sess.qr.Life(sess.q, "session-lifecycle", "create")
 	sess.touch()
 	s.sessions[id] = sess
 	s.countSessionMade()
@@ -712,14 +779,14 @@ func (s *server) findSession(id string) *session {
 	return s.sessions[id]
 }
 
-func (s *server) closeSession(id string) {
+func (s *server) closeSession(id string, reasons ...string) {
 	s.mu.Lock()
 	sess := s.sessions[id]
 	delete(s.sessions, id)
 	s.mu.Unlock()
 	if sess != nil {
 		s.countSessionClosed()
-		sess.close()
+		sess.close(reasons...)
 	}
 }
 
@@ -737,7 +804,7 @@ func (s *server) cleanupLoop() {
 		}
 		s.mu.Unlock()
 		for _, id := range ids {
-			s.closeSession(id)
+			s.closeSession(id, "idle")
 		}
 		if len(ids) > 0 {
 			appLog.Debug("cleanup", "expired", len(ids))
@@ -804,8 +871,9 @@ func (s *session) idleBefore(cutoff time.Time) bool {
 	return s.lastActive.Load() < cutoff.UnixNano()
 }
 
-func (s *session) close() {
+func (s *session) close(reasons ...string) {
 	s.closeOnce.Do(func() {
+		s.qr.Life(s.q, "session-lifecycle", "close", reasons...)
 		s.closed.Store(true)
 		close(s.done)
 		s.lanesMu.Lock()
@@ -852,6 +920,9 @@ func (s *session) addLane(stream relay.MessageStream, transport string) (*server
 		return nil, false
 	}
 	ln := &serverLane{stream: stream, transport: transport, id: s.nextLaneID.Add(1)}
+	ln.qr = s.qr
+	ln.q = s.qr.NewLane(s.q, ln.id, transport)
+	ln.qr.Life(ln.q, "lane-lifecycle", "create")
 	s.lanes[ln] = struct{}{}
 	s.expandHintInFlight.Store(false)
 	s.expandHintInFlightAt.Store(0)
@@ -860,8 +931,12 @@ func (s *session) addLane(stream relay.MessageStream, transport string) (*server
 
 func (s *session) removeLane(ln *serverLane) {
 	s.lanesMu.Lock()
+	_, existed := s.lanes[ln]
 	delete(s.lanes, ln)
 	s.lanesMu.Unlock()
+	if existed {
+		ln.qr.Life(ln.q, "lane-lifecycle", "terminate")
+	}
 }
 
 func (s *session) laneCount() int {
@@ -895,6 +970,7 @@ func (s *session) readLoop(parent *server) {
 	for {
 		n, err := s.udp.Read(buf)
 		if err != nil {
+			s.qr.Error(s.q, "udp-read", err, nil)
 			return
 		}
 		if s.isClosed() {
@@ -903,7 +979,13 @@ func (s *session) readLoop(parent *server) {
 		s.touch()
 		payload := append([]byte(nil), buf[:n]...)
 		f := parent.queueFrame(relay.Frame{Payload: payload})
-		parent.countQueueDrops(relay.EnqueueDropOldest(s.queue, f))
+		sample := s.qr.Queue()
+		if sample.Selected() {
+			sample.QueueDone(s.q, "sendq", len(s.queue), cap(s.queue), false, "")
+		}
+		dropped := relay.EnqueueDropOldest(s.queue, f)
+		s.qr.Drop(s.q, "sendq", dropped)
+		parent.countQueueDrops(dropped)
 		parent.countUDPDown(n)
 	}
 }
@@ -1056,7 +1138,7 @@ var knownServerPluginEnvOptions = map[string]struct{}{
 
 func warnUnknownPluginEnvOptions(opts PluginEnv.Options, known map[string]struct{}) {
 	for key := range opts {
-		if _, ok := known[key]; !ok {
+		if _, ok := known[key]; !ok && !quality.IsOption(key) {
 			appLog.Warn("unknown-PluginEnv-option", "option", key)
 		}
 	}
