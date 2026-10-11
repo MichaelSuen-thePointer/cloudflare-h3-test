@@ -366,6 +366,9 @@ func (s *server) serveAttachedStream(stream relay.MessageStream, transport, id, 
 		body, err := relay.ReadMessageView(lane.stream)
 		sample.Returned()
 		if err != nil {
+			if sess.isClosed() {
+				return
+			}
 			sample.ReadDone(lane.q, "unknown", nil, quality.EncodedSize{}, err)
 			return
 		}
@@ -971,6 +974,9 @@ func (s *session) readLoop(parent *server) {
 	for {
 		n, err := s.udp.Read(buf)
 		if err != nil {
+			if s.isClosed() {
+				return
+			}
 			s.qr.Error(s.q, "udp-read", err, nil)
 			return
 		}

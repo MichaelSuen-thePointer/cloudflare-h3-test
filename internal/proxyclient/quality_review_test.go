@@ -3,6 +3,7 @@ package proxyclient
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -201,7 +202,7 @@ func TestQualityClientReadClasses(t *testing.T) {
 	stream.messages <- business
 	sess.goRun(func() { sess.laneReadLoop(c, lane) })
 	// The fifth read is blocked in the wrapper: all four returned bodies were
-	// processed, and closing it now must produce an unknown-size read error.
+	// processed; session close must not record the resulting read error.
 	for i := 0; i < 5; i++ {
 		select {
 		case <-stream.entered:
@@ -226,13 +227,64 @@ func TestQualityClientReadClasses(t *testing.T) {
 		"SELECT count(*) FROM observation WHERE event_name='transfer' AND direction='read'":                                       1,
 		"SELECT count(*) FROM observation WHERE event_name='control-read' AND encoded_bytes=8":                                    2,
 		"SELECT count(*) FROM observation WHERE event_name='read-unknown' AND outcome='ok' AND encoded_bytes=3":                   1,
-		"SELECT count(*) FROM observation WHERE event_name='read-unknown' AND outcome='error' AND encoded_bytes IS NULL":          1,
+		"SELECT count(*) FROM observation WHERE event_name='read-unknown' AND outcome='error' AND encoded_bytes IS NULL":          0,
 		"SELECT count(*) FROM observation WHERE event_name='error' AND action='decode' AND encoded_bytes=3":                       1,
 		"SELECT count(*) FROM observation WHERE event_name='error' AND action='stream-control-decode-failed' AND encoded_bytes=8": 1,
 	} {
 		var got int
 		if err = db.QueryRow(q).Scan(&got); err != nil || got != want {
 			t.Fatalf("%s: %d want %d: %v", q, got, want, err)
+		}
+	}
+}
+
+func TestQualityReadFailureCloseState(t *testing.T) {
+	for _, every := range []int{0, 1} {
+		for _, reason := range []string{"idle", "initial-connect-failed", "peer"} {
+			t.Run(fmt.Sprintf("sample=%d/%s", every, reason), func(t *testing.T) {
+				config := quality.Defaults("client")
+				config.DBDir = t.TempDir()
+				config.TransferSampleEvery = every
+				barrier := qualitytest.New(t, filepath.Join(config.DBDir, config.DBFilename))
+				ready := make(chan error, 2)
+				r := quality.New(config, "client", func(_ string, err error) { ready <- err })
+				defer r.Stop(3 * time.Second)
+				if err := <-ready; err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				c := &clientState{quality: r, transport: "ws"}
+				sess := &session{qr: r, q: r.NewSession(reason), state: c, ctx: ctx, cancel: cancel, closed: make(chan struct{}), lanesChanged: make(chan struct{}, 1)}
+				stream := &qualityMessageStream{qualityBlockingStream: &qualityBlockingStream{closed: make(chan struct{})}, entered: make(chan struct{}, 1)}
+				lane := sess.newObservedLane(0, stream)
+				// Isolate reader observation from the separately tested reconnect worker.
+				lane.reconnecting.Store(true)
+				sess.lanes = []*streamLane{lane}
+				sess.goRun(func() { sess.laneReadLoop(c, lane) })
+				select {
+				case <-stream.entered:
+				case <-time.After(time.Second):
+					t.Fatal("reader did not start")
+				}
+				want := 0
+				if reason == "peer" {
+					stream.Close()
+					sess.wg.Wait()
+					want = 1
+				}
+				sess.close(reason)
+				barrier.StopAfterPriorRecords(t, config.BatchSize, func(token string) { r.Life(quality.Subject{}, "test-barrier", token) }, r.Stop)
+				db, err := sql.Open("sqlite", filepath.Join(config.DBDir, config.DBFilename))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				var got int
+				if err := db.QueryRow("SELECT count(*) FROM observation WHERE outcome='error'").Scan(&got); err != nil || got != want {
+					t.Fatalf("errors=%d want %d: %v", got, want, err)
+				}
+			})
 		}
 	}
 }

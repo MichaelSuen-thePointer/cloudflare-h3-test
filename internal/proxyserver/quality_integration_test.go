@@ -3,6 +3,7 @@ package proxyserver
 import (
 	"context"
 	"database/sql"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -81,7 +82,8 @@ func TestQualityWebSocketBusinessIntegration(t *testing.T) {
 	}
 	defer db.Close()
 	for q, want := range map[string]int{
-		"SELECT count(*) FROM session": 1,
+		"SELECT count(*) FROM observation WHERE outcome='error'":                                                                                                             0,
+		"SELECT count(*) FROM session":                                                                                                                                       1,
 		"SELECT count(*) FROM lane WHERE lane_index=1 AND transport='ws' AND connection_no IS NULL":                                                                          1,
 		"SELECT count(*) FROM observation WHERE event_name='lane-lifecycle' AND action='terminate'":                                                                          1,
 		"SELECT count(*) FROM observation WHERE event_name='session-lifecycle' AND action='close' AND reason_code='idle'":                                                    1,
@@ -138,6 +140,53 @@ func TestQualityH3OriginBusinessIntegration(t *testing.T) {
 	defer rows.Close()
 	if rows.Next() {
 		t.Fatal("orphan row")
+	}
+}
+
+func TestQualityUDPReadFailureCloseState(t *testing.T) {
+	for _, reason := range []string{"idle", "unknown", "socket-only"} {
+		t.Run(reason, func(t *testing.T) {
+			config := quality.Defaults("server")
+			config.DBDir = t.TempDir()
+			barrier := qualitytest.New(t, filepath.Join(config.DBDir, config.DBFilename))
+			ready := make(chan error, 2)
+			r := quality.New(config, "server", func(_ string, err error) { ready <- err })
+			defer r.Stop(3 * time.Second)
+			if err := <-ready; err != nil {
+				t.Fatal(err)
+			}
+			udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer udp.Close()
+			sess := &session{qr: r, q: r.NewSession(reason), udp: udp, done: make(chan struct{}), lanes: make(map[*serverLane]struct{})}
+			done := make(chan struct{})
+			go func() { defer close(done); sess.readLoop(&server{}) }()
+			want := 0
+			if reason == "socket-only" {
+				udp.Close()
+				want = 1
+			} else {
+				sess.close(reason)
+			}
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("UDP reader did not exit")
+			}
+			sess.close(reason)
+			barrier.StopAfterPriorRecords(t, config.BatchSize, func(token string) { r.Life(quality.Subject{}, "test-barrier", token) }, r.Stop)
+			db, err := sql.Open("sqlite", filepath.Join(config.DBDir, config.DBFilename))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			var got int
+			if err := db.QueryRow("SELECT count(*) FROM observation WHERE action='udp-read' AND outcome='error'").Scan(&got); err != nil || got != want {
+				t.Fatalf("UDP errors=%d want %d: %v", got, want, err)
+			}
+		})
 	}
 }
 

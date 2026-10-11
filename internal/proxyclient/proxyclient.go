@@ -1111,10 +1111,10 @@ func (s *session) laneReadLoop(c *clientState, ln *streamLane) {
 		body, err := relay.ReadMessageView(ln.stream)
 		sample.Returned()
 		if err != nil {
-			sample.ReadDone(ln.q, "unknown", nil, quality.EncodedSize{}, err)
 			if s.isClosed() {
 				return
 			}
+			sample.ReadDone(ln.q, "unknown", nil, quality.EncodedSize{}, err)
 			s.countLaneReadError(ln)
 			ln.closed.Store(true)
 			ln.closeWorker()
