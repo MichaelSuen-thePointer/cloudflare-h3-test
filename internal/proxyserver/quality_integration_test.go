@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"cloudflare-h3-test/internal/quality"
+	"cloudflare-h3-test/internal/qualitytest"
 	"cloudflare-h3-test/internal/relay"
 )
 
@@ -20,6 +21,7 @@ func TestQualityWebSocketBusinessIntegration(t *testing.T) {
 	c.DBDir = t.TempDir()
 	c.TransferSampleEvery = 1
 	c.QueueSampleEvery = 1
+	barrier := qualitytest.New(t, filepath.Join(c.DBDir, c.DBFilename))
 	ready := make(chan error, 2)
 	r := quality.New(c, "server", func(_ string, err error) { ready <- err })
 	defer r.Stop(3 * time.Second)
@@ -72,7 +74,7 @@ func TestQualityWebSocketBusinessIntegration(t *testing.T) {
 		t.Fatal("lane still attached")
 	}
 
-	r.Stop(3 * time.Second)
+	barrier.StopAfterPriorRecords(t, c.BatchSize, func(token string) { r.Life(quality.Subject{}, "test-barrier", token) }, r.Stop)
 	db, err := sql.Open("sqlite", filepath.Join(c.DBDir, c.DBFilename))
 	if err != nil {
 		t.Fatal(err)
@@ -105,6 +107,7 @@ func TestQualityH3OriginBusinessIntegration(t *testing.T) {
 	c.DBDir = t.TempDir()
 	c.TransferSampleEvery = 1
 	c.QueueSampleEvery = 1
+	barrier := qualitytest.New(t, filepath.Join(c.DBDir, c.DBFilename))
 	ready := make(chan error, 2)
 	r := quality.New(c, "server", func(_ string, err error) { ready <- err })
 	defer r.Stop(3 * time.Second)
@@ -112,7 +115,7 @@ func TestQualityH3OriginBusinessIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	testH3OriginDuplexOverHTTP2(t, r)
-	r.Stop(3 * time.Second)
+	barrier.StopAfterPriorRecords(t, c.BatchSize, func(token string) { r.Life(quality.Subject{}, "test-barrier", token) }, r.Stop)
 	db, err := sql.Open("sqlite", filepath.Join(c.DBDir, c.DBFilename))
 	if err != nil {
 		t.Fatal(err)
@@ -141,6 +144,7 @@ func TestQualityH3OriginBusinessIntegration(t *testing.T) {
 func TestQualityServerCloseReasonOnce(t *testing.T) {
 	config := quality.Defaults("server")
 	config.DBDir = t.TempDir()
+	barrier := qualitytest.New(t, filepath.Join(config.DBDir, config.DBFilename))
 	ready := make(chan error, 2)
 	r := quality.New(config, "server", func(_ string, err error) { ready <- err })
 	defer r.Stop(3 * time.Second)
@@ -157,7 +161,7 @@ func TestQualityServerCloseReasonOnce(t *testing.T) {
 		}
 		sess.close("later-reason")
 	}
-	r.Stop(3 * time.Second)
+	barrier.StopAfterPriorRecords(t, config.BatchSize, func(token string) { r.Life(quality.Subject{}, "test-barrier", token) }, r.Stop)
 	db, err := sql.Open("sqlite", filepath.Join(config.DBDir, config.DBFilename))
 	if err != nil {
 		t.Fatal(err)

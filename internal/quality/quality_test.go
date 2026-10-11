@@ -14,6 +14,7 @@ import (
 	"time"
 
 	PluginEnv "cloudflare-h3-test/internal/pluginopts"
+	"cloudflare-h3-test/internal/qualitytest"
 	"cloudflare-h3-test/internal/relay"
 
 	"github.com/quic-go/quic-go"
@@ -22,7 +23,12 @@ import (
 func readyRecorder(t *testing.T, c Config) *Recorder {
 	t.Helper()
 	ready := make(chan error, 2)
-	r := New(c, "client", func(_ string, err error) { ready <- err })
+	r := New(c, "client", func(_ string, err error) {
+		if err != nil {
+			t.Logf("storage report: %v", err)
+		}
+		ready <- err
+	})
 	if r == nil {
 		t.Fatal("nil recorder")
 	}
@@ -105,6 +111,7 @@ func TestSQLiteFactsSamplesAndAppend(t *testing.T) {
 	c.QueueSampleEvery = 1
 	c.BatchSize = 3
 	for run := 0; run < 2; run++ {
+		barrier := qualitytest.New(t, filepath.Join(c.DBDir, c.DBFilename))
 		r := readyRecorder(t, c)
 		subject := r.NewSession("same-business-session")
 		lane := r.NewLane(subject, 0, "h3")
@@ -122,7 +129,7 @@ func TestSQLiteFactsSamplesAndAppend(t *testing.T) {
 		q.QueueDone(subject, "batchq", 2, 8, true, "cancelled")
 		r.Drop(subject, "sendq", 2)
 		r.Error(lane, "decode", errors.New(strings.Repeat("e", 4096)), Int(12))
-		stopped(t, r)
+		barrier.StopAfterPriorRecords(t, c.BatchSize, func(token string) { r.Life(Subject{}, "test-barrier", token) }, r.Stop)
 	}
 	db := readDB(t, c)
 	checkFK(t, db)
@@ -476,6 +483,7 @@ func TestReadSizeAndMessageClass(t *testing.T) {
 	c.DBDir = t.TempDir()
 	for _, every := range []int{0, 1} {
 		c.TransferSampleEvery = every
+		barrier := qualitytest.New(t, filepath.Join(c.DBDir, c.DBFilename))
 		r := readyRecorder(t, c)
 		sample := r.Transfer()
 		sample.Returned()
@@ -493,7 +501,7 @@ func TestReadSizeAndMessageClass(t *testing.T) {
 		sample.Returned()
 		sample.ReadDone(Subject{}, "unknown", nil, KnownSize(11), nil)
 		r.Error(Subject{}, "decode", errors.New("bad returned body"), Int(11))
-		stopped(t, r)
+		barrier.StopAfterPriorRecords(t, c.BatchSize, func(token string) { r.Life(Subject{}, "test-barrier", token) }, r.Stop)
 	}
 	db := readDB(t, c)
 	for q, want := range map[string]int{

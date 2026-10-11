@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	_ "embed"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -53,24 +54,31 @@ type storage struct {
 	cache                          recentKeys
 }
 
-func (w *storage) close() {
-	for _, s := range []*sql.Stmt{w.session, w.lane, w.op, w.observation} {
-		if s != nil {
-			s.Close()
+func (w *storage) close() error {
+	var failures []error
+	add := func(name string, err error) {
+		if err != nil {
+			failures = append(failures, fmt.Errorf("close %s: %w", name, err))
+		}
+	}
+	for i, stmt := range []*sql.Stmt{w.session, w.lane, w.op, w.observation} {
+		if stmt != nil {
+			add([]string{"session statement", "lane statement", "operation statement", "observation statement"}[i], stmt.Close())
 		}
 	}
 	if w.conn != nil {
-		w.conn.Close()
+		add("connection", w.conn.Close())
 	}
 	if w.db != nil {
-		w.db.Close()
+		add("database", w.db.Close())
 	}
+	return errors.Join(failures...)
 }
 func openStorage(ctx context.Context, path string, c Config, run, role string, started time.Time) (_ *storage, err error) {
 	w := &storage{}
 	defer func() {
 		if err != nil {
-			w.close()
+			err = errors.Join(err, w.close())
 		}
 	}()
 	if err = os.MkdirAll(filepath.Dir(path), 0700); err != nil {
@@ -250,7 +258,11 @@ func (r *Recorder) write(role string) {
 		fail(err)
 		return
 	}
-	defer w.close()
+	defer func() {
+		if err := w.close(); err != nil {
+			fail(err)
+		}
+	}()
 	if r.report != nil {
 		r.report(path, nil)
 	}
@@ -262,13 +274,14 @@ func (r *Recorder) write(role string) {
 	}
 	defer timer.Stop()
 	var tick <-chan time.Time
-	var shutdownDeadline time.Time
 	flush := func() bool {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		if !shutdownDeadline.IsZero() {
-			cancel()
-			ctx, cancel = context.WithDeadline(context.Background(), shutdownDeadline)
+		// Stop abandons pending records; it never starts a shutdown transaction.
+		select {
+		case <-r.stop:
+			return false
+		default:
 		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		err := w.batch(ctx, r, batch)
 		cancel()
 		clear(batch)
@@ -306,6 +319,12 @@ func (r *Recorder) write(role string) {
 		return true
 	}
 	for {
+		// Prefer a pending stop over another ordinary batch or timer selection.
+		select {
+		case <-r.stop:
+			return
+		default:
+		}
 		select {
 		case e := <-r.input:
 			if !appendRecord(e) {
@@ -316,19 +335,6 @@ func (r *Recorder) write(role string) {
 				return
 			}
 		case <-r.stop:
-			// A late sender may have passed accepting. A finite drain never waits for it.
-			shutdownDeadline = time.Now().Add(2 * time.Second)
-			for remaining := len(r.input); remaining > 0 && time.Now().Before(shutdownDeadline); remaining-- {
-				select {
-				case e := <-r.input:
-					if !appendRecord(e) {
-						return
-					}
-				default:
-					remaining = 0
-				}
-			}
-			flush()
 			return
 		}
 	}

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"cloudflare-h3-test/internal/quality"
+	"cloudflare-h3-test/internal/qualitytest"
 	"cloudflare-h3-test/internal/relay"
 )
 
@@ -54,6 +55,7 @@ func TestQualityConcurrentPublicationClose(t *testing.T) {
 			config.BatchSize = 8
 			config.FlushInterval = 10 * time.Millisecond
 			config.TransferSampleEvery = 0
+			barrier := qualitytest.New(t, filepath.Join(config.DBDir, config.DBFilename))
 			reports := make(chan error, 2)
 			r := quality.New(config, "client", func(_ string, err error) { reports <- err })
 			defer r.Stop(5 * time.Second)
@@ -111,7 +113,7 @@ func TestQualityConcurrentPublicationClose(t *testing.T) {
 				}
 				sess.close("later-reason") // Losing closeOnce must not overwrite or duplicate.
 			}
-			r.Stop(5 * time.Second)
+			barrier.StopAfterPriorRecords(t, config.BatchSize, func(token string) { r.Life(quality.Subject{}, "test-barrier", token) }, r.Stop)
 			select {
 			case err := <-reports:
 				t.Fatalf("storage failure in publication test: %v", err)
@@ -165,6 +167,7 @@ func TestQualityClientReadClasses(t *testing.T) {
 	config := quality.Defaults("client")
 	config.DBDir = t.TempDir()
 	config.TransferSampleEvery = 1
+	barrier := qualitytest.New(t, filepath.Join(config.DBDir, config.DBFilename))
 	ready := make(chan error, 2)
 	r := quality.New(config, "client", func(_ string, err error) { ready <- err })
 	defer r.Stop(3 * time.Second)
@@ -213,7 +216,7 @@ func TestQualityClientReadClasses(t *testing.T) {
 		t.Fatalf("UDP %q %v", buf[:n], err)
 	}
 	sess.close("idle")
-	r.Stop(3 * time.Second)
+	barrier.StopAfterPriorRecords(t, config.BatchSize, func(token string) { r.Life(quality.Subject{}, "test-barrier", token) }, r.Stop)
 	db, err := sql.Open("sqlite", filepath.Join(config.DBDir, config.DBFilename))
 	if err != nil {
 		t.Fatal(err)
@@ -237,6 +240,7 @@ func TestQualityClientReadClasses(t *testing.T) {
 func TestQualitySessionCloseReasons(t *testing.T) {
 	config := quality.Defaults("client")
 	config.DBDir = t.TempDir()
+	barrier := qualitytest.New(t, filepath.Join(config.DBDir, config.DBFilename))
 	ready := make(chan error, 2)
 	r := quality.New(config, "client", func(_ string, err error) { ready <- err })
 	defer r.Stop(3 * time.Second)
@@ -264,7 +268,7 @@ func TestQualitySessionCloseReasons(t *testing.T) {
 		}
 		sess.close("later-reason")
 	}
-	r.Stop(3 * time.Second)
+	barrier.StopAfterPriorRecords(t, config.BatchSize, func(token string) { r.Life(quality.Subject{}, "test-barrier", token) }, r.Stop)
 	db, err := sql.Open("sqlite", filepath.Join(config.DBDir, config.DBFilename))
 	if err != nil {
 		t.Fatal(err)

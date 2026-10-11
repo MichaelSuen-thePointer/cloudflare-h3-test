@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"cloudflare-h3-test/internal/quality"
+	"cloudflare-h3-test/internal/qualitytest"
 	"cloudflare-h3-test/internal/relay"
 )
 
@@ -24,6 +25,7 @@ func testQualityClientBusiness(t *testing.T, transport string) {
 	config.DBDir = t.TempDir()
 	config.TransferSampleEvery = 1
 	config.QueueSampleEvery = 1
+	barrier := qualitytest.New(t, filepath.Join(config.DBDir, config.DBFilename))
 	ready := make(chan error, 2)
 	r := quality.New(config, "client", func(_ string, err error) { ready <- err })
 	defer r.Stop(3 * time.Second)
@@ -112,7 +114,7 @@ func testQualityClientBusiness(t *testing.T, transport string) {
 	}
 	sess.close()
 	p.Close()
-	r.Stop(3 * time.Second)
+	barrier.StopAfterPriorRecords(t, config.BatchSize, func(token string) { r.Life(quality.Subject{}, "test-barrier", token) }, r.Stop)
 	db, err := sql.Open("sqlite", filepath.Join(config.DBDir, config.DBFilename))
 	if err != nil {
 		t.Fatal(err)

@@ -62,6 +62,8 @@ type Recorder struct {
 	stop, done                       chan struct{}
 	stopOnce                         sync.Once
 	report                           func(string, error)
+	signalMu                         sync.Mutex
+	signalCleanup                    func()
 }
 
 // New returns immediately. All file creation and SQLite work belongs to writer.
@@ -93,9 +95,14 @@ func New(c Config, role string, report func(string, error)) *Recorder {
 	return r
 }
 func (r *Recorder) Enabled() bool { return r != nil && r.accepting.Load() }
-func (r *Recorder) Stop(timeout time.Duration) {
+
+// Stop returns true only after the writer has finished all resource close calls.
+// Pending batches and queued observations are abandoned; only already-started
+// initialization or SQL work completes. Stop is not a persistence flush and does
+// not guarantee successful persistence or a healthy database.
+func (r *Recorder) Stop(timeout time.Duration) bool {
 	if r == nil {
-		return
+		return true
 	}
 	r.accepting.Store(false)
 	r.stopOnce.Do(func() { close(r.stop) })
@@ -103,7 +110,15 @@ func (r *Recorder) Stop(timeout time.Duration) {
 	defer timer.Stop()
 	select {
 	case <-r.done:
+		return true
 	case <-timer.C:
+		// A completed writer wins even if the timer is also ready.
+		select {
+		case <-r.done:
+			return true
+		default:
+			return false
+		}
 	}
 }
 func (r *Recorder) NewSession(id string) Subject {
