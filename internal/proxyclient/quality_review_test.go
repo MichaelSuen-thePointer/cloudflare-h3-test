@@ -3,6 +3,7 @@ package proxyclient
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -17,6 +18,86 @@ import (
 	"cloudflare-h3-test/internal/qualitytest"
 	"cloudflare-h3-test/internal/relay"
 )
+
+func TestQualityStandbyReaderErrors(t *testing.T) {
+	for _, transport := range []string{"ws", "h3"} {
+		for _, mode := range []string{"idle-error", "attach-error", "local-close"} {
+			t.Run(transport+"/"+mode, func(t *testing.T) {
+				config := quality.Defaults("client")
+				config.DBDir = t.TempDir()
+				config.BatchSize = 8
+				config.FlushInterval = 10 * time.Millisecond
+				barrier := qualitytest.New(t, filepath.Join(config.DBDir, config.DBFilename))
+				ready := make(chan error, 2)
+				r := quality.New(config, "client", func(_ string, err error) { ready <- err })
+				defer r.Stop(5 * time.Second)
+				if err := <-ready; err != nil {
+					t.Fatal(err)
+				}
+				p := newStandbyPool(0, time.Second, time.Second, func(context.Context) (*standbyFake, error) {
+					return nil, errors.New("unexpected open")
+				}, r, transport, "open-idle")
+				defer p.close()
+				s := newStandbyFake()
+				readErr := errors.New("standby read failed")
+				state := standbyIdle
+				if mode == "idle-error" {
+					s.ack <- readErr
+				} else if mode == "attach-error" {
+					state = standbyAttaching
+					s.onAttach = func() error { s.ack <- readErr; return nil }
+				}
+				p.mu.Lock()
+				e := p.registerLocked(s, state)
+				p.mu.Unlock()
+				if mode == "attach-error" {
+					if err := p.attach(context.Background(), e, "session"); !errors.Is(err, readErr) {
+						t.Fatalf("attach error=%v", err)
+					}
+				} else if mode == "local-close" {
+					p.close()
+				}
+				select {
+				case <-e.readerDone:
+				case <-time.After(2 * time.Second):
+					t.Fatal("standby reader did not exit")
+				}
+				p.close()
+				barrier.StopAfterPriorRecords(t, config.BatchSize, func(token string) {
+					r.Life(quality.Subject{}, "test-barrier", token)
+				}, r.Stop)
+				db, err := sql.Open("sqlite", filepath.Join(config.DBDir, config.DBFilename))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				var rawErrors, allReadErrors, attachErrors int
+				if err := db.QueryRow(`SELECT count(*) FROM observation WHERE event_name='error' AND action=?`, transport+"-pool-read").Scan(&allReadErrors); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.QueryRow(`SELECT count(*) FROM observation WHERE event_name='error' AND action=?
+                    AND outcome='error' AND error_domain='*errors.errorString' AND error_text=?
+                    AND encoded_bytes IS NULL AND session_no IS NULL AND lane_no IS NULL`, transport+"-pool-read", readErr.Error()).Scan(&rawErrors); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.QueryRow(`SELECT count(*) FROM observation o JOIN operation p
+                    ON p.run_id=o.run_id AND p.operation_no=o.operation_no
+                    WHERE p.operation_kind=? AND o.phase='end' AND o.outcome='error'`, transport+"-attach").Scan(&attachErrors); err != nil {
+					t.Fatal(err)
+				}
+				wantRaw, wantAttach := 0, 0
+				if mode == "idle-error" {
+					wantRaw = 1
+				} else if mode == "attach-error" {
+					wantAttach = 1
+				}
+				if rawErrors != wantRaw || allReadErrors != wantRaw || attachErrors != wantAttach {
+					t.Fatalf("raw errors=%d all read errors=%d attach errors=%d, want %d/%d/%d", rawErrors, allReadErrors, attachErrors, wantRaw, wantRaw, wantAttach)
+				}
+			})
+		}
+	}
+}
 
 type qualityBlockingStream struct {
 	closed chan struct{}

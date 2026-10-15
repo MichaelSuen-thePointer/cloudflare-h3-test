@@ -18,9 +18,16 @@ type KeepaliveMessageStream interface {
 	SendPing() error
 }
 
+// StandbyMessageStream splits setup writes from the unique response reader.
+type StandbyMessageStream interface {
+	KeepaliveMessageStream
+	SendAttach(string) error
+	ReadAttachAck() error
+}
+
 // AttachableMessageStream is a ready stream before it joins a UDP session.
 type AttachableMessageStream interface {
-	KeepaliveMessageStream
+	StandbyMessageStream
 	Attach(context.Context, string) error
 	Probe(context.Context) error
 }

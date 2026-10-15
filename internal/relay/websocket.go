@@ -40,6 +40,7 @@ type WebSocketConn struct {
 
 var _ MessageStream = (*WebSocketConn)(nil)
 var _ AttachableMessageStream = (*WebSocketConn)(nil)
+var _ StandbyMessageStream = (*WebSocketConn)(nil)
 var _ MessageViewReader = (*WebSocketConn)(nil)
 
 type WebSocketSocketOptions struct {
@@ -148,10 +149,6 @@ func AttachWebSocketSession(ctx context.Context, ws *WebSocketConn, sessionID st
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	body, err := EncodeAttach(sessionID)
-	if err != nil {
-		return err
-	}
 	cancelDone := make(chan struct{})
 	stopCancelClose := context.AfterFunc(ctx, func() {
 		defer close(cancelDone)
@@ -170,10 +167,22 @@ func AttachWebSocketSession(ctx context.Context, ws *WebSocketConn, sessionID st
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = ws.SetDeadline(deadline)
 	}
-	if err := ws.WriteMessage(body); err != nil {
+	if err := ws.SendAttach(sessionID); err != nil {
 		return err
 	}
-	ack, err := ws.ReadMessage()
+	return ws.ReadAttachAck()
+}
+
+func (c *WebSocketConn) SendAttach(sessionID string) error {
+	body, err := EncodeAttach(sessionID)
+	if err != nil {
+		return err
+	}
+	return c.WriteMessage(body)
+}
+
+func (c *WebSocketConn) ReadAttachAck() error {
+	ack, err := c.ReadMessage()
 	if err != nil {
 		return err
 	}

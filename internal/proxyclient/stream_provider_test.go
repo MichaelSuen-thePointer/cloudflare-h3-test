@@ -1,13 +1,18 @@
 package proxyclient
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"os"
+	"os/exec"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,7 +26,7 @@ func newProviderH3Server(t *testing.T) (string, *x509.CertPool) {
 	return newProviderH3ServerWithProbe(t, true)
 }
 
-func newProviderH3ServerWithProbe(t *testing.T, replyToPing bool) (string, *x509.CertPool) {
+func newProviderH3ServerWithProbe(t *testing.T, replyToPing bool, greeting ...bool) (string, *x509.CertPool) {
 	t.Helper()
 	certificateServer := httptest.NewTLSServer(http.NotFoundHandler())
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -62,8 +67,7 @@ func newProviderH3ServerWithProbe(t *testing.T, replyToPing bool) (string, *x509
 					return
 				}
 				if !replyToPing {
-					<-r.Context().Done()
-					return
+					continue
 				}
 				pong, _ := relay.EncodeControl(relay.ControlOpPong, nil)
 				if err := relay.WriteStreamMessage(w, pong); err != nil {
@@ -74,7 +78,14 @@ func newProviderH3ServerWithProbe(t *testing.T, replyToPing bool) (string, *x509
 				}
 			}
 			ack, _ := relay.EncodeControl(relay.ControlOpAttachOK, nil)
-			if err := relay.WriteStreamMessage(w, ack); err != nil {
+			var frames bytes.Buffer
+			_ = relay.WriteStreamMessage(&frames, ack)
+			if len(greeting) > 0 && greeting[0] {
+				hint, _ := relay.EncodeControl(relay.ControlOpExpandLanesHint, nil)
+				_ = relay.WriteStreamMessage(&frames, hint)
+				_ = relay.WriteStreamMessage(&frames, []byte("immediate-business"))
+			}
+			if _, err := w.Write(frames.Bytes()); err != nil {
 				return
 			}
 			if err := http.NewResponseController(w).Flush(); err != nil {
@@ -380,7 +391,7 @@ func TestH3ProviderStandbyProbeAttachAndShutdown(t *testing.T) {
 	if got := p.stats(); got.TransportCount != 1 || got.ActiveStreams != 2 || got.H3Idle != 2 {
 		t.Fatalf("prewarmed stats: %+v", got)
 	}
-	p.pool.probeIdle()
+	// Standby Ping no longer removes ready capacity.
 	waitH3PoolIdle(t, p, 2)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -422,7 +433,14 @@ func TestH3ProviderStandbySingleStreamDirectFallback(t *testing.T) {
 	defer p.Close()
 	waitH3PoolIdle(t, p, 1)
 	// Hold the only standby stream to force the no-wait direct acquisition.
-	held := <-p.pool.idle
+	p.pool.mu.Lock()
+	heldEntry := p.pool.ready[0]
+	p.pool.removeReadyLocked(heldEntry)
+	heldEntry.state = standbyAttaching
+	close(heldEntry.claimed)
+	p.pool.mu.Unlock()
+	held := heldEntry.stream
+	defer p.pool.evict(heldEntry, context.Canceled)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	stream, err := p.Acquire(ctx, "fallback")
@@ -453,37 +471,29 @@ func TestH3ProviderStandbySingleStreamDirectFallback(t *testing.T) {
 	}
 }
 
-func TestH3ProviderFailedProbeReplacesStandbyStream(t *testing.T) {
-	remote, certs := newProviderH3ServerWithProbe(t, false)
+func TestH3ProviderFailedReaderReplacesStandbyStream(t *testing.T) {
+	remote, certs := newProviderH3Server(t)
 	p, err := newH3Provider(relay.HTTP3ClientOptions{URL: remote, RootCAs: certs}, "token", 1, 1, 500*time.Millisecond, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer p.Close()
 	waitH3PoolIdle(t, p, 1)
-	old := <-p.pool.idle
-	p.pool.idle <- old
-	p.pool.probeIdle()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		p.mu.Lock()
-		retired := true
-		for _, slot := range p.slots {
-			if slot == old.slot {
-				retired = false
-				break
-			}
-		}
-		p.mu.Unlock()
-		if retired {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("failed probe retained its transport slot")
+	p.pool.mu.Lock()
+	old := p.pool.ready[0]
+	p.pool.mu.Unlock()
+	_ = old.stream.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		p.pool.mu.Lock()
+		replaced := len(p.pool.ready) == 1 && p.pool.ready[0] != old
+		p.pool.mu.Unlock()
+		if replaced {
+			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	waitH3PoolIdle(t, p, 1)
+	t.Fatal("failed reader retained ready entry")
 }
 
 func TestPoolOptionAliases(t *testing.T) {
@@ -574,5 +584,228 @@ func TestH3MetricsTransportLabels(t *testing.T) {
 	provider := snapshot["provider"].(map[string]any)
 	if provider["h3_streams_per_transport"] != 2 || provider["transport"] != "h3" {
 		t.Fatalf("H3 provider metrics: %#v", provider)
+	}
+}
+
+func TestH3StandbyMissingPongCoalescedHandoff(t *testing.T) {
+	remote, certs := newProviderH3ServerWithProbe(t, false, true)
+	p, err := newH3Provider(relay.HTTP3ClientOptions{URL: remote, RootCAs: certs}, "token", 2, 1, time.Second, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	waitH3PoolIdle(t, p, 1)
+	p.pool.mu.Lock()
+	original := p.pool.ready[0].stream
+	p.pool.mu.Unlock()
+	// The server deliberately continues reading Attach while never replying Pong.
+	for range 3 {
+		if err := original.SendPing(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	got, err := p.Acquire(ctx, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer got.Close()
+	if got != original {
+		t.Fatal("pending Pong caused a direct open")
+	}
+	body, err := got.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, _, err := relay.DecodeControl(body)
+	if err != nil || op != relay.ControlOpExpandLanesHint {
+		t.Fatalf("hint=%x err=%v", body, err)
+	}
+	body, err = got.ReadMessage()
+	if err != nil || string(body) != "immediate-business" {
+		t.Fatalf("body=%q err=%v", body, err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := got.WriteMessage([]byte("active")); err != nil {
+		t.Fatal(err)
+	}
+	if body, err := got.ReadMessage(); err != nil || string(body) != "active" {
+		t.Fatalf("body=%q err=%v", body, err)
+	}
+}
+
+func TestWSStandbyTLSHandoff(t *testing.T) {
+	const childEnv = "RELAY_TEST_WS_STANDBY_TLS_CHILD"
+	if os.Getenv(childEnv) != "1" {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestWSStandbyTLSHandoff$", "-test.v")
+		cmd.Env = append(os.Environ(), childEnv+"=1")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("TLS subprocess: %v\n%s", err, out)
+		}
+		return
+	}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := relay.AcceptWebSocket(w, r)
+		if err != nil {
+			return
+		}
+		defer ws.Close()
+		// Native peer Ping is handled by the unique standby reader.
+		if err := ws.Ping(nil); err != nil {
+			return
+		}
+		body, err := ws.ReadMessage()
+		if err != nil {
+			return
+		}
+		op, _, err := relay.DecodeControl(body)
+		if err != nil || op != relay.ControlOpAttach {
+			t.Errorf("attach=%x err=%v", body, err)
+			return
+		}
+		ack, _ := relay.EncodeControl(relay.ControlOpAttachOK, nil)
+		if err := ws.WriteMessage(ack); err != nil {
+			return
+		}
+		hint, _ := relay.EncodeControl(relay.ControlOpExpandLanesHint, nil)
+		for _, frame := range [][]byte{hint, []byte("immediate-business")} {
+			if err := ws.WriteMessage(frame); err != nil {
+				return
+			}
+		}
+		for {
+			body, err := ws.ReadMessage()
+			if err != nil {
+				return
+			}
+			if err := ws.WriteMessage(body); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+	roots := x509.NewCertPool()
+	roots.AddCert(server.Certificate())
+	t.Setenv("GODEBUG", "x509usefallbackroots=1")
+	x509.SetFallbackRoots(roots)
+	for _, target := range []int{0, 1} {
+		t.Run(fmt.Sprint(target), func(t *testing.T) {
+			p := newWSPool("wss"+strings.TrimPrefix(server.URL, "https"), "", "token", target, time.Second, relay.WebSocketSocketOptions{})
+			defer p.Close()
+			deadline := time.Now().Add(3 * time.Second)
+			var original *relay.WebSocketConn
+			for target > 0 && time.Now().Before(deadline) {
+				p.mu.Lock()
+				if len(p.ready) > 0 {
+					original = p.ready[0].stream
+				}
+				p.mu.Unlock()
+				if original != nil {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if target > 0 && original == nil {
+				t.Fatal("standby not ready")
+			}
+			for i := 0; target > 0 && i < 3; i++ {
+				if err := original.SendPing(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			got, err := p.Acquire(ctx, "session")
+			if err != nil {
+				cancel()
+				t.Fatal(err)
+			}
+			defer got.Close()
+			cancel()
+			p.Close()
+			if target > 0 && got != original {
+				t.Fatal("standby not claimed")
+			}
+			if target == 0 && len(p.entries) != 0 {
+				t.Fatal("no-pool WS allocated standby state")
+			}
+			hint, err := got.ReadMessage()
+			if err != nil {
+				t.Fatal(err)
+			}
+			op, _, err := relay.DecodeControl(hint)
+			if err != nil || op != relay.ControlOpExpandLanesHint {
+				t.Fatalf("hint=%x err=%v", hint, err)
+			}
+			body, err := got.ReadMessage()
+			if err != nil || string(body) != "immediate-business" {
+				t.Fatalf("body=%q err=%v", body, err)
+			}
+			if err := got.WriteMessage([]byte("still-active")); err != nil {
+				t.Fatal(err)
+			}
+			body, err = got.ReadMessage()
+			if err != nil || string(body) != "still-active" {
+				t.Fatalf("body=%q err=%v", body, err)
+			}
+		})
+	}
+}
+
+func TestH3StandbyFailurePreservesAttachedSibling(t *testing.T) {
+	for _, reuse := range []int{1, 2} {
+		t.Run(fmt.Sprint(reuse), func(t *testing.T) {
+			remote, certs := newProviderH3Server(t)
+			p, err := newH3Provider(relay.HTTP3ClientOptions{URL: remote, RootCAs: certs}, "token", reuse, 1, time.Second, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer p.Close()
+			waitH3PoolIdle(t, p, 1)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			stream, err := p.Acquire(ctx, "session")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stream.Close()
+			waitH3PoolIdle(t, p, 1)
+			active := stream.(*h3ProviderStream)
+			p.pool.mu.Lock()
+			old := p.pool.ready[0]
+			p.pool.mu.Unlock()
+			if reuse == 2 && old.stream.slot != active.slot {
+				t.Fatal("sibling did not share transport")
+			}
+			_ = old.stream.Close()
+			deadline := time.Now().Add(3 * time.Second)
+			for {
+				p.pool.mu.Lock()
+				replaced := len(p.pool.ready) == 1 && p.pool.ready[0] != old
+				p.pool.mu.Unlock()
+				if replaced {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("standby failure was not replaced")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if err := stream.WriteMessage([]byte("surviving-lane")); err != nil {
+				t.Fatal(err)
+			}
+			if body, err := stream.ReadMessage(); err != nil || string(body) != "surviving-lane" {
+				t.Fatalf("body=%q err=%v", body, err)
+			}
+			p.Close()
+			stream.Close()
+			if got := p.stats(); got.TransportCount != 0 || got.ActiveStreams != 0 {
+				t.Fatalf("leaked reservation: %+v", got)
+			}
+		})
 	}
 }

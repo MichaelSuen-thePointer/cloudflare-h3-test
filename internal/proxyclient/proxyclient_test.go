@@ -850,7 +850,7 @@ func TestWebSocketPoolAcquireAttachesSession(t *testing.T) {
 	defer pool.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	ws, err := pool.Acquire(ctx, "example-token", "test-session")
+	ws, err := pool.Acquire(ctx, "test-session")
 	if err != nil {
 		t.Fatal(err)
 	}

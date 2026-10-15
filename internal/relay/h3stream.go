@@ -28,6 +28,7 @@ type H3MessageStream struct {
 }
 
 var _ AttachableMessageStream = (*H3MessageStream)(nil)
+var _ StandbyMessageStream = (*H3MessageStream)(nil)
 var _ MessageViewReader = (*H3MessageStream)(nil)
 
 // NewH3MessageStream owns a private transport and waits only for response
@@ -196,27 +197,35 @@ func (s *H3MessageStream) Probe(ctx context.Context) error {
 
 func (s *H3MessageStream) Attach(ctx context.Context, sessionID string) error {
 	return s.runSetup(ctx, func() error {
-		body, err := EncodeAttach(sessionID)
-		if err != nil {
+		if err := s.SendAttach(sessionID); err != nil {
 			return err
 		}
-		if err := s.WriteMessage(body); err != nil {
-			return err
-		}
-		ack, err := s.ReadMessage()
-		if err != nil {
-			return err
-		}
-		op, payload, err := DecodeControl(ack)
-		if err != nil {
-			return err
-		}
-		if op != ControlOpAttachOK || len(payload) != 0 {
-			return errors.New("bad attach ack")
-		}
-		s.attached.Store(true)
-		return nil
+		return s.ReadAttachAck()
 	})
+}
+
+func (s *H3MessageStream) SendAttach(sessionID string) error {
+	body, err := EncodeAttach(sessionID)
+	if err != nil {
+		return err
+	}
+	return s.WriteMessage(body)
+}
+
+func (s *H3MessageStream) ReadAttachAck() error {
+	ack, err := s.ReadMessage()
+	if err != nil {
+		return err
+	}
+	op, payload, err := DecodeControl(ack)
+	if err != nil {
+		return err
+	}
+	if op != ControlOpAttachOK || len(payload) != 0 {
+		return errors.New("bad attach ack")
+	}
+	s.attached.Store(true)
+	return nil
 }
 
 func (s *H3MessageStream) runSetup(ctx context.Context, operation func() error) (err error) {

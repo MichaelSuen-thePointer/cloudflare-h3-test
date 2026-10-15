@@ -51,13 +51,12 @@ func (s *providerStats) snapshot() providerStatsSnapshot {
 
 type wsProvider struct {
 	pool      *wsPool
-	token     string
 	closeOnce sync.Once
 	counters  providerStats
 }
 
 func newWSProvider(remote, connectIP, token string, target int, timeout time.Duration, socketOptions relay.WebSocketSocketOptions, metrics bool, recorders ...*quality.Recorder) *wsProvider {
-	return &wsProvider{pool: newWSPool(remote, connectIP, token, target, timeout, socketOptions, recorders...), token: token, counters: providerStats{enabled: metrics}}
+	return &wsProvider{pool: newWSPool(remote, connectIP, token, target, timeout, socketOptions, recorders...), counters: providerStats{enabled: metrics}}
 }
 
 func (p *wsProvider) Acquire(ctx context.Context, sessionID string) (relay.KeepaliveMessageStream, error) {
@@ -66,7 +65,7 @@ func (p *wsProvider) Acquire(ctx context.Context, sessionID string) (relay.Keepa
 		start = time.Now()
 		p.counters.started.Add(1)
 	}
-	stream, err := p.pool.Acquire(ctx, p.token, sessionID)
+	stream, err := p.pool.Acquire(ctx, sessionID)
 	if p.counters.enabled {
 		p.counters.acquireNanos.Add(time.Since(start).Nanoseconds())
 	}
@@ -89,10 +88,7 @@ func (p *wsProvider) Close() error {
 
 func (p *wsProvider) stats() providerStatsSnapshot {
 	s := p.counters.snapshot()
-	p.pool.mu.Lock()
-	s.WSIdle = len(p.pool.idle)
-	s.WSDialing = p.pool.dialing
-	p.pool.mu.Unlock()
+	s.WSIdle, s.WSDialing = p.pool.stats()
 	return s
 }
 
@@ -362,3 +358,8 @@ var _ streamProvider = (*wsProvider)(nil)
 var _ streamProvider = (*h3Provider)(nil)
 var _ relay.MessageViewReader = (*h3ProviderStream)(nil)
 var _ relay.KeepaliveMessageStream = (*h3ProviderStream)(nil)
+
+func (s *h3ProviderStream) SendAttach(id string) error { return s.stream.SendAttach(id) }
+func (s *h3ProviderStream) ReadAttachAck() error       { return s.stream.ReadAttachAck() }
+
+var _ relay.StandbyMessageStream = (*h3ProviderStream)(nil)
