@@ -25,11 +25,15 @@ func DefaultConfig() Config {
 // ParseConfig never includes option values in errors: they may contain secrets.
 // getenv is injected so PluginEnv parsing does not mutate process environment.
 func ParseConfig(args []string, getenv func(string) string) (Config, error) {
+	return parseConfig(args, getenv, findACMECertKey)
+}
+
+func parseConfig(args []string, getenv func(string) string, lookupACME func(string) (string, string, bool)) (Config, error) {
 	c := DefaultConfig()
+	sipHost := false
 	f := flag.NewFlagSet("tcp-proxy", flag.ContinueOnError)
 	f.SetOutput(io.Discard)
 	f.BoolVar(&c.Server, "server", c.Server, "run server role")
-	f.BoolVar(&c.PlainHTTP, "plain-http", false, "explicit plaintext origin or loopback WS client")
 	for _, p := range []struct {
 		name string
 		dst  *string
@@ -127,11 +131,17 @@ func ParseConfig(args []string, getenv func(string) string) (Config, error) {
 				if name == "listen" || name == "remote" || name == "upstream" {
 					return c, errors.New("PluginEnv options cannot override address variables")
 				}
+				if name == "scheme" || name == "tls" {
+					continue
+				}
 				if f.Lookup(name) == nil {
 					return c, errors.New("unknown PluginEnv option")
 				}
+				if name == "host" {
+					sipHost = true
+				}
 				value := values[0]
-				if name == "server" || name == "plain-http" {
+				if name == "server" {
 					b, _, err := opts.Bool(name)
 					if err != nil {
 						return c, errors.New("invalid PluginEnv boolean option")
@@ -157,6 +167,12 @@ func ParseConfig(args []string, getenv func(string) string) (Config, error) {
 			}
 			local, remote := net.JoinHostPort(v[0], v[1]), net.JoinHostPort(v[2], v[3])
 			if c.Server {
+				if _, ok := opts.Get("scheme"); ok {
+					return c, errors.New("PluginEnv scheme is a client-only option")
+				}
+				if _, ok := opts.Get("tls"); ok {
+					return c, errors.New("PluginEnv tls is a client-only option")
+				}
 				c.Listen, c.Upstream, c.Remote = remote, local, ""
 			} else {
 				c.Listen, c.Upstream = local, ""
@@ -165,14 +181,40 @@ func ParseConfig(args []string, getenv func(string) string) (Config, error) {
 					identity = c.Host
 				}
 				scheme := "https"
-				if c.Transport == TransportWebSocket {
-					scheme = "wss"
-					if c.PlainHTTP {
-						scheme = "ws"
+				if value, ok := opts.Get("scheme"); ok {
+					if value != "http" && value != "https" {
+						return c, errors.New("PluginEnv scheme must be http or https")
+					}
+					scheme = value
+				}
+				if enabled, ok, err := opts.Bool("tls"); err != nil {
+					return c, errors.New("invalid PluginEnv tls boolean")
+				} else if ok {
+					if enabled {
+						scheme = "https"
+					} else {
+						scheme = "http"
 					}
 				}
 				c.Remote = (&url.URL{Scheme: scheme, Host: net.JoinHostPort(identity, v[3])}).String()
 				c.DialHost = v[2]
+			}
+		}
+	}
+	if c.Server {
+		if seen["host"] {
+			return c, errors.New("server --host is unsupported; use PluginEnv host for acme.sh lookup")
+		}
+		if sipHost && c.Host != "" {
+			if !validHost(c.Host) {
+				return c, errors.New("host must be a DNS name or IP without a port")
+			}
+			if c.CertFile == "" && c.KeyFile == "" {
+				cert, key, ok := lookupACME(c.Host)
+				if !ok {
+					return c, errors.New("PluginEnv server host set but cert/key empty and no acme.sh certificate found")
+				}
+				c.CertFile, c.KeyFile = cert, key
 			}
 		}
 	}
@@ -272,8 +314,8 @@ func (c Config) Validate() error {
 		return errors.New("cert and key must be supplied together")
 	}
 	if c.Server {
-		if c.Host != "" || c.ConnectIP != "" || c.DialHost != "" {
-			return errors.New("host, connect-ip and network host are client-only options")
+		if c.ConnectIP != "" || c.DialHost != "" {
+			return errors.New("connect-ip and network host are client-only options")
 		}
 		if c.Transport == TransportH3 && c.Path == DefaultWSPath || c.Transport == TransportWebSocket && c.Path == DefaultH3Path {
 			return errors.New("custom server path conflicts with the other transport route")
@@ -283,12 +325,6 @@ func (c Config) Validate() error {
 		}
 		if c.Remote != "" {
 			return errors.New("remote is a client-only option")
-		}
-		if c.PlainHTTP && c.CertFile != "" {
-			return errors.New("plain-http cannot be combined with a TLS certificate")
-		}
-		if !c.PlainHTTP && c.CertFile == "" {
-			return errors.New("server requires cert/key or explicit plain-http")
 		}
 		if c.CAFile != "" {
 			return errors.New("ca is a client-only option")
@@ -301,25 +337,15 @@ func (c Config) Validate() error {
 		if err != nil || u.Hostname() == "" || !validHost(u.Hostname()) || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Port() != "" && !validPort(u.Port())) {
 			return errors.New("remote must be a carrier URL without credentials, query or fragment")
 		}
-		if c.Transport == TransportH3 && (u.Scheme != "https" || c.PlainHTTP) {
+		if c.Transport == TransportH3 && u.Scheme != "https" {
 			return errors.New("h3 remote requires HTTPS")
 		}
 		if c.Transport == TransportWebSocket {
 			if c.CAFile != "" {
 				return errors.New("custom ca is supported only for h3")
 			}
-			if u.Scheme != "wss" {
-				h := u.Hostname()
-				if c.ConnectIP != "" {
-					h = c.ConnectIP
-				}
-				if c.DialHost != "" && c.ConnectIP == "" {
-					h = c.DialHost
-				}
-				ip := net.ParseIP(h)
-				if u.Scheme != "ws" || !c.PlainHTTP || ip == nil || !ip.IsLoopback() {
-					return errors.New("plaintext WS requires explicit plain-http and a literal loopback network target")
-				}
+			if u.Scheme != "wss" && u.Scheme != "ws" && u.Scheme != "https" && u.Scheme != "http" {
+				return errors.New("websocket remote requires http, https, ws or wss")
 			}
 		}
 	}

@@ -17,9 +17,8 @@ import (
 const usage = `Usage: tcp-proxy [--server] --listen HOST:PORT --token TOKEN [options]
 
 One TCP-only binary; default role is client.
-Client: --remote https://HOST[:PORT] (h3) or wss://HOST[:PORT] (websocket)
-Server: --upstream HOST:PORT --cert FILE --key FILE
-        or --plain-http for an explicitly configured plaintext origin.
+Client: --remote https://HOST[:PORT] (h3); websocket accepts http/https/ws/wss.
+Server: --upstream HOST:PORT; cert/key enable TLS, otherwise HTTP.
 
 Options:
   --server[=true|false]       server role (default false)
@@ -27,13 +26,12 @@ Options:
   --listen HOST:PORT         local TCP listener (required)
   --remote URL              client carrier URL
   --upstream HOST:PORT       fixed server upstream service TCP target
-  --host HOST               TLS/HTTP identity host, without port
+  --host HOST               client TLS/HTTP identity host, without port
   --connect-ip IP           literal network IP override; certificate checks remain enabled
   --path PATH               versioned path (defaults /tcp-v1/h3 and /tcp-v1/ws)
   --token TOKEN             required X-Relay-Token value
   --ca FILE                 additional H3 client CA certificates
   --cert FILE --key FILE    server TLS certificate and key
-  --plain-http              plaintext server; WS clients restricted to literal loopback
   --pool-size N             ready standby target (default 2; 0 means on demand)
   --ping-interval DURATION   standby application PING interval (default 10s)
   --http-timeout DURATION    carrier setup / local accept through OPEN_OK (default 15s)

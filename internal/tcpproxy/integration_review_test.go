@@ -209,7 +209,7 @@ func TestReviewRealClientsH3ToHTTP2AndWebSocket(t *testing.T) {
 				} else {
 					origin := httptest.NewServer(state)
 					t.Cleanup(origin.Close)
-					cfg.Remote, cfg.PlainHTTP = "ws"+origin.URL[4:], true
+					cfg.Remote = "ws" + origin.URL[4:]
 				}
 				t.Cleanup(state.shutdown)
 				address := reviewStartClient(t, cfg)
@@ -314,7 +314,7 @@ func TestReviewUploadEOFReachesFixedUpstream(t *testing.T) {
 			} else {
 				origin := httptest.NewServer(state)
 				t.Cleanup(origin.Close)
-				cfg.Remote, cfg.PlainHTTP = "ws"+origin.URL[4:], true
+				cfg.Remote = "ws" + origin.URL[4:]
 			}
 			t.Cleanup(state.shutdown)
 			address := reviewStartClient(t, cfg)

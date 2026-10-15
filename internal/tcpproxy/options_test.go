@@ -42,7 +42,7 @@ func TestPluginEnvMappingAndPrecedence(t *testing.T) {
 	if c.Listen != "[::1]:1081" || c.Remote != "https://identity.example:443" || c.DialHost != "network.example" || c.Token != "env-secret" || c.PoolSize != 0 {
 		t.Fatalf("mapping: %#v", c)
 	}
-	base[(string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS")] = "server;token=secret;plain-http"
+	base[(string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS")] = "server;token=secret"
 	c, err = ParseConfig(nil, getenv)
 	if err != nil {
 		t.Fatal(err)
@@ -63,7 +63,6 @@ func TestConfigRejectsInvalidInputWithoutSecrets(t *testing.T) {
 		{"--listen=:1081", "--remote=https://example.com", "--token=secret\r\ninjected"},
 		{"--listen=:1081", "--remote=ws://example.com", "--transport=websocket", "--plain-http", "--token=secret"},
 		{"--listen=:1081", "--remote=wss://example.com", "--transport=websocket", "--ca=secret", "--token=secret"},
-		{"--server", "--listen=:1081", "--upstream=127.0.0.1:8388", "--token=secret"},
 	} {
 		_, err := ParseConfig(args, nil)
 		if err == nil {
@@ -89,7 +88,7 @@ func TestConfigRejectsInvalidInputWithoutSecrets(t *testing.T) {
 }
 
 func TestLoopbackWSAndHostOverride(t *testing.T) {
-	c, err := ParseConfig([]string{"--listen=:1081", "--remote=ws://127.0.0.1:8080", "--transport=websocket", "--plain-http", "--token=secret"}, nil)
+	c, err := ParseConfig([]string{"--listen=:1081", "--remote=ws://127.0.0.1:8080", "--transport=websocket", "--token=secret"}, nil)
 	if err != nil || c.Path != DefaultWSPath {
 		t.Fatalf("loopback: %v", err)
 	}
@@ -107,15 +106,13 @@ func TestTokenWhitespaceAndServerClientOnlyFields(t *testing.T) {
 			t.Fatalf("token validation: %v", err)
 		}
 	}
-	base, err := ParseConfig([]string{"--server", "--listen=:443", "--upstream=127.0.0.1:8388", "--plain-http", "--token=secret"}, nil)
+	base, err := ParseConfig([]string{"--server", "--listen=:443", "--upstream=127.0.0.1:8388", "--token=secret"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range []string{"host", "connect-ip", "dial-host"} {
+	for _, field := range []string{"connect-ip", "dial-host"} {
 		c := base
 		switch field {
-		case "host":
-			c.Host = "example.com"
 		case "connect-ip":
 			c.ConnectIP = "127.0.0.1"
 		case "dial-host":
@@ -127,18 +124,30 @@ func TestTokenWhitespaceAndServerClientOnlyFields(t *testing.T) {
 	}
 }
 
+func TestServerImplicitHTTPAndCertificateTLSValidation(t *testing.T) {
+	c := DefaultConfig()
+	c.Server, c.Listen, c.Upstream, c.Token = true, ":443", "127.0.0.1:8388", "secret"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("implicit server HTTP rejected: %v", err)
+	}
+	c.Host, c.CertFile, c.KeyFile = "tcp.example.com", "cert", "key"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("server host with TLS rejected: %v", err)
+	}
+}
+
 func TestPluginEnvBooleanCompatibility(t *testing.T) {
 	for _, boolean := range []string{"", "yes", "on", "1", "true"} {
-		env := map[string]string{(string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_HOST"): "127.0.0.1", (string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_PORT"): "8388", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_HOST"): "127.0.0.1", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_PORT"): "8443", (string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS"): "server=" + boolean + ";plain-http=" + boolean + ";token=secret"}
+		env := map[string]string{(string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_HOST"): "127.0.0.1", (string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_PORT"): "8388", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_HOST"): "127.0.0.1", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_PORT"): "8443", (string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS"): "server=" + boolean + ";token=secret"}
 		c, err := ParseConfig([]string{"--server=true"}, func(k string) string { return env[k] })
-		if err != nil || !c.Server || !c.PlainHTTP {
+		if err != nil || !c.Server {
 			t.Fatalf("SIP bool %q: %v", boolean, err)
 		}
 	}
 	for _, boolean := range []string{"no", "off", "0", "false"} {
-		env := map[string]string{(string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_HOST"): "127.0.0.1", (string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_PORT"): "1081", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_HOST"): "example.com", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_PORT"): "443", (string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS"): "server=" + boolean + ";plain-http=" + boolean + ";token=secret"}
+		env := map[string]string{(string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_HOST"): "127.0.0.1", (string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_PORT"): "1081", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_HOST"): "example.com", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_PORT"): "443", (string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS"): "server=" + boolean + ";token=secret"}
 		c, err := ParseConfig([]string{"--server=false"}, func(k string) string { return env[k] })
-		if err != nil || c.Server || c.PlainHTTP {
+		if err != nil || c.Server {
 			t.Fatalf("SIP bool %q: %v", boolean, err)
 		}
 	}
@@ -270,6 +279,76 @@ func TestHTTPTimeoutPublicOption(t *testing.T) {
 	for _, value := range []string{"0s", "-1s", "invalid"} {
 		if _, err := ParseConfig(clientArgs("--http-timeout="+value), nil); err == nil {
 			t.Fatalf("invalid HTTP timeout %s accepted", value)
+		}
+	}
+}
+
+func TestWebSocketURLSchemes(t *testing.T) {
+	for _, scheme := range []string{"http", "https", "ws", "wss"} {
+		c, err := ParseConfig([]string{"--listen=:1081", "--transport=websocket", "--remote=" + scheme + "://public.example.com:8080", "--token=secret"}, nil)
+		if err != nil || !strings.HasPrefix(c.Remote, scheme+"://") {
+			t.Fatalf("WS scheme %s: %v", scheme, err)
+		}
+	}
+	if _, err := ParseConfig([]string{"--listen=:1081", "--remote=http://example.com", "--token=secret"}, nil); err == nil {
+		t.Fatal("H3 accepted HTTP")
+	}
+}
+
+func TestPluginEnvSchemeAndTLSPrecedence(t *testing.T) {
+	for _, tc := range []struct {
+		options, scheme string
+		fail            bool
+	}{
+		{"transport=websocket", "https", false},
+		{"transport=websocket;scheme=http", "http", false},
+		{"transport=websocket;scheme=https", "https", false},
+		{"transport=websocket;scheme=http;tls=yes", "https", false},
+		{"transport=websocket;scheme=https;tls=off", "http", false},
+		{"transport=websocket;tls=", "https", false},
+		{"transport=websocket;tls=0", "http", false},
+		{"scheme=http;tls=true", "https", false},
+		{"scheme=https;tls=false", "", true},
+		{"transport=websocket;scheme=ws", "", true},
+		{"transport=websocket;scheme=bad;tls=true", "", true},
+		{"transport=websocket;tls=bad", "", true},
+		{"transport=websocket;tls=true;tls=false", "", true},
+		{"transport=websocket;scheme=http;scheme=https", "", true},
+		{"server;scheme=https", "", true},
+		{"server;tls=true", "", true},
+		{"plain-http", "", true},
+	} {
+		t.Run(tc.options, func(t *testing.T) {
+			env := map[string]string{(string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_HOST"): "127.0.0.1", (string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_PORT"): "1081", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_HOST"): "network.example.com", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_PORT"): "443", (string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS"): "token=secret;host=identity.example.com;" + tc.options}
+			c, err := ParseConfig(nil, func(k string) string { return env[k] })
+			if tc.fail {
+				if err == nil {
+					t.Fatal("invalid SIP scheme/tls accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.Remote != tc.scheme+"://identity.example.com:443" || c.DialHost != "network.example.com" {
+				t.Fatalf("URL=%q dial=%q", c.Remote, c.DialHost)
+			}
+		})
+	}
+	for _, name := range []string{"plain-http", "scheme", "tls"} {
+		_, err := ParseConfig(clientArgs("--"+name+"=true"), nil)
+		if err == nil || !strings.Contains(err.Error(), "unknown command-line option") {
+			t.Fatalf("unsupported CLI option %s: %v", name, err)
+		}
+	}
+	for _, server := range []bool{false, true} {
+		env := map[string]string{(string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_HOST"): "127.0.0.1", (string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_PORT"): "1081", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_HOST"): "example.com", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_PORT"): "443", (string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS"): "token=secret;plain-http"}
+		if server {
+			env[(string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS")] += ";server"
+		}
+		_, err := ParseConfig(nil, func(k string) string { return env[k] })
+		if err == nil || !strings.Contains(err.Error(), "unknown PluginEnv option") {
+			t.Fatalf("old plain-http server=%v: %v", server, err)
 		}
 	}
 }

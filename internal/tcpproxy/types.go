@@ -38,7 +38,6 @@ type Config struct {
 	CAFile              string
 	CertFile            string
 	KeyFile             string
-	PlainHTTP           bool
 	PoolSize            int
 	PingInterval        time.Duration
 	HTTPTimeout         time.Duration

@@ -139,7 +139,7 @@ func RunServer(ctx context.Context, cfg Config) error {
 		case <-done:
 		}
 	}()
-	if cfg.PlainHTTP {
+	if cfg.CertFile == "" && cfg.KeyFile == "" {
 		err = server.Serve(ln)
 	} else {
 		err = server.ServeTLS(ln, cfg.CertFile, cfg.KeyFile)
@@ -155,6 +155,10 @@ func RunServer(ctx context.Context, cfg Config) error {
 }
 
 func (s *tcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Relay-Token")), []byte(s.cfg.Token)) != 1 {
+		http.NotFound(w, r)
+		return
+	}
 	hp, wp := DefaultH3Path, DefaultWSPath
 	if s.cfg.Path != "" {
 		if s.cfg.Transport == TransportWebSocket {
@@ -174,10 +178,6 @@ func (s *tcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method != wantMethod {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Relay-Token")), []byte(s.cfg.Token)) != 1 {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	if ws && (!strings.EqualFold(r.Header.Get("Upgrade"), "websocket") || !hasUpgradeToken(r.Header.Get("Connection")) || r.Header.Get("Sec-WebSocket-Key") == "" || r.Header.Get("Sec-WebSocket-Version") != "13") {

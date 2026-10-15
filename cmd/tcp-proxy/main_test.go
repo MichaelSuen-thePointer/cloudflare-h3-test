@@ -30,7 +30,7 @@ func TestRunHelpAndInvalidConfig(t *testing.T) {
 			if !strings.Contains(out.String(), "--http-timeout") {
 				t.Fatal("current timeout options missing from help")
 			}
-			for _, old := range []string{"--setup-timeout", "--acquire-timeout", "--dial-timeout", "--control-timeout", "--close-timeout"} {
+			for _, old := range []string{"--setup-timeout", "--acquire-timeout", "--dial-timeout", "--control-timeout", "--close-timeout", "--plain-http"} {
 				if strings.Contains(out.String(), old) {
 					t.Fatalf("removed timeout %s remains in help", old)
 				}
@@ -46,7 +46,7 @@ func TestRunDispatchFailureAndCancellation(t *testing.T) {
 	for _, server := range []bool{false, true} {
 		args := []string{"--listen=127.0.0.1:12345", "--token=secret"}
 		if server {
-			args = append(args, "--server", "--upstream=127.0.0.1:8388", "--plain-http")
+			args = append(args, "--server", "--upstream=127.0.0.1:8388")
 		} else {
 			args = append(args, "--remote=https://example.com")
 		}

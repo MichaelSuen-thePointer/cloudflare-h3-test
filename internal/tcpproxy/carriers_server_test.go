@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -319,6 +320,88 @@ func TestOriginShutdownCancelsWebSocketUpstreamDial(t *testing.T) {
 
 func carrierTestConfig() Config {
 	return Config{Transport: TransportH3, Token: "example-token", HTTPTimeout: time.Second * 3, StreamsPerTransport: 2}
+}
+
+func TestRunServerChoosesHTTPOrTLSFromCertificatePair(t *testing.T) {
+	seed := httptest.NewTLSServer(http.NotFoundHandler())
+	certificate := seed.TLS.Certificates[0]
+	roots := x509.NewCertPool()
+	roots.AddCert(seed.Certificate())
+	seed.Close()
+	privateKey, err := x509.MarshalPKCS8PrivateKey(certificate.PrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificateDir := t.TempDir()
+	certFile := filepath.Join(certificateDir, "cert.pem")
+	keyFile := filepath.Join(certificateDir, "key.pem")
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate[0]}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateKey}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, withTLS := range []bool{false, true} {
+		t.Run(fmt.Sprintf("tls=%v", withTLS), func(t *testing.T) {
+			reservation, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			address := reservation.Addr().String()
+			reservation.Close()
+			cfg := DefaultConfig()
+			cfg.Server = true
+			cfg.Listen = address
+			cfg.Upstream = "127.0.0.1:1"
+			cfg.Token = "example-token"
+			scheme := "http"
+			if withTLS {
+				cfg.CertFile = certFile
+				cfg.KeyFile = keyFile
+				scheme = "https"
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- RunServer(ctx, cfg) }()
+			defer func() {
+				cancel()
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Errorf("RunServer: %v", err)
+					}
+				case <-time.After(time.Second):
+					t.Error("server did not stop")
+				}
+			}()
+			transport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots}, ForceAttemptHTTP2: true}
+			defer transport.CloseIdleConnections()
+			client := &http.Client{Transport: transport, Timeout: time.Second}
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				req, err := http.NewRequest("GET", scheme+"://"+address+"/unknown", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.Header.Set("X-Relay-Token", cfg.Token)
+				response, err := client.Do(req)
+				if err == nil {
+					response.Body.Close()
+					if response.StatusCode != http.StatusNotFound {
+						t.Fatalf("status%d", response.StatusCode)
+					}
+					if (response.TLS != nil) != withTLS {
+						t.Fatal("unexpected TLS selection")
+					}
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("server failed to serve %s: %v", scheme, err)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
+	}
 }
 
 func TestOriginRegistryHasNoBusinessCountLimit(t *testing.T) {
@@ -686,10 +769,25 @@ func TestOriginHTTP2DownstreamEOFCompletesResponseWithUploadOpen(t *testing.T) {
 func TestOriginRejectsBeforeAcceptingCarrier(t *testing.T) {
 	cfg := carrierTestConfig()
 	state := newTCPServer(cfg)
+	for _, token := range []string{"", "bad"} {
+		for _, path := range []string{DefaultH3Path, DefaultWSPath, "/tcp-v2/h3"} {
+			for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
+				req := httptest.NewRequest(method, path, nil)
+				if token != "" {
+					req.Header.Set("X-Relay-Token", token)
+				}
+				w := httptest.NewRecorder()
+				state.ServeHTTP(w, req)
+				if w.Code != http.StatusNotFound || w.Body.String() != "404 page not found\n" {
+					t.Fatalf("unauthenticated %s %s: status%d body%q", method, path, w.Code, w.Body.String())
+				}
+			}
+		}
+	}
 	for _, tc := range []struct {
 		method, path, token string
 		status              int
-	}{{"POST", DefaultH3Path, "bad", 401}, {"GET", DefaultH3Path, cfg.Token, 405}, {"POST", "/tcp-v2/h3", cfg.Token, 404}} {
+	}{{"GET", DefaultH3Path, cfg.Token, 405}, {"POST", "/tcp-v2/h3", cfg.Token, 404}, {"GET", DefaultWSPath, cfg.Token, 400}, {"POST", DefaultWSPath, cfg.Token, 405}} {
 		req := httptest.NewRequest(tc.method, tc.path, nil)
 		req.Header.Set("X-Relay-Token", tc.token)
 		w := httptest.NewRecorder()
