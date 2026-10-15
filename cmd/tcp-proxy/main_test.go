@@ -27,6 +27,9 @@ func TestRunHelpAndInvalidConfig(t *testing.T) {
 			t.Fatal("runner called before valid configuration")
 		}
 		if tc.code == 0 {
+			if !strings.Contains(out.String(), "--transport h3|ws") || !strings.Contains(out.String(), "default change-me-token") || !strings.Contains(out.String(), "default / for both carriers") {
+				t.Fatal("current transport/token/path defaults missing from help")
+			}
 			if !strings.Contains(out.String(), "--http-timeout") {
 				t.Fatal("current timeout options missing from help")
 			}

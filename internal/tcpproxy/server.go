@@ -167,16 +167,13 @@ func (s *tcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			hp = s.cfg.Path
 		}
 	}
-	ws := r.URL.Path == wp
-	if !ws && r.URL.Path != hp {
+	h3Path, wsPath := r.URL.Path == hp, r.URL.Path == wp
+	if !h3Path && !wsPath {
 		http.NotFound(w, r)
 		return
 	}
-	wantMethod := http.MethodPost
-	if ws {
-		wantMethod = http.MethodGet
-	}
-	if r.Method != wantMethod {
+	ws := wsPath && r.Method == http.MethodGet
+	if !ws && !(h3Path && r.Method == http.MethodPost) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}

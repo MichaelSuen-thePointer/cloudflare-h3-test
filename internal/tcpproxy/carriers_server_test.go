@@ -787,7 +787,7 @@ func TestOriginRejectsBeforeAcceptingCarrier(t *testing.T) {
 	for _, tc := range []struct {
 		method, path, token string
 		status              int
-	}{{"GET", DefaultH3Path, cfg.Token, 405}, {"POST", "/tcp-v2/h3", cfg.Token, 404}, {"GET", DefaultWSPath, cfg.Token, 400}, {"POST", DefaultWSPath, cfg.Token, 405}} {
+	}{{"DELETE", DefaultH3Path, cfg.Token, 405}, {"POST", "/tcp-v2/h3", cfg.Token, 404}, {"GET", DefaultWSPath, cfg.Token, 400}} {
 		req := httptest.NewRequest(tc.method, tc.path, nil)
 		req.Header.Set("X-Relay-Token", tc.token)
 		w := httptest.NewRecorder()
@@ -803,5 +803,85 @@ func TestOriginRejectsBeforeAcceptingCarrier(t *testing.T) {
 	state.ServeHTTP(w, req)
 	if w.Code != 503 {
 		t.Fatalf("shutdown refusal got %d", w.Code)
+	}
+}
+
+func TestOriginSharedRootAcceptsHTTPAndWebSocketCarriers(t *testing.T) {
+	cfg := carrierTestConfig()
+	state := newTCPServer(cfg)
+	srv := httptest.NewServer(state)
+	defer srv.Close()
+	defer state.shutdown()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reader, writer := io.Pipe()
+	defer writer.Close()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/", reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Relay-Token", cfg.Token)
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("POST root status%d", response.StatusCode)
+	}
+	if _, err := writer.Write([]byte{ControlPing}); err != nil {
+		t.Fatal(err)
+	}
+	var reply [1]byte
+	if _, err := io.ReadFull(response.Body, reply[:]); err != nil || reply[0] != ControlPong {
+		t.Fatalf("HTTP root PONG=%v err=%v", reply, err)
+	}
+	ws, err := relay.DialWebSocket(context.Background(), "ws"+srv.URL[4:]+"/", "", cfg.Token, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.Close()
+	if err := ws.WriteMessage([]byte{ControlPing}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ws.ReadMessage()
+	if err != nil || !bytes.Equal(got, []byte{ControlPong}) {
+		t.Fatalf("WS root PONG=%v err=%v", got, err)
+	}
+}
+
+func TestOriginCustomPathIsolatesSelectedTransport(t *testing.T) {
+	for _, selected := range []string{TransportH3, TransportWebSocket} {
+		t.Run(selected, func(t *testing.T) {
+			cfg := carrierTestConfig()
+			cfg.Transport = selected
+			cfg.Path = "/custom"
+			state := newTCPServer(cfg)
+			state.shutdown()
+			cases := []struct {
+				method, path string
+				status       int
+			}{}
+			if selected == TransportH3 {
+				cases = []struct {
+					method, path string
+					status       int
+				}{{"POST", "/custom", 503}, {"GET", "/custom", 405}, {"POST", "/", 405}, {"GET", "/", 400}}
+			} else {
+				cases = []struct {
+					method, path string
+					status       int
+				}{{"POST", "/custom", 405}, {"GET", "/custom", 400}, {"POST", "/", 503}, {"GET", "/", 405}}
+			}
+			for _, tc := range cases {
+				req := httptest.NewRequest(tc.method, tc.path, nil)
+				req.Header.Set("X-Relay-Token", cfg.Token)
+				w := httptest.NewRecorder()
+				state.ServeHTTP(w, req)
+				if w.Code != tc.status {
+					t.Fatalf("%s %s status%d want%d", tc.method, tc.path, w.Code, tc.status)
+				}
+			}
+		})
 	}
 }

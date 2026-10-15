@@ -14,22 +14,22 @@ import (
 	"cloudflare-h3-test/internal/tcpproxy"
 )
 
-const usage = `Usage: tcp-proxy [--server] --listen HOST:PORT --token TOKEN [options]
+const usage = `Usage: tcp-proxy [--server] --listen HOST:PORT [options]
 
 One TCP-only binary; default role is client.
-Client: --remote https://HOST[:PORT] (h3); websocket accepts http/https/ws/wss.
+Client: --remote https://HOST[:PORT] (h3); ws accepts http/https/ws/wss.
 Server: --upstream HOST:PORT; cert/key enable TLS, otherwise HTTP.
 
 Options:
   --server[=true|false]       server role (default false)
-  --transport h3|websocket   client carrier/custom server path selector (default h3)
+  --transport h3|ws          client carrier/custom server path selector (default h3)
   --listen HOST:PORT         local TCP listener (required)
   --remote URL              client carrier URL
   --upstream HOST:PORT       fixed server upstream service TCP target
   --host HOST               client TLS/HTTP identity host, without port
   --connect-ip IP           literal network IP override; certificate checks remain enabled
-  --path PATH               versioned path (defaults /tcp-v1/h3 and /tcp-v1/ws)
-  --token TOKEN             required X-Relay-Token value
+  --path PATH               carrier path (default / for both carriers)
+  --token TOKEN             X-Relay-Token value (default change-me-token; empty rejected)
   --ca FILE                 additional H3 client CA certificates
   --cert FILE --key FILE    server TLS certificate and key
   --pool-size N             ready standby target (default 2; 0 means on demand)
@@ -44,7 +44,8 @@ Options:
   --help                    show this help
 
 Durations require units, for example 5s. Unknown and duplicate options are rejected.
-Server listens on both default paths; --path overrides only --transport's route.
+Server shares /: POST is H3, GET Upgrade is WS; ordinary authenticated GET returns 400.
+--path overrides only --transport's route.
 Connection counts and concurrent dials are limited by OS resources only.
 No UDP forwarding, application multiplexing, reconnection, or TCP half-close.
 `

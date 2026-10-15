@@ -16,7 +16,7 @@ import (
 )
 
 func DefaultConfig() Config {
-	return Config{Transport: TransportH3, PoolSize: 2, PingInterval: 10 * time.Second,
+	return Config{Transport: TransportH3, Token: "change-me-token", PoolSize: 2, PingInterval: 10 * time.Second,
 		HTTPTimeout:         15 * time.Second,
 		StreamsPerTransport: 2,
 		QUICWindows:         relay.QUICReceiveWindows{InitialStream: 6 << 20, MaxStream: 16 << 20, InitialConnection: 15 << 20, MaxConnection: 24 << 20}}
@@ -279,7 +279,7 @@ func validAddress(s string) bool {
 
 func (c Config) Validate() error {
 	if c.Transport != TransportH3 && c.Transport != TransportWebSocket {
-		return errors.New("transport must be h3 or websocket")
+		return errors.New("transport must be h3 or ws")
 	}
 	if !validAddress(c.Listen) {
 		return errors.New("listen must be a TCP host:port address with a nonzero port")
@@ -316,9 +316,6 @@ func (c Config) Validate() error {
 	if c.Server {
 		if c.ConnectIP != "" || c.DialHost != "" {
 			return errors.New("connect-ip and network host are client-only options")
-		}
-		if c.Transport == TransportH3 && c.Path == DefaultWSPath || c.Transport == TransportWebSocket && c.Path == DefaultH3Path {
-			return errors.New("custom server path conflicts with the other transport route")
 		}
 		if !validAddress(c.Upstream) {
 			return errors.New("upstream must be a fixed TCP host:port address")

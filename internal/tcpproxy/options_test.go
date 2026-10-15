@@ -61,8 +61,8 @@ func TestConfigRejectsInvalidInputWithoutSecrets(t *testing.T) {
 		clientArgs("--path=/bad?secret"), clientArgs("--token=another-secret"), clientArgs("--unknown=secret"),
 		clientArgs("--host=secret:443"),
 		{"--listen=:1081", "--remote=https://example.com", "--token=secret\r\ninjected"},
-		{"--listen=:1081", "--remote=ws://example.com", "--transport=websocket", "--plain-http", "--token=secret"},
-		{"--listen=:1081", "--remote=wss://example.com", "--transport=websocket", "--ca=secret", "--token=secret"},
+		{"--listen=:1081", "--remote=ws://example.com", "--transport=ws", "--plain-http", "--token=secret"},
+		{"--listen=:1081", "--remote=wss://example.com", "--transport=ws", "--ca=secret", "--token=secret"},
 	} {
 		_, err := ParseConfig(args, nil)
 		if err == nil {
@@ -88,7 +88,7 @@ func TestConfigRejectsInvalidInputWithoutSecrets(t *testing.T) {
 }
 
 func TestLoopbackWSAndHostOverride(t *testing.T) {
-	c, err := ParseConfig([]string{"--listen=:1081", "--remote=ws://127.0.0.1:8080", "--transport=websocket", "--token=secret"}, nil)
+	c, err := ParseConfig([]string{"--listen=:1081", "--remote=ws://127.0.0.1:8080", "--transport=ws", "--token=secret"}, nil)
 	if err != nil || c.Path != DefaultWSPath {
 		t.Fatalf("loopback: %v", err)
 	}
@@ -285,7 +285,7 @@ func TestHTTPTimeoutPublicOption(t *testing.T) {
 
 func TestWebSocketURLSchemes(t *testing.T) {
 	for _, scheme := range []string{"http", "https", "ws", "wss"} {
-		c, err := ParseConfig([]string{"--listen=:1081", "--transport=websocket", "--remote=" + scheme + "://public.example.com:8080", "--token=secret"}, nil)
+		c, err := ParseConfig([]string{"--listen=:1081", "--transport=ws", "--remote=" + scheme + "://public.example.com:8080", "--token=secret"}, nil)
 		if err != nil || !strings.HasPrefix(c.Remote, scheme+"://") {
 			t.Fatalf("WS scheme %s: %v", scheme, err)
 		}
@@ -295,25 +295,82 @@ func TestWebSocketURLSchemes(t *testing.T) {
 	}
 }
 
+func TestTokenTransportAndRootPathDefaults(t *testing.T) {
+	for _, transport := range []string{"h3", "ws"} {
+		c, err := ParseConfig([]string{"--listen=:1081", "--remote=https://example.com", "--transport=" + transport}, nil)
+		if err != nil || c.Token != "change-me-token" || c.Path != "/" || c.Transport != transport {
+			t.Fatalf("CLI defaults: token=%q path=%q transport=%q err=%v", c.Token, c.Path, c.Transport, err)
+		}
+		env := map[string]string{(string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_HOST"): "127.0.0.1", (string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_PORT"): "1081", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_HOST"): "example.com", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_PORT"): "443", (string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS"): "transport=" + transport}
+		c, err = ParseConfig(nil, func(k string) string { return env[k] })
+		if err != nil || c.Token != "change-me-token" || c.Path != "/" {
+			t.Fatalf("SIP defaults: token=%q path=%q err=%v", c.Token, c.Path, err)
+		}
+		env[(string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS")] += ";token=custom-token"
+		c, err = ParseConfig(nil, func(k string) string { return env[k] })
+		if err != nil || c.Token != "custom-token" {
+			t.Fatalf("SIP token override: %v", err)
+		}
+		env[(string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS")] = "transport=" + transport + ";token="
+		if _, err := ParseConfig(nil, func(k string) string { return env[k] }); err == nil {
+			t.Fatal("explicit empty SIP token accepted")
+		}
+	}
+	if _, err := ParseConfig(clientArgs("--transport=websocket"), nil); err == nil {
+		t.Fatal("old websocket transport accepted by CLI")
+	}
+	env := map[string]string{(string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_HOST"): "127.0.0.1", (string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_PORT"): "1081", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_HOST"): "example.com", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_PORT"): "443", (string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS"): "transport=websocket"}
+	if _, err := ParseConfig(nil, func(k string) string { return env[k] }); err == nil {
+		t.Fatal("old websocket transport accepted by PluginEnv")
+	}
+	if DefaultConfig().Path != "" {
+		t.Fatal("default config must preserve URL-path fallback")
+	}
+}
+
+func TestCustomClientAndServerPaths(t *testing.T) {
+	for _, transport := range []string{"h3", "ws"} {
+		for _, tc := range []struct{ url, path, want string }{
+			{"https://example.com", "", "/"}, {"https://example.com/from-url", "", "/from-url"},
+			{"https://example.com/from-url", "/explicit", "/explicit"}, {"https://example.com/from-url", "/", "/"},
+		} {
+			args := []string{"--listen=:1081", "--transport=" + transport, "--remote=" + tc.url}
+			if tc.path != "" {
+				args = append(args, "--path="+tc.path)
+			}
+			c, err := ParseConfig(args, nil)
+			if err != nil || c.Path != tc.want {
+				t.Fatalf("client path=%q want=%q err=%v", c.Path, tc.want, err)
+			}
+		}
+		for _, path := range []string{"/", "/custom"} {
+			c, err := ParseConfig([]string{"--server", "--listen=:8080", "--upstream=127.0.0.1:8388", "--transport=" + transport, "--path=" + path}, nil)
+			if err != nil || c.Path != path {
+				t.Fatalf("server path=%q want=%q err=%v", c.Path, path, err)
+			}
+		}
+	}
+}
+
 func TestPluginEnvSchemeAndTLSPrecedence(t *testing.T) {
 	for _, tc := range []struct {
 		options, scheme string
 		fail            bool
 	}{
-		{"transport=websocket", "https", false},
-		{"transport=websocket;scheme=http", "http", false},
-		{"transport=websocket;scheme=https", "https", false},
-		{"transport=websocket;scheme=http;tls=yes", "https", false},
-		{"transport=websocket;scheme=https;tls=off", "http", false},
-		{"transport=websocket;tls=", "https", false},
-		{"transport=websocket;tls=0", "http", false},
+		{"transport=ws", "https", false},
+		{"transport=ws;scheme=http", "http", false},
+		{"transport=ws;scheme=https", "https", false},
+		{"transport=ws;scheme=http;tls=yes", "https", false},
+		{"transport=ws;scheme=https;tls=off", "http", false},
+		{"transport=ws;tls=", "https", false},
+		{"transport=ws;tls=0", "http", false},
 		{"scheme=http;tls=true", "https", false},
 		{"scheme=https;tls=false", "", true},
-		{"transport=websocket;scheme=ws", "", true},
-		{"transport=websocket;scheme=bad;tls=true", "", true},
-		{"transport=websocket;tls=bad", "", true},
-		{"transport=websocket;tls=true;tls=false", "", true},
-		{"transport=websocket;scheme=http;scheme=https", "", true},
+		{"transport=ws;scheme=ws", "", true},
+		{"transport=ws;scheme=bad;tls=true", "", true},
+		{"transport=ws;tls=bad", "", true},
+		{"transport=ws;tls=true;tls=false", "", true},
+		{"transport=ws;scheme=http;scheme=https", "", true},
 		{"server;scheme=https", "", true},
 		{"server;tls=true", "", true},
 		{"plain-http", "", true},

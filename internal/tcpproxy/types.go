@@ -11,9 +11,9 @@ import (
 
 const (
 	TransportH3             = "h3"
-	TransportWebSocket      = "websocket"
-	DefaultH3Path           = "/tcp-v1/h3"
-	DefaultWSPath           = "/tcp-v1/ws"
+	TransportWebSocket      = "ws"
+	DefaultH3Path           = "/"
+	DefaultWSPath           = "/"
 	ControlPing        byte = 0x01
 	ControlPong        byte = 0x02
 	ControlOpen        byte = 0x03
