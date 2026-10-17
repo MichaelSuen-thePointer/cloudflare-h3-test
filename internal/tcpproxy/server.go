@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -251,14 +252,16 @@ func (s *tcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	var control [1]byte
+	reader := newRecordReader(carrier)
+	writer := newRecordWriter(carrier, nil, false)
 	for {
-		if _, err := io.ReadFull(carrier, control[:]); err != nil {
+		header, err := reader.ReadHeader()
+		if err != nil {
 			return
 		}
-		switch control[0] {
+		switch header {
 		case ControlPing:
-			if err := writeServerControl(carrier, ControlPong); err != nil {
+			if err := writer.WriteControl(ControlPong); err != nil {
 				s.reportFailure(session.ctx, "pong-write", err)
 				return
 			}
@@ -283,11 +286,13 @@ opened:
 	if !session.setUpstream(upstream) {
 		return
 	}
-	if err := writeServerControl(carrier, ControlOpenOK); err != nil {
+	if err := writer.WriteControl(ControlOpenOK); err != nil {
 		s.reportFailure(session.ctx, "open-ok-write", err)
 		return
 	}
-	s.relayRaw(session.ctx, carrier, upstream, stopAndJoinRequest)
+	if err := s.relayRecords(session.ctx, carrier, upstream, reader, writer, stopAndJoinRequest); err != nil {
+		s.reportFailure(session.ctx, "relay-records", err)
+	}
 }
 func (s *tcpServer) reportFailure(ctx context.Context, stage string, err error) {
 	if ctx.Err() != nil || err == nil {
@@ -299,13 +304,6 @@ func (s *tcpServer) reportFailure(ctx context.Context, stage string, err error) 
 	}
 	log.Printf("tcp server failure stage=%s error=%q", stage, message)
 }
-func writeServerControl(c Carrier, b byte) error {
-	n, err := c.Write([]byte{b})
-	if err == nil && n != 1 {
-		return io.ErrShortWrite
-	}
-	return err
-}
 func hasUpgradeToken(value string) bool {
 	for _, v := range strings.Split(value, ",") {
 		if strings.EqualFold(strings.TrimSpace(v), "upgrade") {
@@ -315,15 +313,18 @@ func hasUpgradeToken(value string) bool {
 	return false
 }
 
-func (s *tcpServer) relayRaw(ctx context.Context, c Carrier, upstream net.Conn, stopRequest func()) {
+func (s *tcpServer) relayRecords(ctx context.Context, c Carrier, upstream net.Conn, reader *recordReader, writer *recordWriter, stopRequest func()) error {
 	type result struct {
 		down bool
 		err  error
 	}
 	done := make(chan result, 2)
-	go func() { _, err := io.CopyBuffer(upstream, c, make([]byte, CopyBufferSize)); done <- result{err: err} }()
 	go func() {
-		_, err := io.CopyBuffer(c, upstream, make([]byte, CopyBufferSize))
+		_, err := io.CopyBuffer(upstream, &serverDataReader{reader: reader, writer: writer}, make([]byte, CopyBufferSize))
+		done <- result{err: err}
+	}()
+	go func() {
+		_, err := io.CopyBuffer(writer, upstream, make([]byte, CopyBufferSize))
 		done <- result{down: true, err: err}
 	}()
 	var first result
@@ -334,10 +335,17 @@ func (s *tcpServer) relayRaw(ctx context.Context, c Carrier, upstream net.Conn, 
 		upstream.Close()
 		<-done
 		<-done
-		return
+		writer.Stop()
+		return ctx.Err()
 	}
 	if first.err == nil {
 		stopRequest()
+		// Stop joins the in-flight record and forbids future DATA/PONG before
+		// normal FinishWrite. Explicit shutdown closes c without taking this lock.
+		writer.Stop()
+	} else {
+		c.Close()
+		writer.Stop()
 	}
 	// Close the fixed TCP target to wake the other business direction. On a
 	// normal finish allow its already scheduled response writes to finish.
@@ -352,10 +360,50 @@ func (s *tcpServer) relayRaw(ctx context.Context, c Carrier, upstream net.Conn, 
 	} else if first.down {
 		c.Close()
 	}
-	<-done // All ResponseWriter users have exited before handler return.
-	if first.err == nil {
-		c.FinishWrite()
+	second := <-done // All ResponseWriter users have exited before handler return.
+	var relayErr error
+	if first.err != nil {
+		relayErr = first.err
 	}
+	// The owner's socket/body interruption can make the joined loop return a
+	// network error or writer-stopped. A decoded protocol error is still real,
+	// including one hidden by a simultaneous upstream Write failure in io.Copy.
+	if isServerRecordProtocolError(second.err) {
+		relayErr = errors.Join(relayErr, second.err)
+	}
+	if err := reader.Err(); isServerRecordProtocolError(err) && !errors.Is(relayErr, err) {
+		relayErr = errors.Join(relayErr, err)
+	}
+	if err := writer.Err(); err != nil && !errors.Is(relayErr, err) {
+		relayErr = errors.Join(relayErr, err)
+	}
+	if relayErr != nil {
+		c.Close()
+		return relayErr
+	}
+	if err := c.FinishWrite(); err != nil {
+		c.Close()
+		return fmt.Errorf("finish response: %w", err)
+	}
+	return nil
+}
+
+func isServerRecordProtocolError(err error) bool {
+	return errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, errRecordControl)
+}
+
+type serverDataReader struct {
+	reader *recordReader
+	writer *recordWriter
+}
+
+func (r *serverDataReader) Read(p []byte) (int, error) {
+	return r.reader.ReadData(p, func(header uint16) error {
+		if header != ControlPing {
+			return fmt.Errorf("%w: invalid active upstream control record", errRecordControl)
+		}
+		return r.writer.WriteControl(ControlPong)
+	})
 }
 
 type originH3Carrier struct {

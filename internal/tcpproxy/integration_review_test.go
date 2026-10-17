@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -343,6 +344,118 @@ func TestReviewUploadEOFReachesFixedUpstream(t *testing.T) {
 				}
 			case <-time.After(5 * time.Second):
 				t.Fatal("fixed upstream never received EOF")
+			}
+		})
+	}
+}
+
+// Observe the actual HTTP/2 request bytes independently of the production
+// decoder. Only PINGs after OPEN count, so standby refill cannot satisfy this.
+type reviewRecordBody struct {
+	io.ReadCloser
+	header [2]byte
+	used   int
+	left   int
+	opened bool
+	pings  *atomic.Int32
+}
+
+func (b *reviewRecordBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	for data := p[:n]; len(data) > 0; {
+		if b.left > 0 {
+			k := min(b.left, len(data))
+			b.left -= k
+			data = data[k:]
+			continue
+		}
+		k := copy(b.header[b.used:], data)
+		b.used += k
+		data = data[k:]
+		if b.used != 2 {
+			continue
+		}
+		b.used = 0
+		header := binary.LittleEndian.Uint16(b.header[:])
+		switch {
+		case header == 0 && b.opened:
+			b.pings.Add(1)
+		case header == 65535:
+			b.opened = true
+		case header > 0 && header < 65535:
+			b.left = int(header)
+		}
+	}
+	return n, err
+}
+
+func TestReviewH3ActivePingReachesOriginWithoutLeakingToSS(t *testing.T) {
+	for _, poolSize := range []int{0, 2} {
+		t.Run(fmt.Sprintf("pool%d", poolSize), func(t *testing.T) {
+			initial := []byte{0, 0, 1, 0, 2, 0, 3, 0, 255, 255}
+			extra := make(chan []byte, 1)
+			upstream, _ := reviewUpstream(t, func(c net.Conn) {
+				got := make([]byte, len(initial))
+				if _, err := io.ReadFull(c, got); err != nil || !bytes.Equal(got, initial) {
+					t.Errorf("initial SS bytes: %x, %v", got, err)
+					return
+				}
+				if _, err := c.Write(got); err != nil {
+					return
+				}
+				// Sustained downlink does not count as client send activity.
+				for i := 0; i < 8; i++ {
+					time.Sleep(25 * time.Millisecond)
+					if _, err := c.Write([]byte{byte(i)}); err != nil {
+						return
+					}
+				}
+				remaining, err := io.ReadAll(c)
+				if err != nil {
+					t.Errorf("SS tail: %v", err)
+				}
+				extra <- remaining
+			})
+			cfg := reviewConfig()
+			cfg.PoolSize = poolSize
+			serverCfg := cfg
+			serverCfg.Upstream = upstream
+			state := newTCPServer(serverCfg)
+			var pings atomic.Int32
+			cfg.Remote, cfg.CAFile, _ = reviewH3Edge(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				r.Body = &reviewRecordBody{ReadCloser: r.Body, pings: &pings}
+				state.ServeHTTP(w, r)
+			}))
+			t.Cleanup(state.shutdown)
+			address := reviewStartClient(t, cfg)
+			c, err := net.DialTimeout("tcp", address, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+			if _, err := c.Write(initial); err != nil {
+				t.Fatal(err)
+			}
+			got := make([]byte, len(initial)+8)
+			if _, err := io.ReadFull(c, got); err != nil {
+				t.Fatal(err)
+			}
+			want := append(append([]byte(nil), initial...), 0, 1, 2, 3, 4, 5, 6, 7)
+			if !bytes.Equal(got, want) {
+				t.Fatalf("PONG leaked into SS client: %x", got)
+			}
+			if pings.Load() < 2 {
+				t.Fatalf("active request body only contained %d PINGs", pings.Load())
+			}
+			c.Close()
+			select {
+			case b := <-extra:
+				if len(b) != 0 {
+					t.Fatalf("PING leaked into SS server: %x", b)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("SS connection did not finish")
 			}
 		})
 	}

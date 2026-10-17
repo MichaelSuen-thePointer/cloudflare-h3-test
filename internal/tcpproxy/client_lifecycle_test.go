@@ -3,6 +3,7 @@ package tcpproxy
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -76,20 +77,20 @@ func TestTCPClientEarlyUploadAndExactACKBoundary(t *testing.T) {
 	payload := []byte{1, 2, 3, 4, 0, 255}
 	upload := []byte("before-ack")
 	go func() {
-		var open [1]byte
+		var open [2]byte
 		_, err := io.ReadFull(back, open[:])
-		if err == nil && open[0] != ControlOpen {
+		if err == nil && binary.LittleEndian.Uint16(open[:]) != ControlOpen {
 			err = errors.New("missing OPEN")
 		}
 		b := make([]byte, len(upload))
 		if err == nil {
-			_, err = io.ReadFull(back, b)
+			_, err = io.ReadFull(clientUploadTestReader{newRecordReader(back)}, b)
 		}
 		if err == nil && !bytes.Equal(b, upload) {
 			err = errors.New("upload mismatch")
 		}
 		if err == nil {
-			_, err = back.Write(append([]byte{ControlPong, ControlOpenOK}, payload...))
+			_, err = back.Write(append(clientTestControls(ControlPong, ControlOpenOK, ControlPong), clientTestDataWire(payload)...))
 		}
 		server <- err
 	}()
@@ -112,7 +113,7 @@ func TestTCPClientEarlyUploadAndExactACKBoundary(t *testing.T) {
 		t.Fatal("OPEN retried")
 	}
 }
-func TestTCPClientJoinsAuthorizedPingBeforeOPEN(t *testing.T) {
+func TestTCPClientRecordsSerializeAuthorizedPingAndOPEN(t *testing.T) {
 	cfg := clientTestConfig()
 	cfg.PoolSize = 1
 	cfg.PingInterval = time.Millisecond
@@ -124,13 +125,13 @@ func TestTCPClientJoinsAuthorizedPingBeforeOPEN(t *testing.T) {
 	var once sync.Once
 	carrier := &clientPipeCarrier{Conn: front}
 	carrier.write = func(b []byte) (int, error) {
-		if len(b) == 1 && b[0] == ControlPing {
+		if len(b) == 2 && binary.LittleEndian.Uint16(b) == ControlPing {
 			n, err := front.Write(b)
 			once.Do(func() { close(pingStarted) })
 			<-releasePing
 			return n, err
 		}
-		if len(b) == 1 && b[0] == ControlOpen {
+		if len(b) == 2 && binary.LittleEndian.Uint16(b) == ControlOpen {
 			openCalled <- struct{}{}
 		}
 		return front.Write(b)
@@ -141,19 +142,28 @@ func TestTCPClientJoinsAuthorizedPingBeforeOPEN(t *testing.T) {
 	p := newStandbyPool(ctx, cfg, d)
 	server := make(chan error, 1)
 	go func() {
-		var b [1]byte
+		var b [2]byte
 		_, err := io.ReadFull(back, b[:])
 		if err == nil {
-			_, err = back.Write([]byte{ControlPong})
+			_, err = back.Write(clientTestControls(ControlPong))
 		}
-		if err == nil {
+		for err == nil {
 			_, err = io.ReadFull(back, b[:])
-			if b[0] != ControlOpen {
-				err = errors.New("PING occurred after claim")
+			if err != nil {
+				break
 			}
+			h := binary.LittleEndian.Uint16(b[:])
+			if h == ControlOpen {
+				break
+			}
+			if h != ControlPing {
+				err = errors.New("unexpected record before OPEN")
+				break
+			}
+			_, err = back.Write(clientTestControls(ControlPong))
 		}
 		if err == nil {
-			_, err = back.Write([]byte{ControlOpenOK})
+			_, err = back.Write(clientTestControls(ControlOpenOK))
 		}
 		server <- err
 	}()
@@ -196,9 +206,9 @@ func TestTCPClientFastACKCannotHideFailedOPEN(t *testing.T) {
 	app, _, done, _ := startClientTestConnection(t, cfg, d)
 	defer app.Close()
 	go func() {
-		var b [1]byte
+		var b [2]byte
 		_, _ = io.ReadFull(back, b[:])
-		_, _ = back.Write([]byte{ControlOpenOK})
+		_, _ = back.Write(clientTestControls(ControlOpenOK))
 		close(ackSent)
 	}()
 	if err := clientTestWait(t, done); err == nil {
@@ -220,12 +230,16 @@ func TestTCPPoolCloseHasNoAuthorityAfterHandoff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer e.abort()
+	defer e.join()
 	defer p.release(e)
 	if err = p.beginOpen(e, ctx); err != nil {
 		t.Fatal(err)
 	}
-	go func() { var b [1]byte; _, _ = io.ReadFull(back, b[:]); _, _ = back.Write([]byte{ControlOpenOK}) }()
+	go func() {
+		var b [2]byte
+		_, _ = io.ReadFull(back, b[:])
+		_, _ = back.Write(clientTestControls(ControlOpenOK))
+	}()
 	if err = e.writeControl(ctx, ControlOpen); err != nil {
 		t.Fatal(err)
 	}
@@ -233,14 +247,15 @@ func TestTCPPoolCloseHasNoAuthorityAfterHandoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	clientTestWait(t, e.readDone)
+	p.prepareHandoff(e, ctx)
 	if err = p.handoff(e, ctx); err != nil {
 		t.Fatal(err)
 	}
 	p.Close()
 	sent := make(chan error, 1)
-	go func() { _, err := back.Write([]byte{9}); sent <- err }()
-	var b [1]byte
-	if _, err = io.ReadFull(e.reader, b[:]); err != nil || b[0] != 9 {
+	go func() { _, err := back.Write(clientTestDataWire([]byte{9})); sent <- err }()
+	var b [2]byte
+	if _, err = io.ReadFull(clientDataReader{reader: e.reader}, b[:1]); err != nil || b[0] != 9 {
 		t.Fatalf("pool closed active: %v", err)
 	}
 	if err = clientTestWait(t, sent); err != nil {
@@ -262,8 +277,8 @@ func (c *clientTailCarrier) Write(b []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	n, err := c.buf.Write(b)
-	if len(b) == 1 && b[0] == ControlOpen {
-		go func() { _, _ = c.writer.Write([]byte{ControlOpenOK}) }()
+	if len(b) == 2 && binary.LittleEndian.Uint16(b) == ControlOpen {
+		go func() { _, _ = c.writer.Write(clientTestControls(ControlOpenOK)) }()
 	}
 	return n, err
 }
@@ -288,7 +303,7 @@ func TestTCPClientUploadEOFFinishesTailBeforeAbort(t *testing.T) {
 	c.mu.Lock()
 	got := append([]byte(nil), c.buf.Bytes()...)
 	c.mu.Unlock()
-	if !bytes.Equal(got, append([]byte{ControlOpen}, tail...)) {
+	if !bytes.Equal(clientTestDecodeUpload(t, got), tail) {
 		t.Fatalf("upload tail changed: got %d want %d", len(got), len(tail)+1)
 	}
 }
@@ -338,7 +353,7 @@ func TestTCPPoolCloseCancelsClaimWaitingForPing(t *testing.T) {
 	carrier := &clientPipeCarrier{Conn: front}
 	var once sync.Once
 	carrier.write = func(b []byte) (int, error) {
-		if b[0] == ControlPing {
+		if len(b) == 2 && binary.LittleEndian.Uint16(b) == ControlPing {
 			once.Do(func() { close(started) })
 		}
 		return front.Write(b)
@@ -392,7 +407,7 @@ func TestTCPClientLateACKAfterUploadEOFCannotHandoff(t *testing.T) {
 	app.Close()
 	clientTestWait(t, finished)
 	// The connection already became terminal before this ACK could arrive.
-	_, _ = w.Write([]byte{ControlOpenOK})
+	_, _ = w.Write(clientTestControls(ControlOpenOK))
 	_ = w.Close()
 	if err := clientTestWait(t, done); !errors.Is(err, errConnectionEnded) {
 		t.Fatalf("late ACK result: %v", err)
@@ -437,15 +452,16 @@ func TestTCPPoolHandoffAndReleaseRaceClose(t *testing.T) {
 		if err = p.beginOpen(e, ctx); err != nil {
 			t.Fatal(err)
 		}
-		go func() { _, _ = back.Write([]byte{ControlOpenOK}) }()
+		go func() { _, _ = back.Write(clientTestControls(ControlOpenOK)) }()
 		if err = clientTestWait(t, e.ack); err != nil {
 			t.Fatal(err)
 		}
 		clientTestWait(t, e.readDone)
 		closed := make(chan struct{})
 		go func() { p.Close(); close(closed) }()
+		p.prepareHandoff(e, ctx)
 		_ = p.handoff(e, ctx)
-		e.abort()
+		e.join()
 		p.release(e)
 		clientTestWait(t, closed)
 		cancel()
@@ -483,7 +499,7 @@ func TestTCPPoolRejectsOPENOKBeforeOPENStarted(t *testing.T) {
 			time.Sleep(time.Millisecond)
 		}
 	}
-	if _, err := back.Write([]byte{ControlOpenOK}); err != nil {
+	if _, err := back.Write(clientTestControls(ControlOpenOK)); err != nil {
 		t.Fatal(err)
 	}
 	if err := clientTestWait(t, e.ack); err == nil {
@@ -554,8 +570,8 @@ func (c *clientArbitratedCarrier) Write(b []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	n, err := c.buf.Write(b)
-	if len(b) == 1 && b[0] == ControlOpen {
-		go func() { _, _ = c.w.Write([]byte{ControlOpenOK, 99}) }()
+	if len(b) == 2 && binary.LittleEndian.Uint16(b) == ControlOpen {
+		go func() { _, _ = c.w.Write(append(clientTestControls(ControlOpenOK), clientTestDataWire([]byte{99})...)) }()
 	}
 	return n, err
 }
@@ -592,7 +608,7 @@ func TestTCPClientOriginalUploadEOFBeatsInducedDownstreamError(t *testing.T) {
 	if !carrier.finished || carrier.abortedBeforeFinish {
 		t.Fatal("normal upload EOF was replaced with abort")
 	}
-	if !bytes.Equal(carrier.buf.Bytes(), append([]byte{ControlOpen}, tail...)) {
+	if !bytes.Equal(clientTestDecodeUpload(t, carrier.buf.Bytes()), tail) {
 		t.Fatal("buffered upload tail changed")
 	}
 }
@@ -658,10 +674,10 @@ func TestTCPClientHTTPTimeoutInterruptsClaimedBlockedPing(t *testing.T) {
 	var opens atomic.Int32
 	carrier := &clientPipeCarrier{Conn: front}
 	carrier.write = func(b []byte) (int, error) {
-		if len(b) == 1 && b[0] == ControlPing {
+		if len(b) == 2 && binary.LittleEndian.Uint16(b) == ControlPing {
 			once.Do(func() { close(started) })
 		}
-		if len(b) == 1 && b[0] == ControlOpen {
+		if len(b) == 2 && binary.LittleEndian.Uint16(b) == ControlOpen {
 			opens.Add(1)
 		}
 		return front.Write(b)
@@ -730,7 +746,7 @@ func TestTCPClientOnDemandSetupUsesRemainingHTTPBudget(t *testing.T) {
 		t.Fatalf("setup reset total HTTP budget: got %v want %v", got, wantDeadline)
 	}
 	opened := make(chan struct{})
-	go func() { var b [1]byte; _, _ = io.ReadFull(back, b[:]); close(opened) }()
+	go func() { var b [2]byte; _, _ = io.ReadFull(back, b[:]); close(opened) }()
 	clientTestWait(t, opened)
 	// No OPEN_OK: the same original deadline must terminate the ACK wait.
 	if err := clientTestWait(t, done); !errors.Is(err, context.DeadlineExceeded) {
@@ -744,14 +760,21 @@ type clientDrainObservationCarrier struct {
 	readingDrain chan struct{}
 	openOnce     sync.Once
 	drainOnce    sync.Once
+	finishError  error
 }
 
 func (c *clientDrainObservationCarrier) Write(b []byte) (int, error) {
 	n, err := c.clientEOFCarrier.Write(b)
-	if len(b) == 1 && b[0] == ControlOpen {
+	if len(b) == 2 && binary.LittleEndian.Uint16(b) == ControlOpen {
 		c.openOnce.Do(func() { close(c.opened) })
 	}
 	return n, err
+}
+func (c *clientDrainObservationCarrier) FinishWrite() error {
+	if err := c.clientEOFCarrier.FinishWrite(); err != nil {
+		return err
+	}
+	return c.finishError
 }
 func (c *clientDrainObservationCarrier) Read(b []byte) (int, error) {
 	select {
@@ -799,7 +822,7 @@ func TestTCPClientDrainWaitsForPeerAndProcessCancellationJoinsWorkers(t *testing
 			ackDone <- ctx.Err()
 			return
 		}
-		_, err := w.Write([]byte{ControlOpenOK, 99})
+		_, err := w.Write(append(clientTestControls(ControlOpenOK), clientTestDataWire([]byte{99})...))
 		ackDone <- err
 	}()
 	var raw [1]byte
@@ -817,7 +840,7 @@ func TestTCPClientDrainWaitsForPeerAndProcessCancellationJoinsWorkers(t *testing
 	// Wake the old business reader once. Its local write fails because EOF has
 	// already closed local business, then the same reader enters transport drain.
 	consumed := make(chan error, 1)
-	go func() { _, err := w.Write([]byte{1}); consumed <- err }()
+	go func() { _, err := w.Write(clientTestDataWire([]byte{1})); consumed <- err }()
 	if err := clientTestWait(t, consumed); err != nil {
 		t.Fatalf("normal EOF immediately aborted carrier: %v", err)
 	}
@@ -839,13 +862,553 @@ func TestTCPClientDrainWaitsForPeerAndProcessCancellationJoinsWorkers(t *testing
 		t.Fatal(err)
 	}
 	clientTestWait(t, d.closed)
-	if _, err := w.Write([]byte{1}); err == nil {
+	if _, err := w.Write(clientTestDataWire([]byte{1})); err == nil {
 		t.Fatal("process shutdown did not abort stalled response")
 	}
 	mu.Lock()
 	got := append([]byte(nil), upload.Bytes()...)
 	mu.Unlock()
-	if !bytes.Equal(got, append([]byte{ControlOpen}, []byte("tail")...)) {
+	if !bytes.Equal(clientTestDecodeUpload(t, got), []byte("tail")) {
 		t.Fatalf("upload tail changed: %x", got)
+	}
+}
+
+func clientTestControls(headers ...uint16) []byte {
+	b := make([]byte, 2*len(headers))
+	for i, h := range headers {
+		binary.LittleEndian.PutUint16(b[2*i:], h)
+	}
+	return b
+}
+func clientTestDataWire(payload []byte) []byte {
+	var b bytes.Buffer
+	_, _ = newRecordWriter(&b, nil, false).Write(payload)
+	return b.Bytes()
+}
+func clientTestDecodeUpload(t *testing.T, wire []byte) []byte {
+	t.Helper()
+	r := newRecordReader(bytes.NewReader(wire))
+	opened := false
+	var out bytes.Buffer
+	for {
+		h, err := r.ReadHeader()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch h {
+		case ControlPing:
+		case ControlOpen:
+			if opened {
+				t.Fatal("duplicate OPEN")
+			}
+			opened = true
+		default:
+			if !opened || h == ControlPing || h == ControlOpen {
+				t.Fatalf("invalid upload header %d", h)
+			}
+			b := make([]byte, int(h))
+			if _, err := r.ReadPayload(b); err != nil {
+				t.Fatal(err)
+			}
+			out.Write(b)
+		}
+	}
+	if !opened {
+		t.Fatal("missing OPEN")
+	}
+	return out.Bytes()
+}
+
+type clientManualTimer struct {
+	ticks  chan time.Time
+	resets chan time.Duration
+}
+
+func (t *clientManualTimer) Chan() <-chan time.Time { return t.ticks }
+func (t *clientManualTimer) Reset(d time.Duration)  { t.resets <- d }
+func (t *clientManualTimer) Stop()                  {}
+func TestTCPClientKeepaliveUsesLastSendWithoutResetOnDATA(t *testing.T) {
+	now := time.Unix(0, 0)
+	var wire bytes.Buffer
+	timer := &clientManualTimer{ticks: make(chan time.Time), resets: make(chan time.Duration, 4)}
+	created := make(chan time.Duration, 1)
+	cfg := clientTestConfig()
+	cfg.PingInterval = 10 * time.Second
+	p := &standbyPool{cfg: cfg, newPingTimer: func(d time.Duration) clientPingTimer { created <- d; return timer }}
+	writer := newRecordWriterWithClock(&wire, nil, true, func() time.Time { return now })
+	writer.SetActive()
+	e := &standbyEntry{pool: p, writer: writer, pingDone: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go e.pingLoop(ctx)
+	if d := clientTestWait(t, created); d != 10*time.Second {
+		t.Fatal(d)
+	}
+	writer.mu.Lock()
+	now = now.Add(8 * time.Second)
+	writer.mu.Unlock()
+	if _, err := writer.Write([]byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-timer.resets:
+		t.Fatal("DATA reset timer")
+	default:
+	}
+	writer.mu.Lock()
+	now = now.Add(2 * time.Second)
+	writer.mu.Unlock()
+	timer.ticks <- now
+	if next := clientTestWait(t, timer.resets); next != 8*time.Second {
+		t.Fatalf("t=10 should defer to18: %v", next)
+	}
+	writer.mu.Lock()
+	before := append([]byte(nil), wire.Bytes()...)
+	now = now.Add(8 * time.Second)
+	writer.mu.Unlock()
+	if !bytes.Equal(before, clientTestDataWire([]byte("data"))) {
+		t.Fatalf("premature PING: %x", before)
+	}
+	timer.ticks <- now
+	if next := clientTestWait(t, timer.resets); next != 10*time.Second {
+		t.Fatal(next)
+	}
+	cancel()
+	clientTestWait(t, e.pingDone)
+	if !bytes.Equal(wire.Bytes(), append(clientTestDataWire([]byte("data")), clientTestControls(ControlPing)...)) {
+		t.Fatalf("t=18 missing PING: %x", wire.Bytes())
+	}
+}
+
+func TestTCPClientPoolZeroPingsDuringOpeningAndActive(t *testing.T) {
+	cfg := clientTestConfig()
+	cfg.PingInterval = 15 * time.Millisecond
+	front, back := net.Pipe()
+	defer back.Close()
+	d := &clientTestDialer{dial: func(context.Context) (Carrier, error) { return &clientPipeCarrier{Conn: front}, nil }}
+	app, cancel, done, p := startClientTestConnection(t, cfg, d)
+	_ = app.SetDeadline(time.Now().Add(2 * time.Second))
+	observed := make(chan error, 1)
+	go func() {
+		r := newRecordReader(back)
+		h, err := r.ReadHeader()
+		if err == nil && h != ControlOpen {
+			err = errors.New("missing OPEN")
+		}
+		if err == nil {
+			h, err = r.ReadHeader()
+			if h != ControlPing {
+				err = errors.New("opening PING missing")
+			}
+		}
+		if err == nil {
+			_, err = back.Write(append(clientTestControls(ControlPong, ControlOpenOK, ControlPong), clientTestDataWire([]byte("server-first"))...))
+		}
+		if err == nil {
+			h, err = r.ReadHeader()
+			if h != ControlPing {
+				err = errors.New("active PING missing")
+			}
+		}
+		if err == nil {
+			_, err = back.Write(clientTestControls(ControlPong))
+		}
+		observed <- err
+	}()
+	data := make([]byte, len("server-first"))
+	if _, err := io.ReadFull(app, data); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, []byte("server-first")) {
+		t.Fatal("PONG entered payload")
+	}
+	if err := clientTestWait(t, observed); err != nil {
+		t.Fatal(err)
+	}
+	// Active worker is outside pool ownership even for the on-demand path.
+	p.Close()
+	cancel()
+	clientTestWait(t, done)
+	if d.calls.Load() != 1 {
+		t.Fatal("duplicate worker/carrier")
+	}
+}
+
+func TestTCPClientActivePingFailureWakesLocalCopy(t *testing.T) {
+	cfg := clientTestConfig()
+	cfg.PingInterval = 15 * time.Millisecond
+	front, back := net.Pipe()
+	defer back.Close()
+	carrier := &clientPipeCarrier{Conn: front}
+	carrier.write = func(b []byte) (int, error) {
+		if len(b) == 2 && binary.LittleEndian.Uint16(b) == ControlPing {
+			return 0, errors.New("PING failed")
+		}
+		return front.Write(b)
+	}
+	d := &clientTestDialer{dial: func(context.Context) (Carrier, error) { return carrier, nil }}
+	app, _, done, _ := startClientTestConnection(t, cfg, d)
+	_ = app.SetDeadline(time.Now().Add(time.Second))
+	go func() {
+		var open [2]byte
+		_, _ = io.ReadFull(back, open[:])
+		_, _ = back.Write(append(clientTestControls(ControlOpenOK), clientTestDataWire([]byte{42})...))
+	}()
+	var data [1]byte
+	if _, err := io.ReadFull(app, data[:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := clientTestWait(t, done); err == nil {
+		t.Fatal("active PING error ignored")
+	}
+	if n, err := app.Read(data[:]); n != 0 || err == nil {
+		t.Fatal("PING failure left local reader blocked")
+	}
+}
+
+func TestTCPPoolCloseLeavesActiveBlockedPingWithConnectionOwner(t *testing.T) {
+	cfg := clientTestConfig()
+	cfg.PingInterval = 10 * time.Millisecond
+	front, back := net.Pipe()
+	defer back.Close()
+	started := make(chan struct{})
+	var once sync.Once
+	carrier := &clientPipeCarrier{Conn: front}
+	carrier.write = func(b []byte) (int, error) {
+		if len(b) == 2 && binary.LittleEndian.Uint16(b) == ControlPing {
+			once.Do(func() { close(started) })
+		}
+		return front.Write(b)
+	}
+	d := &clientTestDialer{dial: func(context.Context) (Carrier, error) { return carrier, nil }}
+	app, cancel, done, p := startClientTestConnection(t, cfg, d)
+	_ = app.SetDeadline(time.Now().Add(time.Second))
+	r := newRecordReader(back)
+	initial := make(chan error, 1)
+	go func() {
+		h, err := r.ReadHeader()
+		if err == nil && h != ControlOpen {
+			err = errors.New("missing OPEN")
+		}
+		if err == nil {
+			_, err = back.Write(append(clientTestControls(ControlOpenOK), clientTestDataWire([]byte{7})...))
+		}
+		initial <- err
+	}()
+	var byteOne [1]byte
+	if _, err := io.ReadFull(app, byteOne[:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := clientTestWait(t, initial); err != nil {
+		t.Fatal(err)
+	}
+	clientTestWait(t, started)
+	poolClosed := make(chan struct{})
+	go func() { p.Close(); close(poolClosed) }()
+	clientTestWait(t, poolClosed)
+	h, err := r.ReadHeader()
+	if err != nil || h != ControlPing {
+		t.Fatalf("pool.Close aborted active PING: header=%d err=%v", h, err)
+	}
+	// A later business record still uses this carrier after pool ownership ended.
+	server := make(chan error, 1)
+	go func() {
+		data := make([]byte, 1)
+		_, err := io.ReadFull(clientUploadTestReader{r}, data)
+		if err == nil {
+			_, err = back.Write(clientTestDataWire(data))
+		}
+		server <- err
+	}()
+	if _, err := app.Write([]byte{8}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(app, byteOne[:]); err != nil || byteOne[0] != 8 {
+		t.Fatalf("active connection lost after pool close: %v", err)
+	}
+	if err := clientTestWait(t, server); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	clientTestWait(t, done)
+}
+
+func TestTCPClientEOFPingJoinPrecedesFinishWrite(t *testing.T) {
+	cfg := clientTestConfig()
+	cfg.PingInterval = 10 * time.Millisecond
+	front, back := net.Pipe()
+	defer back.Close()
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	var once sync.Once
+	var wroteAfterFinish atomic.Bool
+	carrier := &clientPipeCarrier{Conn: front}
+	carrier.write = func(b []byte) (int, error) {
+		select {
+		case <-finished:
+			wroteAfterFinish.Store(true)
+		default:
+		}
+		if len(b) == 2 && binary.LittleEndian.Uint16(b) == ControlPing {
+			once.Do(func() { close(started) })
+		}
+		return front.Write(b)
+	}
+	carrier.finish = func() error { close(finished); return front.Close() }
+	d := &clientTestDialer{dial: func(context.Context) (Carrier, error) { return carrier, nil }}
+	app, _, done, _ := startClientTestConnection(t, cfg, d)
+	_ = app.SetDeadline(time.Now().Add(time.Second))
+	r := newRecordReader(back)
+	initial := make(chan error, 1)
+	go func() {
+		_, err := r.ReadHeader()
+		if err == nil {
+			_, err = back.Write(append(clientTestControls(ControlOpenOK), clientTestDataWire([]byte{9})...))
+		}
+		initial <- err
+	}()
+	var b [1]byte
+	if _, err := io.ReadFull(app, b[:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := clientTestWait(t, initial); err != nil {
+		t.Fatal(err)
+	}
+	clientTestWait(t, started)
+	app.Close()
+	select {
+	case <-finished:
+		t.Fatal("FinishWrite overtook authorized PING")
+	default:
+	}
+	h, err := r.ReadHeader()
+	if err != nil || h != ControlPing {
+		t.Fatalf("authorized PING did not finish: %d %v", h, err)
+	}
+	clientTestWait(t, finished)
+	if err := clientTestWait(t, done); err != nil {
+		t.Fatal(err)
+	}
+	if wroteAfterFinish.Load() {
+		t.Fatal("record write after FinishWrite")
+	}
+}
+
+type clientUploadTestReader struct{ *recordReader }
+
+func (r clientUploadTestReader) Read(p []byte) (int, error) {
+	return r.ReadData(p, func(h uint16) error {
+		if h == ControlPing {
+			return nil
+		}
+		return errors.New("invalid upstream control")
+	})
+}
+
+func TestTCPClientActiveRejectsDuplicateACKAndTruncatedDATA(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tail []byte
+		want []byte
+	}{
+		{"duplicate-ACK", clientTestControls(ControlOpenOK), nil},
+		{"truncated-DATA", append(clientTestControls(8), []byte{1, 2}...), []byte{1, 2}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := clientTestConfig()
+			front, back := net.Pipe()
+			defer back.Close()
+			d := &clientTestDialer{dial: func(context.Context) (Carrier, error) { return &clientPipeCarrier{Conn: front}, nil }}
+			app, _, done, _ := startClientTestConnection(t, cfg, d)
+			_ = app.SetDeadline(time.Now().Add(time.Second))
+			go func() {
+				var open [2]byte
+				_, _ = io.ReadFull(back, open[:])
+				_, _ = back.Write(append(clientTestControls(ControlOpenOK), tc.tail...))
+				back.Close()
+			}()
+			got, err := io.ReadAll(app)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, tc.want) {
+				t.Fatalf("DATA prefix changed: %x", got)
+			}
+			if err := clientTestWait(t, done); err == nil {
+				t.Fatal("invalid active record treated as normal EOF")
+			}
+		})
+	}
+}
+
+func startClientEOFReview(t *testing.T, finishErr error) (net.Conn, <-chan error, *io.PipeWriter, <-chan struct{}) {
+	t.Helper()
+	r, w := io.Pipe()
+	finished := make(chan struct{})
+	var mu sync.Mutex
+	var upload bytes.Buffer
+	carrier := &clientDrainObservationCarrier{clientEOFCarrier: &clientEOFCarrier{reader: r, writer: w, finish: finished, mu: &mu, buf: &upload}, opened: make(chan struct{}), readingDrain: make(chan struct{}), finishError: finishErr}
+	d := &clientTestDialer{dial: func(context.Context) (Carrier, error) { return carrier, nil }}
+	app, _, done, _ := startClientTestConnection(t, clientTestConfig(), d)
+	_ = app.SetDeadline(time.Now().Add(time.Second))
+	sent := make(chan error, 1)
+	go func() {
+		<-carrier.opened
+		_, err := w.Write(append(clientTestControls(ControlOpenOK), clientTestDataWire([]byte{99})...))
+		sent <- err
+	}()
+	var b [1]byte
+	if _, err := io.ReadFull(app, b[:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := clientTestWait(t, sent); err != nil {
+		t.Fatal(err)
+	}
+	return app, done, w, finished
+}
+func TestTCPClientUploadEOFPreservesDrainDecoderErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		wire []byte
+	}{
+		{"truncated-DATA", append(clientTestControls(6), 1)},
+		{"truncated-header", []byte{0}},
+		{"duplicate-ACK", clientTestControls(ControlOpenOK)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app, done, w, finished := startClientEOFReview(t, nil)
+			app.Close()
+			clientTestWait(t, finished)
+			_, _ = w.Write(tc.wire)
+			_ = w.Close()
+			err := clientTestWait(t, done)
+			if err == nil {
+				t.Fatal("normal local EOF hid damaged downstream records")
+			}
+			if tc.name != "duplicate-ACK" && !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Fatalf("truncation cause lost: %v", err)
+			}
+		})
+	}
+}
+func TestTCPClientFinishWriteFailureAbortsAndJoinsResponseReader(t *testing.T) {
+	injected := errors.New("finish failed")
+	app, done, w, finished := startClientEOFReview(t, injected)
+	app.Close()
+	clientTestWait(t, finished)
+	if err := clientTestWait(t, done); !errors.Is(err, injected) {
+		t.Fatalf("FinishWrite failure hidden: %v", err)
+	}
+	if _, err := w.Write(clientTestControls(ControlPong)); err == nil {
+		t.Fatal("failed FinishWrite left response reader open")
+	}
+}
+
+type clientControlledEOFLocal struct {
+	net.Conn
+	eof    chan struct{}
+	closed chan struct{}
+	once   sync.Once
+	writes atomic.Int32
+}
+
+func (c *clientControlledEOFLocal) Read([]byte) (int, error) {
+	select {
+	case <-c.eof:
+		return 0, io.EOF
+	case <-c.closed:
+		return 0, io.ErrClosedPipe
+	}
+}
+func (c *clientControlledEOFLocal) Write(p []byte) (int, error) {
+	c.writes.Add(1)
+	return c.Conn.Write(p)
+}
+func (c *clientControlledEOFLocal) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+func TestTCPClientEOFDuringBlockedPingHandoffCannotActivate(t *testing.T) {
+	cfg := clientTestConfig()
+	cfg.PingInterval = time.Millisecond
+	front, back := net.Pipe()
+	defer back.Close()
+	pingStarted := make(chan struct{})
+	var once sync.Once
+	carrier := &clientPipeCarrier{Conn: front}
+	carrier.write = func(b []byte) (int, error) {
+		if len(b) == 2 && binary.LittleEndian.Uint16(b) == ControlPing {
+			once.Do(func() { close(pingStarted) })
+		}
+		return front.Write(b)
+	}
+	d := &clientTestDialer{dial: func(context.Context) (Carrier, error) { return carrier, nil }}
+	life, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p := newStandbyPool(life, cfg, d)
+	defer p.Close()
+	prepared := make(chan struct{})
+	p.beforeHandoffPrepare = func() { close(prepared) }
+	localConn, app := net.Pipe()
+	defer app.Close()
+	local := &clientControlledEOFLocal{Conn: localConn, eof: make(chan struct{}), closed: make(chan struct{})}
+	acquire, ca := context.WithTimeout(life, time.Second)
+	defer ca()
+	done := make(chan error, 1)
+	go func() { done <- runClientConnection(life, acquire, ca, cfg, p, local) }()
+	var open [2]byte
+	if _, err := io.ReadFull(back, open[:]); err != nil {
+		t.Fatal(err)
+	}
+	clientTestWait(t, pingStarted)
+	if _, err := back.Write(clientTestControls(ControlOpenOK)); err != nil {
+		t.Fatal(err)
+	}
+	clientTestWait(t, prepared)
+	// Handoff is now preparing behind the PING-held writer mutex. EOF must
+	// publish terminal state and close local without waiting for that mutex.
+	close(local.eof)
+	clientTestWait(t, local.closed)
+	var ping [2]byte
+	if _, err := io.ReadFull(back, ping[:]); err != nil {
+		t.Fatal(err)
+	}
+	if binary.LittleEndian.Uint16(ping[:]) != ControlPing {
+		t.Fatal("missing blocked PING")
+	}
+	if err := clientTestWait(t, done); !errors.Is(err, errConnectionEnded) {
+		t.Fatalf("EOF revived into active handoff: %v", err)
+	}
+	if local.writes.Load() != 0 {
+		t.Fatal("late handoff started downstream business after EOF")
+	}
+}
+
+func TestTCPClientKeepaliveUsesEstablishedTimerWhenWorkerStartsLate(t *testing.T) {
+	var wire bytes.Buffer
+	timer := &clientManualTimer{ticks: make(chan time.Time, 1), resets: make(chan time.Duration, 1)}
+	// Establishment's timer expired before the worker was scheduled.
+	timer.ticks <- time.Unix(10, 0)
+	var newTimers atomic.Int32
+	cfg := clientTestConfig()
+	cfg.PingInterval = 10 * time.Second
+	p := &standbyPool{cfg: cfg, newPingTimer: func(time.Duration) clientPingTimer { newTimers.Add(1); return timer }}
+	e := &standbyEntry{pool: p, writer: newRecordWriter(&wire, nil, true), pingDone: make(chan struct{}), pingTimer: timer}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go e.pingLoop(ctx)
+	if next := clientTestWait(t, timer.resets); next != cfg.PingInterval {
+		t.Fatal(next)
+	}
+	cancel()
+	clientTestWait(t, e.pingDone)
+	if newTimers.Load() != 0 {
+		t.Fatal("late worker restarted the first keepalive interval")
+	}
+	if !bytes.Equal(wire.Bytes(), clientTestControls(ControlPing)) {
+		t.Fatalf("expired establishment timer did not send PING: %x", wire.Bytes())
 	}
 }

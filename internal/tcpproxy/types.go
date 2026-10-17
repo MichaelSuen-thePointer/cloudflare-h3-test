@@ -10,15 +10,17 @@ import (
 )
 
 const (
-	TransportH3             = "h3"
-	TransportWebSocket      = "ws"
-	DefaultH3Path           = "/"
-	DefaultWSPath           = "/"
-	ControlPing        byte = 0x01
-	ControlPong        byte = 0x02
-	ControlOpen        byte = 0x03
-	ControlOpenOK      byte = 0x04
-	CopyBufferSize          = 32 << 10
+	TransportH3               = "h3"
+	TransportWebSocket        = "ws"
+	DefaultH3Path             = "/"
+	DefaultWSPath             = "/"
+	ControlPing        uint16 = 0
+	ControlPong        uint16 = ControlPing // direction determines PING or PONG
+	ControlOpen        uint16 = 0xffff
+	ControlOpenOK      uint16 = ControlOpen // direction determines OPEN or OPEN_OK
+	MaxRecordSize             = 64 << 10
+	MaxRecordPayload          = MaxRecordSize - 2
+	CopyBufferSize            = 32 << 10
 )
 
 // Config is validated before opening a listener or dialing a carrier.
@@ -46,7 +48,7 @@ type Config struct {
 }
 
 // Carrier is an ordered byte stream. Its Read/Write methods never interpret
-// application control bytes. Control parsing belongs to the setup phase only.
+// application records. The TCP record layer handles framing for its lifetime.
 type Carrier interface {
 	io.ReadWriteCloser
 	// FinishWrite ends an HTTP upload normally; for WS it closes the connection.

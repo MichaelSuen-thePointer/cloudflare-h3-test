@@ -6,7 +6,9 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -27,6 +29,134 @@ type blockedUpgradeWriter struct {
 	*httptest.ResponseRecorder
 	conn     net.Conn
 	hijacked chan struct{}
+}
+
+type serverJoinedInput struct {
+	release <-chan struct{}
+	reader  io.Reader
+}
+
+func (r *serverJoinedInput) Read(p []byte) (int, error) { <-r.release; return r.reader.Read(p) }
+func (r *serverJoinedInput) Close() error               { return nil }
+
+type serverEOFUpstream struct{ net.Conn }
+
+func (serverEOFUpstream) Read([]byte) (int, error)    { return 0, io.EOF }
+func (serverEOFUpstream) Write(p []byte) (int, error) { return len(p), nil }
+func (serverEOFUpstream) Close() error                { return nil }
+
+type serverFinishObserver struct {
+	*httptest.ResponseRecorder
+	finishErr error
+	finishes  int
+	aborted   bool
+}
+
+func (w *serverFinishObserver) FlushError() error                { w.finishes++; return w.finishErr }
+func (w *serverFinishObserver) SetWriteDeadline(time.Time) error { w.aborted = true; return nil }
+func (w *serverFinishObserver) SetReadDeadline(time.Time) error  { return nil }
+
+func TestOriginJoinedRecordFailureOverridesAdjacentNormalEOF(t *testing.T) {
+	finishFailure := errors.New("test finish flush failed")
+	for _, tc := range []struct {
+		name                 string
+		wire                 []byte
+		finishErr, errorWant error
+		finishCount          int
+	}{{"both-normal", nil, nil, nil, 1}, {"local-network-interruption", nil, nil, nil, 1}, {"truncated-header", []byte{4}, nil, io.ErrUnexpectedEOF, 0}, {"truncated-payload", []byte{8, 0, 7, 6}, nil, io.ErrUnexpectedEOF, 0}, {"duplicate-open", testV2Control(ControlOpen), nil, errRecordControl, 0}, {"finish-failure", nil, finishFailure, finishFailure, 1}} {
+		t.Run(tc.name, func(t *testing.T) {
+			released := make(chan struct{})
+			var input io.Reader = bytes.NewReader(tc.wire)
+			if tc.name == "local-network-interruption" {
+				input = serverErrorInput{err: net.ErrClosed}
+			}
+			body := &serverJoinedInput{release: released, reader: input}
+			response := &serverFinishObserver{ResponseRecorder: httptest.NewRecorder(), finishErr: tc.finishErr}
+			carrier := &originH3Carrier{body: body, w: response, rc: http.NewResponseController(response)}
+			reader := newRecordReader(carrier)
+			writer := newRecordWriter(carrier, nil, false)
+			err := newTCPServer(carrierTestConfig()).relayRecords(context.Background(), carrier, serverEOFUpstream{}, reader, writer, func() { close(released) })
+			if !errors.Is(err, tc.errorWant) {
+				t.Fatalf("relay error=%v want%v", err, tc.errorWant)
+			}
+			if response.finishes != tc.finishCount {
+				t.Fatalf("FinishWrite calls%d want%d", response.finishes, tc.finishCount)
+			}
+			if response.aborted != (tc.errorWant != nil) {
+				t.Fatalf("aborted=%v want%v", response.aborted, tc.errorWant != nil)
+			}
+		})
+	}
+}
+
+type serverErrorInput struct{ err error }
+
+func (r serverErrorInput) Read([]byte) (int, error) { return 0, r.err }
+
+type serverWriteFailureCarrier struct {
+	entered, release chan struct{}
+	writeErr         error
+	aborted          bool
+	finishes         int
+}
+
+func (c *serverWriteFailureCarrier) Read([]byte) (int, error) { <-c.entered; return 0, io.EOF }
+func (c *serverWriteFailureCarrier) Write([]byte) (int, error) {
+	close(c.entered)
+	<-c.release
+	return 0, c.writeErr
+}
+func (c *serverWriteFailureCarrier) Close() error       { c.aborted = true; return nil }
+func (c *serverWriteFailureCarrier) FinishWrite() error { c.finishes++; return nil }
+
+type serverPayloadUpstream struct {
+	serverEOFUpstream
+	reader io.Reader
+}
+
+func (c *serverPayloadUpstream) Read(p []byte) (int, error) { return c.reader.Read(p) }
+
+func TestOriginJoinedInFlightWriteFailureOverridesNormalEOF(t *testing.T) {
+	writeErr := errors.New("test response DATA write failed")
+	carrier := &serverWriteFailureCarrier{entered: make(chan struct{}), release: make(chan struct{}), writeErr: writeErr}
+	upstream := &serverPayloadUpstream{reader: bytes.NewReader([]byte("tail"))}
+	err := newTCPServer(carrierTestConfig()).relayRecords(context.Background(), carrier, upstream, newRecordReader(carrier), newRecordWriter(carrier, nil, false), func() { close(carrier.release) })
+	if !errors.Is(err, writeErr) || !carrier.aborted || carrier.finishes != 0 {
+		t.Fatalf("err=%v aborted=%v finishes%d", err, carrier.aborted, carrier.finishes)
+	}
+}
+
+func testV2Control(header uint16) []byte {
+	var wire [2]byte
+	binary.LittleEndian.PutUint16(wire[:], header)
+	return wire[:]
+}
+func testV2Data(payload []byte) []byte {
+	var wire bytes.Buffer
+	newRecordWriter(&wire, nil, false).Write(payload)
+	return wire.Bytes()
+}
+
+type testV2DataReader struct{ reader *recordReader }
+
+func (r *testV2DataReader) Read(p []byte) (int, error) {
+	return r.reader.ReadData(p, func(header uint16) error {
+		if header == ControlPong {
+			return nil
+		}
+		return errors.New("unexpected downstream control")
+	})
+}
+func testV2AssertResponse(t *testing.T, wire, payload []byte) {
+	t.Helper()
+	reader := newRecordReader(bytes.NewReader(wire))
+	if header, err := reader.ReadHeader(); err != nil || header != ControlOpenOK {
+		t.Fatalf("OPEN_OK=%v err=%v", header, err)
+	}
+	got, err := io.ReadAll(&testV2DataReader{reader: reader})
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("downstream tail differs: got %d want %d err=%v", len(got), len(payload), err)
+	}
 }
 
 type pendingTailWriter struct {
@@ -78,7 +208,7 @@ func TestOriginEOFTailWaitsWithoutTimerAndShutdownStillInterrupts(t *testing.T) 
 			requestStopped := make(chan struct{})
 			done := make(chan struct{})
 			go func() {
-				state.relayRaw(session.ctx, carrier, upstream, func() { close(requestStopped) })
+				state.relayRecords(session.ctx, carrier, upstream, newRecordReader(carrier), newRecordWriter(carrier, nil, false), func() { close(requestStopped) })
 				session.close()
 				state.mu.Lock()
 				delete(state.sessions, session)
@@ -115,7 +245,7 @@ func TestOriginEOFTailWaitsWithoutTimerAndShutdownStillInterrupts(t *testing.T) 
 			case <-time.After(time.Second):
 				t.Fatal("tail relay did not finish")
 			}
-			if !shutdown && !bytes.Equal(w.Body.Bytes(), payload) {
+			if !shutdown && !bytes.Equal(w.Body.Bytes(), testV2Data(payload)) {
 				t.Fatal("pendingtail was lost")
 			}
 			if !shutdown {
@@ -293,7 +423,7 @@ func TestOriginShutdownCancelsWebSocketUpstreamDial(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ws.Close()
-	if err := ws.WriteMessage([]byte{ControlOpen}); err != nil {
+	if err := ws.WriteMessage(testV2Control(ControlOpen)); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -647,19 +777,19 @@ func TestOriginWebSocketNoDialBeforeOpenAndPreservesCoalescedPayload(t *testing.
 		t.Fatal("upstream dialed before OPEN")
 	case <-time.After(30 * time.Millisecond):
 	}
-	c.Write([]byte{ControlPing})
-	var control [1]byte
-	if _, err := io.ReadFull(c, control[:]); err != nil || control[0] != ControlPong {
-		t.Fatalf("PONG: %v %v", control, err)
+	reader := newRecordReader(c)
+	c.Write(testV2Control(ControlPing))
+	if header, err := reader.ReadHeader(); err != nil || header != ControlPong {
+		t.Fatalf("PONG: %v %v", header, err)
 	}
-	if _, err := c.Write(append([]byte{ControlOpen}, payload...)); err != nil {
+	if _, err := c.Write(append(testV2Control(ControlOpen), testV2Data(payload)...)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := io.ReadFull(c, control[:]); err != nil || control[0] != ControlOpenOK {
-		t.Fatalf("ACK: %v %v", control, err)
+	if header, err := reader.ReadHeader(); err != nil || header != ControlOpenOK {
+		t.Fatalf("ACK: %v %v", header, err)
 	}
 	got := make([]byte, len(payload))
-	if _, err := io.ReadFull(c, got); err != nil || !bytes.Equal(got, payload) {
+	if _, err := io.ReadFull(&testV2DataReader{reader: reader}, got); err != nil || !bytes.Equal(got, payload) {
 		t.Fatalf("payload %v %v", got, err)
 	}
 }
@@ -699,17 +829,14 @@ func TestOriginHTTP1DownstreamEOFWakesOpenUploadAndPreservesTail(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	if _, err := writer.Write([]byte{ControlOpen}); err != nil {
+	if _, err := writer.Write(testV2Control(ControlOpen)); err != nil {
 		t.Fatal(err)
 	}
 	got, err := io.ReadAll(response.Body)
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := append([]byte{ControlOpenOK}, payload...)
-	if !bytes.Equal(got, expected) {
-		t.Fatalf("downstream tail differs: got %d want %d", len(got), len(expected))
-	}
+	testV2AssertResponse(t, got, payload)
 	// The upload remains open; the handler must terminate its reader itself.
 }
 
@@ -753,17 +880,14 @@ func TestOriginHTTP2DownstreamEOFCompletesResponseWithUploadOpen(t *testing.T) {
 	if response.ProtoMajor != 2 {
 		t.Fatalf("expected HTTP2, got %s", response.Proto)
 	}
-	if _, err := writer.Write([]byte{ControlOpen}); err != nil {
+	if _, err := writer.Write(testV2Control(ControlOpen)); err != nil {
 		t.Fatal(err)
 	}
 	got, err := io.ReadAll(response.Body)
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := append([]byte{ControlOpenOK}, payload...)
-	if !bytes.Equal(got, expected) {
-		t.Fatalf("downstream tail differs: got %d want %d", len(got), len(expected))
-	}
+	testV2AssertResponse(t, got, payload)
 }
 
 func TestOriginRejectsBeforeAcceptingCarrier(t *testing.T) {
@@ -829,23 +953,22 @@ func TestOriginSharedRootAcceptsHTTPAndWebSocketCarriers(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("POST root status%d", response.StatusCode)
 	}
-	if _, err := writer.Write([]byte{ControlPing}); err != nil {
+	if _, err := writer.Write(testV2Control(ControlPing)); err != nil {
 		t.Fatal(err)
 	}
-	var reply [1]byte
-	if _, err := io.ReadFull(response.Body, reply[:]); err != nil || reply[0] != ControlPong {
-		t.Fatalf("HTTP root PONG=%v err=%v", reply, err)
+	if header, err := newRecordReader(response.Body).ReadHeader(); err != nil || header != ControlPong {
+		t.Fatalf("HTTP root PONG=%v err=%v", header, err)
 	}
 	ws, err := relay.DialWebSocket(context.Background(), "ws"+srv.URL[4:]+"/", "", cfg.Token, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ws.Close()
-	if err := ws.WriteMessage([]byte{ControlPing}); err != nil {
+	if err := ws.WriteMessage(testV2Control(ControlPing)); err != nil {
 		t.Fatal(err)
 	}
 	got, err := ws.ReadMessage()
-	if err != nil || !bytes.Equal(got, []byte{ControlPong}) {
+	if err != nil || !bytes.Equal(got, testV2Control(ControlPong)) {
 		t.Fatalf("WS root PONG=%v err=%v", got, err)
 	}
 }
@@ -880,6 +1003,189 @@ func TestOriginCustomPathIsolatesSelectedTransport(t *testing.T) {
 				state.ServeHTTP(w, req)
 				if w.Code != tc.status {
 					t.Fatalf("%s %s status%d want%d", tc.method, tc.path, w.Code, tc.status)
+				}
+			}
+		})
+	}
+}
+
+func TestOriginV2DelayedDialActivePingAndDataStaySeparated(t *testing.T) {
+	cfg := carrierTestConfig()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	cfg.Upstream = ln.Addr().String()
+	payload := bytes.Repeat([]byte{0, 1, 2, 3, 255, 0}, 8192)
+	downPayload := bytes.Repeat([]byte{255, 3, 2, 1, 0}, 32768)
+	received := make(chan []byte, 1)
+	upstreamDone := make(chan struct{})
+	releaseUpstream := make(chan struct{})
+	go func() {
+		defer close(upstreamDone)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		downDone := make(chan struct{})
+		go func() { defer close(downDone); conn.Write(downPayload) }()
+		b := make([]byte, len(payload))
+		_, err = io.ReadFull(conn, b)
+		if err == nil {
+			received <- b
+		}
+		<-releaseUpstream
+		conn.Close()
+		<-downDone
+	}()
+	defer func() { close(releaseUpstream); ln.Close(); <-upstreamDone }()
+	state := newTCPServer(cfg)
+	dialStarted := make(chan struct{})
+	allowDial := make(chan struct{})
+	state.dialUpstream = func(ctx context.Context, network, address string) (net.Conn, error) {
+		close(dialStarted)
+		select {
+		case <-allowDial:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, address)
+	}
+	srv := httptest.NewServer(state)
+	defer srv.Close()
+	defer state.shutdown()
+	ws, err := relay.DialWebSocket(context.Background(), "ws"+srv.URL[4:]+"/", "", cfg.Token, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	carrier := &wsCarrier{ws: ws}
+	defer carrier.Close()
+	ws.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := carrier.Write(append(append(testV2Control(ControlOpen), testV2Control(ControlPing)...), testV2Data(payload)...)); err != nil {
+		t.Fatal(err)
+	}
+	<-dialStarted
+	reader := newRecordReader(carrier)
+	ack := make(chan uint16, 1)
+	ackErr := make(chan error, 1)
+	go func() {
+		header, err := reader.ReadHeader()
+		if err != nil {
+			ackErr <- err
+			return
+		}
+		ack <- header
+	}()
+	select {
+	case header := <-ack:
+		t.Fatalf("ACK before dial completed: %d", header)
+	case err := <-ackErr:
+		t.Fatal(err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(allowDial)
+	select {
+	case header := <-ack:
+		if header != ControlOpenOK {
+			t.Fatalf("first downstream record%d wantOPEN_OK", header)
+		}
+	case err := <-ackErr:
+		t.Fatal(err)
+	case <-time.After(time.Second):
+		t.Fatal("ACK blocked behind early DATA")
+	}
+	const pings = 20
+	sent := make(chan error, 1)
+	go func() {
+		writer := newRecordWriter(carrier, nil, false)
+		for range pings {
+			if err := writer.WriteControl(ControlPing); err != nil {
+				sent <- err
+				return
+			}
+		}
+		sent <- nil
+	}()
+	got := make([]byte, 0, len(downPayload))
+	pongs := 0
+	buffer := make([]byte, CopyBufferSize)
+	for len(got) < len(downPayload) || pongs < pings+1 {
+		header, err := reader.ReadHeader()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if header == ControlPong {
+			pongs++
+			continue
+		}
+		if header == ControlPong || header == ControlOpenOK {
+			t.Fatalf("unexpected active control%d", header)
+		}
+		remaining := int(header)
+		for remaining > 0 {
+			n, err := reader.ReadPayload(buffer[:min(len(buffer), remaining)])
+			got = append(got, buffer[:n]...)
+			remaining -= n
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if !bytes.Equal(got, downPayload) {
+		t.Fatal("downstream DATA/PONG records interleaved")
+	}
+	if err := <-sent; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-received:
+		if !bytes.Equal(got, payload) {
+			t.Fatal("upstream received control bytes or altered DATA")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("upstream DATA blocked")
+	}
+}
+
+func TestOriginV2RejectsTruncatedAndWrongStageRecords(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		wire []byte
+		dial bool
+	}{{"half-open", testV2Control(ControlOpen)[:1], false}, {"data-before-open", testV2Data([]byte{9}), false}, {"duplicate-open", append(testV2Control(ControlOpen), testV2Control(ControlOpen)...), true}, {"truncated-data", append(testV2Control(ControlOpen), []byte{8, 0, 7, 6}...), true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := carrierTestConfig()
+			state := newTCPServer(cfg)
+			var dialed atomic.Bool
+			upDone := make(chan []byte, 1)
+			state.dialUpstream = func(context.Context, string, string) (net.Conn, error) {
+				dialed.Store(true)
+				up, peer := net.Pipe()
+				go func() { defer peer.Close(); b, _ := io.ReadAll(peer); upDone <- b }()
+				return up, nil
+			}
+			req := httptest.NewRequest("POST", "/", bytes.NewReader(tc.wire))
+			req.ProtoMajor = 2
+			req.Header.Set("X-Relay-Token", cfg.Token)
+			w := httptest.NewRecorder()
+			state.ServeHTTP(w, req)
+			state.shutdown()
+			if dialed.Load() != tc.dial {
+				t.Fatalf("dialed=%v want%v", dialed.Load(), tc.dial)
+			}
+			if tc.dial {
+				select {
+				case data := <-upDone:
+					if tc.name == "duplicate-open" && len(data) != 0 {
+						t.Fatal("control leaked into SS")
+					}
+					if tc.name == "truncated-data" && !bytes.Equal(data, []byte{7, 6}) {
+						t.Fatalf("truncated DATA prefix=%v", data)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("truncated connection did not release upstream")
 				}
 			}
 		})

@@ -54,7 +54,7 @@ type options struct {
 
 func main() {
 	var o options
-	flag.StringVar(&o.mode, "mode", "raw-h3", "server, raw-h3, carrier-h3, direct-h2, tcp-h3, tcp-ws, or direct-tcp")
+	flag.StringVar(&o.mode, "mode", "raw-h3", "server, raw-h3, carrier-h3 (v1 origin only), direct-h2, tcp-h3, tcp-ws, or direct-tcp")
 	flag.StringVar(&o.id, "id", "probe", "unique case identifier")
 	flag.StringVar(&o.edge, "edge", "", "literal edge IP (mandatory for CF clients)")
 	flag.StringVar(&o.url, "url", "https://relay.example.com:8443/", "raw origin URL or actual tcp-proxy entry")

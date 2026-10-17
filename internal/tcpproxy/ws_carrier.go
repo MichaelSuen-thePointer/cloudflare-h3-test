@@ -35,7 +35,7 @@ func (c *wsCarrier) Read(p []byte) (int, error) {
 func (c *wsCarrier) Write(p []byte) (int, error) {
 	total := 0
 	for len(p) > 0 {
-		n := min(len(p), CopyBufferSize)
+		n := min(len(p), MaxRecordSize)
 		if err := c.ws.WriteMessage(p[:n]); err != nil {
 			return total, err
 		}

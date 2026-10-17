@@ -18,6 +18,15 @@ import (
 	"github.com/quic-go/quic-go/qlogwriter"
 )
 
+// Keep this historical raw-carrier control pinned to wire v1. It requires a
+// v1 origin; tcp-h3/tcp-ws modes use the current tcpproxy implementation instead.
+const (
+	legacyControlPing   byte = 1
+	legacyControlPong   byte = 2
+	legacyControlOpen   byte = 3
+	legacyControlOpenOK byte = 4
+)
+
 // A deliberately separate raw-carrier control, not a change to tcp-proxy.
 // OPEN/PING are sent only during setup. After OPEN_OK all bytes are real SS
 // ciphertext produced by sslocal; no keepalive bytes are inserted into it.
@@ -88,7 +97,7 @@ func runCarrierBridge(ctx context.Context, cfg tcpproxy.Config, o options) error
 			uploadDone := make(chan struct{})
 			go func() {
 				defer close(uploadDone)
-				if _, e := writer.Write([]byte{tcpproxy.ControlOpen}); e != nil {
+				if _, e := writer.Write([]byte{legacyControlOpen}); e != nil {
 					return
 				}
 				_, e := io.Copy(writer, local)
@@ -109,7 +118,7 @@ func runCarrierBridge(ctx context.Context, cfg tcpproxy.Config, o options) error
 			defer resp.Body.Close()
 			emit(event{"event": "response_headers", "id": o.id, "status": resp.StatusCode, "proto": resp.Proto, "cf_ray": resp.Header.Get("Cf-Ray")})
 			var control [1]byte
-			if _, err = io.ReadFull(resp.Body, control[:]); err == nil && control[0] != tcpproxy.ControlOpenOK {
+			if _, err = io.ReadFull(resp.Body, control[:]); err == nil && control[0] != legacyControlOpenOK {
 				err = fmt.Errorf("invalid OPEN_OK")
 			}
 			if err == nil {
@@ -121,12 +130,12 @@ func runCarrierBridge(ctx context.Context, cfg tcpproxy.Config, o options) error
 				pr, pw := io.Pipe()
 				pingReq, _ := http.NewRequestWithContext(probeCtx, "POST", o.url, pr)
 				pingReq.Header.Set("X-Relay-Token", cfg.Token)
-				go func() { pw.Write([]byte{tcpproxy.ControlPing}) }()
+				go func() { pw.Write([]byte{legacyControlPing}) }()
 				pongResp, pingErr := client.Do(pingReq)
 				pongOK := false
 				if pingErr == nil {
 					_, pingErr = io.ReadFull(pongResp.Body, control[:])
-					pongOK = pingErr == nil && control[0] == tcpproxy.ControlPong
+					pongOK = pingErr == nil && control[0] == legacyControlPong
 					pongResp.Body.Close()
 				}
 				cancel()

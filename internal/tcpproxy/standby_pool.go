@@ -1,11 +1,9 @@
 package tcpproxy
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"sync"
 	"time"
 )
@@ -20,48 +18,102 @@ const (
 )
 
 type standbyPool struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	cfg        Config
-	dialer     CarrierDialer
-	mu         sync.Mutex
-	entries    map[*standbyEntry]struct{}
-	prewarming int // background setups only, to avoid exceeding the idle target
-	closed     bool
-	closeDone  chan struct{}
-	wg         sync.WaitGroup
+	life                 context.Context
+	ctx                  context.Context
+	cancel               context.CancelFunc
+	cfg                  Config
+	dialer               CarrierDialer
+	mu                   sync.Mutex
+	entries              map[*standbyEntry]struct{}
+	prewarming           int
+	closed               bool
+	closeDone            chan struct{}
+	wg                   sync.WaitGroup // refill, setup and failed-idle cleanup; never active workers
+	newPingTimer         func(time.Duration) clientPingTimer
+	beforeHandoffPrepare func() // optional one-time synchronization for lifecycle tests
 }
+
+type clientPingTimer interface {
+	Chan() <-chan time.Time
+	Reset(time.Duration)
+	Stop()
+}
+type realClientPingTimer struct{ *time.Timer }
+
+func (t realClientPingTimer) Chan() <-chan time.Time { return t.C }
+func (t realClientPingTimer) Reset(d time.Duration)  { t.Timer.Reset(d) }
+func (t realClientPingTimer) Stop()                  { t.Timer.Stop() }
+
 type standbyEntry struct {
 	pool        *standbyPool
 	stream      Carrier
-	reader      *bufio.Reader
-	phase       entryPhase         // protected by pool.mu
-	openStarted bool               // protected by pool.mu
-	ownerCancel context.CancelFunc // protected by pool.mu
-	pingStop    chan struct{}
+	reader      *recordReader
+	writer      *recordWriter
+	phase       entryPhase         // pool.mu
+	openStarted bool               // pool.mu
+	ownerCancel context.CancelFunc // pool.mu
+	pingCancel  context.CancelFunc
 	pingDone    chan struct{}
+	pingTimer   clientPingTimer
 	readDone    chan struct{}
 	ack         chan error
+	failed      chan struct{}
+	failure     error // immutable after failed closes
+	faultOnce   sync.Once
 	closeOnce   sync.Once
+	joinOnce    sync.Once
+	stopLife    func() bool
+	lifeDone    chan struct{}
 }
 
-func newStandbyPool(ctx context.Context, cfg Config, d CarrierDialer) *standbyPool {
-	ctx, cancel := context.WithCancel(ctx)
-	p := &standbyPool{ctx: ctx, cancel: cancel, cfg: cfg, dialer: d, entries: make(map[*standbyEntry]struct{}), closeDone: make(chan struct{})}
+func newStandbyPool(life context.Context, cfg Config, d CarrierDialer) *standbyPool {
+	ctx, cancel := context.WithCancel(life)
+	p := &standbyPool{life: life, ctx: ctx, cancel: cancel, cfg: cfg, dialer: d, entries: make(map[*standbyEntry]struct{}), closeDone: make(chan struct{}), newPingTimer: func(d time.Duration) clientPingTimer { return realClientPingTimer{time.NewTimer(d)} }}
 	if cfg.PoolSize > 0 {
 		p.wg.Add(1)
 		go p.refill()
 	}
 	return p
 }
-func (e *standbyEntry) abort() { e.closeOnce.Do(func() { _ = e.stream.Close() }) }
+func (e *standbyEntry) abort() { e.pingCancel(); e.closeOnce.Do(func() { _ = e.stream.Close() }) }
+func (e *standbyEntry) fail(err error) {
+	e.abort()
+	e.faultOnce.Do(func() { e.failure = err; close(e.failed) })
+	p := e.pool
+	p.mu.Lock()
+	var owner context.CancelFunc
+	if e.phase == entryIdle {
+		e.phase = entryClosed
+		if !p.closed {
+			p.wg.Add(1)
+			go func() { defer p.wg.Done(); e.join(); p.mu.Lock(); delete(p.entries, e); p.mu.Unlock() }()
+		}
+	} else if e.phase == entryOpening {
+		owner = e.ownerCancel
+	}
+	p.mu.Unlock()
+	if owner != nil {
+		owner()
+	}
+}
+func (e *standbyEntry) join() {
+	e.joinOnce.Do(func() {
+		e.abort()
+		<-e.pingDone
+		<-e.readDone
+		if !e.stopLife() {
+			<-e.lifeDone
+		}
+	})
+}
+func (e *standbyEntry) stopPing() { e.pingCancel(); e.writer.Stop(); <-e.pingDone }
 func (p *standbyPool) setup(ctx context.Context, idle bool, ownerCancel context.CancelFunc) (*standbyEntry, error) {
 	defer p.wg.Done()
 	setupCtx, cancel := context.WithTimeout(ctx, p.cfg.HTTPTimeout)
 	poolCancelDone := make(chan struct{})
-	stopPoolCancel := context.AfterFunc(p.ctx, func() { cancel(); close(poolCancelDone) })
+	stop := context.AfterFunc(p.ctx, func() { cancel(); close(poolCancelDone) })
 	stream, err := p.dialer.Dial(setupCtx)
-	if !stopPoolCancel() {
+	if !stop() {
 		<-poolCancelDone
 	}
 	cancel()
@@ -79,21 +131,18 @@ func (p *standbyPool) setup(ctx context.Context, idle bool, ownerCancel context.
 		}
 		return nil, err
 	}
-	e := &standbyEntry{pool: p, stream: stream, reader: bufio.NewReaderSize(stream, CopyBufferSize), phase: entryIdle, pingStop: make(chan struct{}), pingDone: make(chan struct{}), readDone: make(chan struct{}), ack: make(chan error, 1)}
+	pingCtx, pingCancel := context.WithCancel(p.life)
+	e := &standbyEntry{pool: p, stream: stream, reader: newRecordReader(stream), writer: newRecordWriter(stream, nil, true), phase: entryIdle, ownerCancel: ownerCancel, pingCancel: pingCancel, pingDone: make(chan struct{}), readDone: make(chan struct{}), ack: make(chan error, 1), failed: make(chan struct{}), lifeDone: make(chan struct{})}
+	// Anchor the first wakeup at carrier establishment, even if scheduling the
+	// worker is delayed. Only this one worker owns subsequent timer resets.
+	e.pingTimer = p.newPingTimer(p.cfg.PingInterval)
 	if !idle {
 		e.phase = entryOpening
-		e.ownerCancel = ownerCancel
-		close(e.pingStop)
 	}
+	e.stopLife = context.AfterFunc(p.life, func() { e.fail(p.life.Err()); close(e.lifeDone) })
 	p.entries[e] = struct{}{}
-	p.wg.Add(1)
 	go e.readControl()
-	if idle {
-		p.wg.Add(1)
-		go e.pingLoop()
-	} else {
-		close(e.pingDone)
-	}
+	go e.pingLoop(pingCtx)
 	p.mu.Unlock()
 	return e, nil
 }
@@ -129,19 +178,18 @@ func (p *standbyPool) refill() {
 	}
 }
 func (e *standbyEntry) readControl() {
-	defer e.pool.wg.Done()
 	defer close(e.readDone)
-	var err error
 	for {
-		var b byte
-		b, err = e.reader.ReadByte()
+		header, err := e.reader.ReadHeader()
 		if err != nil {
-			break
+			e.ack <- err
+			e.fail(err)
+			return
 		}
-		if b == ControlPong {
+		switch header {
+		case ControlPong:
 			continue
-		}
-		if b == ControlOpenOK {
+		case ControlOpenOK:
 			e.pool.mu.Lock()
 			valid := e.phase == entryOpening && e.openStarted
 			e.pool.mu.Unlock()
@@ -150,62 +198,52 @@ func (e *standbyEntry) readControl() {
 				return
 			}
 		}
-		err = fmt.Errorf("unexpected TCP control byte 0x%02x", b)
-		break
+		err = fmt.Errorf("unexpected TCP record header %d before OPEN_OK", header)
+		e.ack <- err
+		e.fail(err)
+		return
 	}
-	e.ack <- err
-	e.abort()
-	e.pool.discard(e)
 }
-func (e *standbyEntry) pingLoop() {
-	defer e.pool.wg.Done()
+func (e *standbyEntry) pingLoop(ctx context.Context) {
 	defer close(e.pingDone)
-	t := time.NewTicker(e.pool.cfg.PingInterval)
-	defer t.Stop()
+	timer := e.pingTimer
+	if timer == nil {
+		timer = e.pool.newPingTimer(e.pool.cfg.PingInterval)
+	} // isolated timer tests
+	defer timer.Stop()
 	for {
 		select {
-		case <-e.pingStop:
+		case <-ctx.Done():
 			return
-		case <-e.pool.ctx.Done():
-			return
-		case <-t.C:
-			e.pool.mu.Lock()
-			authorized := e.phase == entryIdle && !e.pool.closed
-			e.pool.mu.Unlock()
-			if !authorized {
-				return
-			}
-			if err := e.writeControl(e.pool.ctx, ControlPing); err != nil {
-				e.abort()
-				e.pool.discard(e)
-				return
-			}
+		case <-timer.Chan():
 		}
+		if ctx.Err() != nil {
+			return
+		}
+		next, err := e.writer.Ping(e.pool.cfg.PingInterval)
+		if err != nil {
+			if ctx.Err() == nil {
+				e.fail(err)
+			}
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		timer.Reset(next)
 	}
 }
-func (e *standbyEntry) writeControl(ctx context.Context, b byte) error {
+func (e *standbyEntry) writeControl(ctx context.Context, header uint16) error {
 	joined := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() { e.abort(); close(joined) })
-	n, err := e.stream.Write([]byte{b})
+	err := e.writer.WriteControl(header)
 	if !stop() {
 		<-joined
 	}
-	if err == nil && n != 1 {
-		err = io.ErrShortWrite
-	}
-	if err == nil {
-		err = ctx.Err()
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 	return err
-}
-func (p *standbyPool) discard(e *standbyEntry) {
-	p.mu.Lock()
-	if e.phase == entryIdle {
-		e.phase = entryClosed
-		delete(p.entries, e)
-		close(e.pingStop)
-	}
-	p.mu.Unlock()
 }
 func (p *standbyPool) claim(ctx context.Context, cancel context.CancelFunc) (*standbyEntry, error) {
 	p.mu.Lock()
@@ -220,13 +258,10 @@ func (p *standbyPool) claim(ctx context.Context, cancel context.CancelFunc) (*st
 		if e.phase == entryIdle {
 			e.phase = entryOpening
 			e.ownerCancel = cancel
-			close(e.pingStop)
 			p.mu.Unlock()
 			return e, nil
 		}
 	}
-	// Each accepted TCP starts its own setup immediately. Register before unlock
-	// so Close joins it, without imposing admission or setup concurrency limits.
 	p.wg.Add(1)
 	p.mu.Unlock()
 	return p.setup(ctx, false, cancel)
@@ -240,11 +275,29 @@ func (p *standbyPool) beginOpen(e *standbyEntry, ctx context.Context) error {
 	e.openStarted = true
 	return nil
 }
+func (p *standbyPool) prepareHandoff(e *standbyEntry, ctx context.Context) {
+	// Writer lock serializes the one-time phase change with timer decisions.
+	// Never hold pool.mu or the connection terminal mutex while waiting here.
+	if p.beforeHandoffPrepare != nil {
+		p.beforeHandoffPrepare()
+	}
+	joined := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { e.abort(); close(joined) })
+	e.writer.SetActive()
+	if !stop() {
+		<-joined
+	}
+}
 func (p *standbyPool) handoff(e *standbyEntry, ctx context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed || e.phase != entryOpening || ctx.Err() != nil {
 		return context.Canceled
+	}
+	select {
+	case <-e.failed:
+		return e.failure
+	default:
 	}
 	e.phase = entryActive
 	e.ownerCancel = nil
@@ -253,10 +306,8 @@ func (p *standbyPool) handoff(e *standbyEntry, ctx context.Context) error {
 }
 func (p *standbyPool) release(e *standbyEntry) {
 	p.mu.Lock()
-	if e.phase != entryClosed {
-		e.phase = entryClosed
-		delete(p.entries, e)
-	}
+	e.phase = entryClosed
+	delete(p.entries, e)
 	p.mu.Unlock()
 }
 func (p *standbyPool) Close() {
@@ -268,24 +319,24 @@ func (p *standbyPool) Close() {
 	}
 	p.closed = true
 	p.cancel()
-	var idle []*standbyEntry
-	var owners []context.CancelFunc
+	entries := make([]*standbyEntry, 0, len(p.entries))
+	owners := []context.CancelFunc{}
 	for e := range p.entries {
-		if e.phase == entryOpening {
-			if e.ownerCancel != nil {
-				owners = append(owners, e.ownerCancel)
-			}
-		} else if e.phase == entryIdle {
-			idle = append(idle, e)
+		entries = append(entries, e)
+		if e.phase == entryOpening && e.ownerCancel != nil {
+			owners = append(owners, e.ownerCancel)
 		}
 	}
 	p.mu.Unlock()
 	for _, cancel := range owners {
 		cancel()
 	}
-	for _, e := range idle {
+	for _, e := range entries {
 		e.abort()
-		p.discard(e)
+	}
+	for _, e := range entries {
+		e.join()
+		p.release(e)
 	}
 	p.wg.Wait()
 	close(p.closeDone)

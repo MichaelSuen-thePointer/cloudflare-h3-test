@@ -2,6 +2,8 @@ package tcpproxy
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -16,33 +18,23 @@ func runClientConnection(life, acquire context.Context, cancelAcquire context.Ca
 		if err != nil {
 			return err
 		}
-		// Before OPEN, stale idle entries may be replaced within the same budget.
-		select {
-		case <-e.pingDone:
-		case <-acquire.Done():
-			e.abort()
-			<-e.pingDone
-			<-e.readDone
-			p.release(e)
-			return acquire.Err()
-		}
+		// A stale entry can still be replaced before OPEN begins. Ping continues.
 		select {
 		case <-e.readDone:
-			e.abort()
+			e.join()
 			p.release(e)
 			continue
 		default:
 		}
 		if err = p.beginOpen(e, acquire); err != nil {
-			e.abort()
-			<-e.readDone
+			e.join()
 			p.release(e)
 			return err
 		}
 		break
 	}
 	defer p.release(e)
-	defer e.abort()
+	defer e.join()
 	// Cancellation owns wakeup, while this function alone owns joining workers.
 	lifeJoined := make(chan struct{})
 	stopLife := context.AfterFunc(life, func() { _ = local.Close(); e.abort(); close(lifeJoined) })
@@ -82,10 +74,11 @@ func runClientConnection(life, acquire context.Context, cancelAcquire context.Ca
 			firstTerminal <- result
 		}
 		terminalMu.Unlock()
+		e.pingCancel()
 		_ = local.Close()
 	}
 	go func() {
-		err := copyTCPRaw(e.stream, local)
+		err := copyTCPRaw(e.writer, local)
 		recordTerminal(terminalResult{up: true, err: err})
 		up <- err
 	}()
@@ -98,11 +91,16 @@ func runClientConnection(life, acquire context.Context, cancelAcquire context.Ca
 		upResult = <-up
 		upEnded = true
 		handshakeErr = errConnectionEnded
+	case <-e.failed:
+		handshakeErr = e.failure
 	case <-acquire.Done():
 		handshakeErr = acquire.Err()
 	}
 	if handshakeErr == nil {
 		<-e.readDone
+		// This can wait for an in-flight PING. Let EOF publish termination while
+		// waiting; only the final nonblocking ownership commit holds terminalMu.
+		p.prepareHandoff(e, acquire)
 		if !stopAcquire() {
 			<-acquireJoined
 		}
@@ -122,7 +120,7 @@ func runClientConnection(life, acquire context.Context, cancelAcquire context.Ca
 	if handshakeErr != nil {
 		// EOF has a distinct normal upload finish even if OPEN_OK was delayed.
 		if upEnded && upResult == nil {
-			finishClientEOF(e, local, up, true, nil, false)
+			handshakeErr = errors.Join(handshakeErr, finishClientEOF(e, local, up, true, nil, false))
 		} else {
 			e.abort()
 			_ = local.Close()
@@ -136,7 +134,7 @@ func runClientConnection(life, acquire context.Context, cancelAcquire context.Ca
 	cancelAcquire() // callback has been stopped and joined; active has no acquire deadline.
 	down := make(chan error, 1)
 	go func() {
-		err := copyTCPRaw(local, e.reader)
+		err := copyTCPRaw(local, clientDataReader{reader: e.reader})
 		recordTerminal(terminalResult{err: err})
 		down <- err
 	}()
@@ -151,6 +149,12 @@ func runClientConnection(life, acquire context.Context, cancelAcquire context.Ca
 			downResult = <-down
 			downEnded = true
 		}
+	case <-e.failed:
+		e.abort()
+		_ = local.Close()
+		<-up
+		<-down
+		return e.failure
 	case <-life.Done():
 		e.abort()
 		_ = local.Close()
@@ -169,28 +173,69 @@ func runClientConnection(life, acquire context.Context, cancelAcquire context.Ca
 		}
 		return io.ErrClosedPipe
 	}
-	finishClientEOF(e, local, up, upEnded, down, downEnded)
-	return nil
+	return finishClientEOF(e, local, up, upEnded, down, downEnded)
 }
 
 // EOF terminates local business immediately. The existing reader alone finishes
 // transport cleanup; no second goroutine competes for the response body.
 // Cleanup has no local timer. The owning lifecycle cancellation still aborts
 // the carrier to wake every blocked worker during process shutdown.
-func finishClientEOF(e *standbyEntry, local net.Conn, up <-chan error, upEnded bool, down <-chan error, downEnded bool) {
+func finishClientEOF(e *standbyEntry, local net.Conn, up <-chan error, upEnded bool, down <-chan error, downEnded bool) error {
 	_ = local.Close()
+	// Stop future record authorization before waiting for the opposite business
+	// loop. The current record may finish; lifecycle cancellation can abort it.
+	e.stopPing()
 	if !upEnded {
 		// The first cause was normal EOF. Closing local to stop future business
 		// commonly makes this second loop report a socket error.
 		<-up
 	}
-	_ = e.stream.FinishWrite()
+	// A normal first EOF does not make later transport damage successful.
+	// Stop and the copy joins above make the writer's terminal error stable.
+	finishErr := e.writer.Err()
+	if finishErr == nil {
+		finishErr = e.stream.FinishWrite()
+	}
+	if finishErr != nil {
+		e.abort()
+	} // wake response reads instead of draining forever
 	<-e.readDone
 	if down != nil && !downEnded {
 		<-down
 	}
-	if !downEnded {
-		_, _ = io.CopyBuffer(io.Discard, e.reader, make([]byte, CopyBufferSize))
+	if finishErr == nil && !downEnded {
+		_, finishErr = io.CopyBuffer(io.Discard, clientDataReader{reader: e.reader}, make([]byte, CopyBufferSize))
+		finishErr = clientDrainError(finishErr)
+	}
+	// The business reader may have seen n>0 plus a decoder error and then
+	// failed writing to the local socket we intentionally closed. Preserve the
+	// decoder error, while ignoring that induced local socket write failure.
+	if decoderErr := e.reader.Err(); finishErr == nil && decoderErr != nil && !errors.Is(decoderErr, io.EOF) {
+		finishErr = clientDrainError(decoderErr)
 	}
 	e.abort()
+	return finishErr
+}
+
+// A successful WS FinishWrite closes its socket. These two local-close errors
+// are expected while joining/draining that read side; framing damage and other
+// network errors still propagate. FinishWrite's own error is never normalized.
+func clientDrainError(err error) error {
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
+		return nil
+	}
+	return err
+}
+
+// clientDataReader keeps the same decoder across OPEN_OK, business and drain.
+// Only PONG may be interleaved with downstream DATA in this phase.
+type clientDataReader struct{ reader *recordReader }
+
+func (r clientDataReader) Read(b []byte) (int, error) {
+	return r.reader.ReadData(b, func(header uint16) error {
+		if header == ControlPong {
+			return nil
+		}
+		return fmt.Errorf("unexpected active client record header %d", header)
+	})
 }

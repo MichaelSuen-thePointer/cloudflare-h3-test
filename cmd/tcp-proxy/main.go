@@ -33,7 +33,7 @@ Options:
   --ca FILE                 additional H3 client CA certificates
   --cert FILE --key FILE    server TLS certificate and key
   --pool-size N             ready standby target (default 2; 0 means on demand)
-  --ping-interval DURATION   standby application PING interval (default 10s)
+  --ping-interval DURATION   standby PING / active send-idle interval (default 10s)
   --http-timeout DURATION    carrier setup / local accept through OPEN_OK (default 15s)
   --h3-streams-per-transport N  H3 streams per QUIC transport (default 2)
   --quic-initial-stream-window BYTES (default 6291456: 6 MiB)
@@ -47,6 +47,8 @@ Durations require units, for example 5s. Unknown and duplicate options are rejec
 Server shares /: POST is H3, GET Upgrade is WS; ordinary authenticated GET returns 400.
 --path overrides only --transport's route.
 Connection counts and concurrent dials are limited by OS resources only.
+TCP wire v2 uses a 2-byte little-endian header; both peers must use v2.
+Client PING continues after OPEN; active uploads defer it until send-idle.
 No UDP forwarding, application multiplexing, reconnection, or TCP half-close.
 `
 
