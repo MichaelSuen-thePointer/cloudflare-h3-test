@@ -87,3 +87,25 @@ func TestRunDispatchFailureAndCancellation(t *testing.T) {
 		}
 	}
 }
+
+func TestRunPendingWarningsUseConfiguredLevelAndWriter(t *testing.T) {
+	for _, level := range []string{"info", "error"} {
+		var out, stderr bytes.Buffer
+		env := map[string]string{(string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_HOST"): "127.0.0.1", (string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_PORT"): "1081", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_HOST"): "example.com", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_PORT"): "443", (string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS"): "bare-secret;future=private;log-level=" + level}
+		called := false
+		start := func(context.Context, tcpproxy.Config) error { called = true; return nil }
+		code := run(context.Background(), nil, func(k string) string { return env[k] }, &out, &stderr, start, start)
+		if code != 0 || !called {
+			t.Fatalf("code=%d called=%v", code, called)
+		}
+		if level == "info" && (!strings.Contains(stderr.String(), "[WARN] tcp-unknown-PluginEnv-options") || !strings.Contains(stderr.String(), "count: 2")) {
+			t.Fatal(stderr.String())
+		}
+		if level == "error" && stderr.Len() != 0 {
+			t.Fatal("pending warning ignored configured level")
+		}
+		if strings.Contains(stderr.String(), "bare-secret") || strings.Contains(stderr.String(), "private") || strings.Contains(stderr.String(), "future") {
+			t.Fatal("unknown contents leaked")
+		}
+	}
+}

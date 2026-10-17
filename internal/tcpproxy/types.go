@@ -6,6 +6,7 @@ import (
 	"io"
 	"time"
 
+	"cloudflare-h3-test/internal/diaglog"
 	"cloudflare-h3-test/internal/relay"
 )
 
@@ -45,6 +46,10 @@ type Config struct {
 	HTTPTimeout         time.Duration
 	StreamsPerTransport int
 	QUICWindows         relay.QUICReceiveWindows
+	LogLevel            string
+	UseSyslog           bool
+	logger              *diaglog.Logger
+	unknownOptions      int
 }
 
 // Carrier is an ordered byte stream. Its Read/Write methods never interpret

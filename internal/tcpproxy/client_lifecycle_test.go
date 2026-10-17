@@ -409,7 +409,7 @@ func TestTCPClientLateACKAfterUploadEOFCannotHandoff(t *testing.T) {
 	// The connection already became terminal before this ACK could arrive.
 	_, _ = w.Write(clientTestControls(ControlOpenOK))
 	_ = w.Close()
-	if err := clientTestWait(t, done); !errors.Is(err, errConnectionEnded) {
+	if err := clientTestWait(t, done); err != nil {
 		t.Fatalf("late ACK result: %v", err)
 	}
 	p.mu.Lock()
@@ -553,7 +553,9 @@ func (c *clientArbitratedLocal) Write(b []byte) (int, error) {
 	<-c.closed
 	return 0, io.ErrClosedPipe
 }
-func (c *clientArbitratedLocal) Close() error { c.once.Do(func() { close(c.closed) }); return nil }
+func (c *clientArbitratedLocal) Close() error         { c.once.Do(func() { close(c.closed) }); return nil }
+func (c *clientArbitratedLocal) LocalAddr() net.Addr  { return &net.TCPAddr{} }
+func (c *clientArbitratedLocal) RemoteAddr() net.Addr { return &net.TCPAddr{} }
 
 type clientArbitratedCarrier struct {
 	r                   *io.PipeReader
@@ -1379,7 +1381,7 @@ func TestTCPClientEOFDuringBlockedPingHandoffCannotActivate(t *testing.T) {
 	if binary.LittleEndian.Uint16(ping[:]) != ControlPing {
 		t.Fatal("missing blocked PING")
 	}
-	if err := clientTestWait(t, done); !errors.Is(err, errConnectionEnded) {
+	if err := clientTestWait(t, done); err != nil {
 		t.Fatalf("EOF revived into active handoff: %v", err)
 	}
 	if local.writes.Load() != 0 {

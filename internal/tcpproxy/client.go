@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"log"
 	"net"
 	"sync"
 )
@@ -14,6 +13,11 @@ func RunClient(ctx context.Context, cfg Config) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
+	cfg, cleanup, err := initRuntimeLogger(cfg)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
 	d, err := NewCarrierDialer(cfg)
 	if err != nil {
 		return err
@@ -28,6 +32,8 @@ func RunClient(ctx context.Context, cfg Config) error {
 
 // runClient takes ownership of listener and dialer, including on failure.
 func runClient(ctx context.Context, cfg Config, l net.Listener, d CarrierDialer) error {
+	cfg.logInfo(cfg.Transport, "tcp-process-start", "local", l.Addr().String())
+	defer cfg.logInfo(cfg.Transport, "tcp-process-stop", "local", l.Addr().String())
 	life, cancel := context.WithCancel(ctx)
 	defer cancel()
 	p := newStandbyPool(life, cfg, d)
@@ -47,17 +53,7 @@ func runClient(ctx context.Context, cfg Config, l net.Listener, d CarrierDialer)
 		go func() {
 			defer wg.Done()
 			defer acceptedCancel()
-			if err := runClientConnection(life, acceptedCtx, acceptedCancel, cfg, p, local); err != nil && life.Err() == nil {
-				// Do not print transport errors: HTTP errors can contain remote URLs.
-				reason := "carrier or local I/O"
-				if errors.Is(err, context.DeadlineExceeded) {
-					reason = "HTTP handshake timeout"
-				}
-				if errors.Is(err, errConnectionEnded) {
-					reason = "local EOF before OPEN_OK"
-				}
-				log.Printf("tcp client connection ended: %s", reason)
-			}
+			_ = runClientConnection(life, acceptedCtx, acceptedCancel, cfg, p, local)
 		}()
 	}
 	cancel()

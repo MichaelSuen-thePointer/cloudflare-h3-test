@@ -2,6 +2,7 @@ package diaglog
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"strconv"
 	"strings"
@@ -66,6 +67,42 @@ func New(level Level) *Logger {
 	l.level.Store(int32(level))
 	return l
 }
+
+// NewWriter creates an independent timestamped sink without changing the
+// process-wide standard logger used by existing callers of New.
+func NewWriter(level Level, out io.Writer) *Logger {
+	l := New(level)
+	l.sink = logWriterSink{logger: log.New(out, "", log.LstdFlags|log.Lmicroseconds)}
+	return l
+}
+
+// UseWriter replaces the sink with an independent timestamped writer.
+func (l *Logger) UseWriter(out io.Writer) {
+	l.mu.Lock()
+	old := l.sink
+	l.sink = logWriterSink{logger: log.New(out, "", log.LstdFlags|log.Lmicroseconds)}
+	l.mu.Unlock()
+	if old != nil {
+		_ = old.close()
+	}
+}
+
+// Close releases the current sink. It is safe to call more than once.
+func (l *Logger) Close() error {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	old := l.sink
+	l.sink = logWriterSink{logger: log.New(io.Discard, "", 0)}
+	l.mu.Unlock()
+	return old.close()
+}
+
+type logWriterSink struct{ logger *log.Logger }
+
+func (s logWriterSink) write(level Level, msg string) { s.logger.Print(formatLine(level, msg)) }
+func (s logWriterSink) close() error                  { return nil }
 
 func (l *Logger) SetLevel(level Level) {
 	l.level.Store(int32(level))

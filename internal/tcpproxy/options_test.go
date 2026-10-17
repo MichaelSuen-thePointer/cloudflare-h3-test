@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"flag"
-	"log"
 	"strings"
 	"testing"
 	"time"
@@ -59,9 +58,6 @@ func TestPluginEnvMappingAndPrecedence(t *testing.T) {
 
 func TestPluginEnvUnknownOptionsWarnAndPreserveKnownValidation(t *testing.T) {
 	var warnings bytes.Buffer
-	previous := log.Writer()
-	log.SetOutput(&warnings)
-	t.Cleanup(func() { log.SetOutput(previous) })
 	env := map[string]string{(string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_HOST"): "127.0.0.1", (string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_PORT"): "1081", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_HOST"): "example.com", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_PORT"): "443"}
 	getenv := func(k string) string { return env[k] }
 	for _, role := range []string{"", "server;"} {
@@ -73,10 +69,22 @@ func TestPluginEnvUnknownOptionsWarnAndPreserveKnownValidation(t *testing.T) {
 		warnings.Reset()
 		env[(string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS")] += ";__android_vpn;__android_vpn;future-option=private-value;bare-secret"
 		got, err := ParseConfig(nil, getenv)
+		count := got.unknownOptions
+		got.unknownOptions = 0
 		if err != nil || got != want {
 			t.Fatalf("unknown metadata changed configuration: %v", err)
 		}
-		if strings.Count(warnings.String(), "warning: ignoring unknown PluginEnv option") != 3 {
+		if warnings.Len() != 0 {
+			t.Fatal("warning emitted during parsing")
+		}
+		got.unknownOptions = count
+		initialized, initErr := got.InitLogger(&warnings)
+		if initErr != nil {
+			t.Fatal(initErr)
+		}
+		initialized.CloseLogger()
+		// Four unknown occurrences contain three distinct unknown keys.
+		if count != 3 || strings.Count(warnings.String(), "tcp-unknown-PluginEnv-options") != 1 || !strings.Contains(warnings.String(), "count: 3") {
 			t.Fatalf("missing warnings: %q", warnings.String())
 		}
 		for _, hidden := range []string{"secret", "private-value", "future-option", "__android_vpn"} {
@@ -444,6 +452,35 @@ func TestPluginEnvSchemeAndTLSPrecedence(t *testing.T) {
 		_, err := ParseConfig(nil, func(k string) string { return env[k] })
 		if err != nil {
 			t.Fatalf("old plain-http server=%v: %v", server, err)
+		}
+	}
+}
+
+func TestLoggingOptionsDefaultsAndPluginEnvPrecedence(t *testing.T) {
+	cfg, err := ParseConfig(clientArgs(), nil)
+	if err != nil || cfg.LogLevel != "info" || cfg.UseSyslog {
+		t.Fatalf("defaults: %+v %v", cfg, err)
+	}
+	env := map[string]string{(string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_HOST"): "127.0.0.1", (string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_PORT"): "1081", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_HOST"): "example.com", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_PORT"): "443", (string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS"): "log-level=error;use-syslog=false"}
+	cfg, err = ParseConfig([]string{"--log-level=debug", "--use-syslog"}, func(k string) string { return env[k] })
+	if err != nil || cfg.LogLevel != "error" || cfg.UseSyslog {
+		t.Fatalf("PluginEnv precedence: %+v %v", cfg, err)
+	}
+	for _, options := range []string{"log-level=secret", "use-syslog=secret", "use-syslog=true;use-syslog=false", "log-level=warn;log-level=error"} {
+		env[(string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS")] = options
+		_, err = ParseConfig(nil, func(k string) string { return env[k] })
+		if err == nil || strings.Contains(err.Error(), "secret") {
+			t.Fatalf("accepted/leaked invalid known option: %v", err)
+		}
+	}
+	env[(string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS")] = "use-syslog;log-level=warning"
+	cfg, err = ParseConfig(nil, func(k string) string { return env[k] })
+	if err != nil || !cfg.UseSyslog || cfg.LogLevel != "warning" {
+		t.Fatalf("bare boolean: %+v %v", cfg, err)
+	}
+	for _, options := range []string{"--log-level=secret", "--use-syslog=secret"} {
+		if _, err := ParseConfig(clientArgs(options), nil); err == nil || strings.Contains(err.Error(), "secret") {
+			t.Fatalf("CLI accepted/leaked: %v", err)
 		}
 	}
 }

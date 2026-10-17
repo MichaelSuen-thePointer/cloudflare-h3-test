@@ -8,9 +8,9 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 
+	"cloudflare-h3-test/internal/diaglog"
 	"cloudflare-h3-test/internal/tcpproxy"
 )
 
@@ -41,6 +41,8 @@ Options:
   --quic-initial-conn-window BYTES   (default 15728640: 15 MiB)
   --quic-max-conn-window BYTES       (default 25165824: 24 MiB)
                                     explicit 0 keeps quic-go's field default
+  --log-level LEVEL         debug|info|warn|error (default info)
+  --use-syslog[=true|false]  system syslog sink (default false)
   --help                    show this help
 
 Durations require units, for example 5s. Unknown CLI and duplicate known options are rejected.
@@ -61,9 +63,15 @@ func run(ctx context.Context, args []string, getenv func(string) string, out, er
 		return 0
 	}
 	if err != nil {
-		fmt.Fprintln(errOut, "tcp-proxy:", err)
+		diaglog.NewWriter(diaglog.Error, errOut).Error("tcp-config-failed", "err", err)
 		return 2
 	}
+	cfg, err = cfg.InitLogger(errOut)
+	if err != nil {
+		diaglog.NewWriter(diaglog.Error, errOut).Error("tcp-logger-failed", "err", err)
+		return 1
+	}
+	defer cfg.CloseLogger()
 	start := client
 	if cfg.Server {
 		start = server
@@ -72,10 +80,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, out, er
 		if ctx.Err() != nil {
 			return 0
 		}
-		// Retain useful bind/TLS/CA diagnostics while masking the configured secret.
-		// Quoting also prevents peer-controlled line breaks from forging log lines.
-		reason := strings.ReplaceAll(err.Error(), cfg.Token, "[REDACTED]")
-		fmt.Fprintf(errOut, "tcp-proxy: startup or runtime failure: %q\n", reason)
+		cfg.LogError("tcp-runtime-failed", err)
 		return 1
 	}
 	return 0

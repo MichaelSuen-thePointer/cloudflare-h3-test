@@ -77,8 +77,8 @@ func newStandbyPool(life context.Context, cfg Config, d CarrierDialer) *standbyP
 }
 func (e *standbyEntry) abort() { e.pingCancel(); e.closeOnce.Do(func() { _ = e.stream.Close() }) }
 func (e *standbyEntry) fail(err error) {
-	e.abort()
 	e.faultOnce.Do(func() { e.failure = err; close(e.failed) })
+	e.abort()
 	p := e.pool
 	p.mu.Lock()
 	var owner context.CancelFunc
@@ -86,7 +86,17 @@ func (e *standbyEntry) fail(err error) {
 		e.phase = entryClosed
 		if !p.closed {
 			p.wg.Add(1)
-			go func() { defer p.wg.Done(); e.join(); p.mu.Lock(); delete(p.entries, e); p.mu.Unlock() }()
+			go func() {
+				defer p.wg.Done()
+				e.join()
+				p.mu.Lock()
+				delete(p.entries, e)
+				p.mu.Unlock()
+				// The idle owner reports after every worker has joined, outside locks.
+				if p.life.Err() == nil && p.ctx.Err() == nil {
+					p.cfg.logFailure(p.cfg.Transport, "pool-idle", e.failure)
+				}
+			}()
 		}
 	} else if e.phase == entryOpening {
 		owner = e.ownerCancel
@@ -108,7 +118,6 @@ func (e *standbyEntry) join() {
 }
 func (e *standbyEntry) stopPing() { e.pingCancel(); e.writer.Stop(); <-e.pingDone }
 func (p *standbyPool) setup(ctx context.Context, idle bool, ownerCancel context.CancelFunc) (*standbyEntry, error) {
-	defer p.wg.Done()
 	setupCtx, cancel := context.WithTimeout(ctx, p.cfg.HTTPTimeout)
 	poolCancelDone := make(chan struct{})
 	stop := context.AfterFunc(p.ctx, func() { cancel(); close(poolCancelDone) })
@@ -168,7 +177,13 @@ func (p *standbyPool) refill() {
 		}
 		p.mu.Unlock()
 		for i := 0; i < want; i++ {
-			go func() { _, _ = p.setup(p.ctx, true, nil) }()
+			go func() {
+				defer p.wg.Done() // includes failure reporting before pool Close returns
+				_, err := p.setup(p.ctx, true, nil)
+				if err != nil && p.life.Err() == nil && p.ctx.Err() == nil {
+					p.cfg.logFailure(p.cfg.Transport, "pool-setup", err)
+				}
+			}()
 		}
 		select {
 		case <-p.ctx.Done():
@@ -182,6 +197,7 @@ func (e *standbyEntry) readControl() {
 	for {
 		header, err := e.reader.ReadHeader()
 		if err != nil {
+
 			e.ack <- err
 			e.fail(err)
 			return
@@ -198,7 +214,7 @@ func (e *standbyEntry) readControl() {
 				return
 			}
 		}
-		err = fmt.Errorf("unexpected TCP record header %d before OPEN_OK", header)
+		err = fmt.Errorf("%w: unexpected TCP record header %d before OPEN_OK", errRecordControl, header)
 		e.ack <- err
 		e.fail(err)
 		return
@@ -264,6 +280,7 @@ func (p *standbyPool) claim(ctx context.Context, cancel context.CancelFunc) (*st
 	}
 	p.wg.Add(1)
 	p.mu.Unlock()
+	defer p.wg.Done()
 	return p.setup(ctx, false, cancel)
 }
 func (p *standbyPool) beginOpen(e *standbyEntry, ctx context.Context) error {

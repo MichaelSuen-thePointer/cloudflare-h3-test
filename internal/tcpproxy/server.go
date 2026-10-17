@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -30,6 +29,7 @@ type tcpServer struct {
 	wg           sync.WaitGroup
 }
 type serverSession struct {
+	id          uint64
 	mu          sync.Mutex
 	closed      bool
 	closeDone   chan struct{}
@@ -94,13 +94,14 @@ func newTCPServer(cfg Config) *tcpServer {
 	return &tcpServer{cfg: cfg, sessions: make(map[*serverSession]struct{}), dialUpstream: (&net.Dialer{}).DialContext}
 }
 func (s *tcpServer) reserve() (*serverSession, bool) {
+	id := newSessionID()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closing {
 		return nil, false
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	c := &serverSession{ctx: ctx, cancel: cancel, closeDone: make(chan struct{})}
+	c := &serverSession{id: id, ctx: ctx, cancel: cancel, closeDone: make(chan struct{})}
 	s.sessions[c] = struct{}{}
 	s.idle++
 	s.wg.Add(1)
@@ -124,12 +125,19 @@ func RunServer(ctx context.Context, cfg Config) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
+	cfg, cleanupLogger, err := initRuntimeLogger(cfg)
+	if err != nil {
+		return err
+	}
+	defer cleanupLogger()
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return err
 	}
 	state := newTCPServer(cfg)
-	server := &http.Server{Handler: state, ReadHeaderTimeout: cfg.HTTPTimeout, BaseContext: func(net.Listener) context.Context { return ctx }}
+	server := &http.Server{Handler: state, ErrorLog: cfg.httpErrorLogger(), ReadHeaderTimeout: cfg.HTTPTimeout, BaseContext: func(net.Listener) context.Context { return ctx }}
+	cfg.logInfo("http", "tcp-process-start", "listen", ln.Addr().String())
+	defer cfg.logInfo("http", "tcp-process-stop")
 	done := make(chan struct{})
 	watcherDone := make(chan struct{})
 	go func() {
@@ -188,7 +196,16 @@ func (s *tcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	idle := true
+	transport := TransportH3
+	if ws {
+		transport = TransportWebSocket
+	}
+	created := false
+	var failure error
+	failureStage := ""
+	fail := func(stage string, err error) { failureStage, failure = stage, err }
 	defer func() {
+		canceled := session.ctx.Err() != nil
 		session.close()
 		s.mu.Lock()
 		delete(s.sessions, session)
@@ -196,6 +213,14 @@ func (s *tcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s.idle--
 		}
 		s.mu.Unlock()
+		// The session is fully closed and no session/controller locks are held
+		// while the potentially blocking diagnostic sink is used.
+		if !canceled && failure != nil {
+			s.cfg.logFailure(transport, failureStage, failure, "session", session.id, "remote", r.RemoteAddr)
+		}
+		if created {
+			s.cfg.logDebug(transport, "tcp-connection-close", "session", session.id, "remote", r.RemoteAddr)
+		}
 		s.wg.Done()
 	}()
 	requestDone := make(chan struct{})
@@ -226,7 +251,7 @@ func (s *tcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			<-setupDone
 		}
 		if err != nil {
-			s.reportFailure(session.ctx, "websocket-upgrade", err)
+			fail("websocket-upgrade", err)
 			return
 		}
 		carrier = &wsCarrier{ws: conn}
@@ -243,31 +268,41 @@ func (s *tcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !session.setCarrier(carrier) {
 		return
 	}
+	if ws {
+		created = true
+		s.cfg.logDebug(transport, "tcp-connection-create", "session", session.id, "remote", r.RemoteAddr)
+	}
 	if !ws {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusOK)
 		if err := carrier.(*originH3Carrier).rc.Flush(); err != nil {
-			s.reportFailure(session.ctx, "accept-flush", err)
+			fail("accept-flush", err)
 			return
 		}
+		created = true
+		s.cfg.logDebug(transport, "tcp-connection-create", "session", session.id, "remote", r.RemoteAddr)
 	}
 	reader := newRecordReader(carrier)
 	writer := newRecordWriter(carrier, nil, false)
 	for {
 		header, err := reader.ReadHeader()
 		if err != nil {
+			if err != io.EOF {
+				fail("open-read", err)
+			}
 			return
 		}
 		switch header {
 		case ControlPing:
 			if err := writer.WriteControl(ControlPong); err != nil {
-				s.reportFailure(session.ctx, "pong-write", err)
+				fail("pong-write", err)
 				return
 			}
 		case ControlOpen:
 			goto opened
 		default:
+			fail("open-read", fmt.Errorf("%w: invalid pre-OPEN record", errRecordControl))
 			return
 		}
 	}
@@ -280,29 +315,20 @@ opened:
 	upstream, err := s.dialUpstream(dialCtx, "tcp", s.cfg.Upstream)
 	cancel()
 	if err != nil {
-		s.reportFailure(session.ctx, "upstream-dial", err)
+		fail("upstream-dial", err)
 		return
 	}
 	if !session.setUpstream(upstream) {
 		return
 	}
 	if err := writer.WriteControl(ControlOpenOK); err != nil {
-		s.reportFailure(session.ctx, "open-ok-write", err)
+		fail("open-ok-write", err)
 		return
 	}
+	s.cfg.logDebug(transport, "tcp-connection-ready", "session", session.id, "remote", r.RemoteAddr)
 	if err := s.relayRecords(session.ctx, carrier, upstream, reader, writer, stopAndJoinRequest); err != nil {
-		s.reportFailure(session.ctx, "relay-records", err)
+		fail("relay-records", err)
 	}
-}
-func (s *tcpServer) reportFailure(ctx context.Context, stage string, err error) {
-	if ctx.Err() != nil || err == nil {
-		return
-	}
-	message := err.Error()
-	if s.cfg.Token != "" {
-		message = strings.ReplaceAll(message, s.cfg.Token, "[redacted]")
-	}
-	log.Printf("tcp server failure stage=%s error=%q", stage, message)
 }
 func hasUpgradeToken(value string) bool {
 	for _, v := range strings.Split(value, ",") {
@@ -383,7 +409,7 @@ func (s *tcpServer) relayRecords(ctx context.Context, c Carrier, upstream net.Co
 	}
 	if err := c.FinishWrite(); err != nil {
 		c.Close()
-		return fmt.Errorf("finish response: %w", err)
+		return err
 	}
 	return nil
 }

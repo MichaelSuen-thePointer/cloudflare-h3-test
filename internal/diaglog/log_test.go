@@ -98,3 +98,50 @@ func TestStdLoggerAdapter(t *testing.T) {
 		t.Fatalf("unexpected adapter output:\n%s", out)
 	}
 }
+
+func TestWriterSinkIsIndependentAndKeepsSuppression(t *testing.T) {
+	var a, b bytes.Buffer
+	first := NewWriter(Info, &a)
+	second := NewWriter(Error, &b)
+	first.Info("first")
+	second.Info("hidden")
+	if !strings.Contains(a.String(), "[INFO] first") || b.Len() != 0 {
+		t.Fatal("writer or level crossed instances")
+	}
+	first.UseWriter(&b)
+	for i := 0; i < 13; i++ {
+		first.WarnRate("fixed", 10*time.Second, "failed")
+	}
+	first.mu.Lock()
+	first.rate["fixed"].anchor = time.Now().Add(-11 * time.Second)
+	first.mu.Unlock()
+	first.WarnRate("fixed", 10*time.Second, "failed")
+	if strings.Count(b.String(), "[WARN] failed") != 11 || !strings.Contains(b.String(), "suppressed: 3") {
+		t.Fatal(b.String())
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = first.Close()
+	first.Info("closed")
+	if strings.Contains(b.String(), "closed") {
+		t.Fatal("closed sink emitted")
+	}
+}
+
+func TestNewWriterPreservesDefaultLoggerBehavior(t *testing.T) {
+	var global, independent bytes.Buffer
+	oldOut, oldFlags, oldPrefix := log.Writer(), log.Flags(), log.Prefix()
+	defer log.SetOutput(oldOut)
+	defer log.SetFlags(oldFlags)
+	defer log.SetPrefix(oldPrefix)
+	log.SetOutput(&global)
+	log.SetFlags(0)
+	log.SetPrefix("existing: ")
+	custom := NewWriter(Info, &independent)
+	custom.Info("custom")
+	New(Info).Info("default")
+	if global.String() != "existing: [INFO] default\n" || strings.Contains(independent.String(), "existing:") || !strings.Contains(independent.String(), "[INFO] custom") {
+		t.Fatalf("global=%s custom=%s", global.String(), independent.String())
+	}
+}

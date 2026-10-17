@@ -10,6 +10,17 @@ import (
 )
 
 func runClientConnection(life, acquire context.Context, cancelAcquire context.CancelFunc, cfg Config, p *standbyPool, local net.Conn) error {
+	id := newSessionID()
+	cfg.logDebug(cfg.Transport, "tcp-connection-create", "session", id, "local", local.LocalAddr(), "peer", local.RemoteAddr())
+	err := runClientSession(life, acquire, cancelAcquire, cfg, p, local, id)
+	if life.Err() == nil && err != nil && !errors.Is(err, context.Canceled) {
+		cfg.logFailure(cfg.Transport, "connection", err, "session", id, "local", local.LocalAddr(), "peer", local.RemoteAddr())
+	}
+	cfg.logDebug(cfg.Transport, "tcp-connection-close", "session", id, "local", local.LocalAddr(), "peer", local.RemoteAddr())
+	return err
+}
+
+func runClientSession(life, acquire context.Context, cancelAcquire context.CancelFunc, cfg Config, p *standbyPool, local net.Conn, id uint64) error {
 	defer local.Close()
 	var e *standbyEntry
 	for {
@@ -91,6 +102,9 @@ func runClientConnection(life, acquire context.Context, cancelAcquire context.Ca
 		upResult = <-up
 		upEnded = true
 		handshakeErr = errConnectionEnded
+		if upResult != nil {
+			handshakeErr = upResult
+		}
 	case <-e.failed:
 		handshakeErr = e.failure
 	case <-acquire.Done():
@@ -115,12 +129,15 @@ func runClientConnection(life, acquire context.Context, cancelAcquire context.Ca
 		if handshakeErr == errConnectionEnded {
 			upResult = <-up
 			upEnded = true
+			if upResult != nil {
+				handshakeErr = upResult
+			}
 		}
 	}
 	if handshakeErr != nil {
 		// EOF has a distinct normal upload finish even if OPEN_OK was delayed.
 		if upEnded && upResult == nil {
-			handshakeErr = errors.Join(handshakeErr, finishClientEOF(e, local, up, true, nil, false))
+			handshakeErr = finishClientEOF(e, local, up, true, nil, false)
 		} else {
 			e.abort()
 			_ = local.Close()
@@ -131,6 +148,7 @@ func runClientConnection(life, acquire context.Context, cancelAcquire context.Ca
 		}
 		return handshakeErr
 	}
+	cfg.logDebug(cfg.Transport, "tcp-connection-ready", "session", id, "local", local.LocalAddr(), "peer", local.RemoteAddr())
 	cancelAcquire() // callback has been stopped and joined; active has no acquire deadline.
 	down := make(chan error, 1)
 	go func() {
@@ -171,7 +189,10 @@ func runClientConnection(life, acquire context.Context, cancelAcquire context.Ca
 		if !downEnded {
 			<-down
 		}
-		return io.ErrClosedPipe
+		if upEnded {
+			return upResult
+		}
+		return downResult
 	}
 	return finishClientEOF(e, local, up, upEnded, down, downEnded)
 }
@@ -236,6 +257,6 @@ func (r clientDataReader) Read(b []byte) (int, error) {
 		if header == ControlPong {
 			return nil
 		}
-		return fmt.Errorf("unexpected active client record header %d", header)
+		return fmt.Errorf("%w: unexpected active client record header %d", errRecordControl, header)
 	})
 }

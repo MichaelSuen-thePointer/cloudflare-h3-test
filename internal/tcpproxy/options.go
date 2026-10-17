@@ -5,19 +5,19 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
+	"cloudflare-h3-test/internal/diaglog"
 	PluginEnv "cloudflare-h3-test/internal/pluginopts"
 	"cloudflare-h3-test/internal/relay"
 )
 
 func DefaultConfig() Config {
-	return Config{Transport: TransportH3, Token: "change-me-token", PoolSize: 2, PingInterval: 10 * time.Second,
+	return Config{Transport: TransportH3, Token: "change-me-token", PoolSize: 2, PingInterval: 10 * time.Second, LogLevel: "info",
 		HTTPTimeout:         15 * time.Second,
 		StreamsPerTransport: 2,
 		QUICWindows:         relay.QUICReceiveWindows{InitialStream: 6 << 20, MaxStream: 16 << 20, InitialConnection: 15 << 20, MaxConnection: 24 << 20}}
@@ -35,6 +35,8 @@ func parseConfig(args []string, getenv func(string) string, lookupACME func(stri
 	f := flag.NewFlagSet("tcp-proxy", flag.ContinueOnError)
 	f.SetOutput(io.Discard)
 	f.BoolVar(&c.Server, "server", c.Server, "run server role")
+	f.BoolVar(&c.UseSyslog, "use-syslog", c.UseSyslog, "write to system syslog")
+	f.StringVar(&c.LogLevel, "log-level", c.LogLevel, "minimum log severity")
 	for _, p := range []struct {
 		name string
 		dst  *string
@@ -129,7 +131,8 @@ func parseConfig(args []string, getenv func(string) string, lookupACME func(stri
 				if f.Lookup(name) == nil && name != "scheme" && name != "tls" {
 					// Ignore host metadata, including repeated unknown keys. Neither
 					// names nor values are logged: a bare secret can look like a key.
-					log.Print("tcp-proxy: warning: ignoring unknown PluginEnv option")
+					// Count distinct unknown keys, including keys with repeated values.
+					c.unknownOptions++
 					continue
 				}
 				if len(values) != 1 {
@@ -145,7 +148,7 @@ func parseConfig(args []string, getenv func(string) string, lookupACME func(stri
 					sipHost = true
 				}
 				value := values[0]
-				if name == "server" {
+				if name == "server" || name == "use-syslog" {
 					b, _, err := opts.Bool(name)
 					if err != nil {
 						return c, errors.New("invalid PluginEnv boolean option")
@@ -282,6 +285,9 @@ func validAddress(s string) bool {
 }
 
 func (c Config) Validate() error {
+	if _, err := diaglog.ParseLevel(c.LogLevel); err != nil {
+		return errors.New("invalid log-level (use debug, info, warn or error)")
+	}
 	if c.Transport != TransportH3 && c.Transport != TransportWebSocket {
 		return errors.New("transport must be h3 or ws")
 	}
