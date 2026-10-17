@@ -97,7 +97,7 @@ func TestPluginEnvServerACMEPrecedenceAndMapping(t *testing.T) {
 		{"sip-overrides-cli", "host=tcp.example.com;cert=sip-cert;key=sip-key", []string{"--cert=cli-cert", "--key=cli-key"}, false, false, "sip-cert", "sip-key"},
 		{"missing-key", "host=tcp.example.com;cert=explicit-cert", nil, false, true, "", ""},
 		{"missing-cert", "host=tcp.example.com;key=explicit-key", nil, false, true, "", ""},
-		{"removed-plain-http", "host=tcp.example.com;plain-http", nil, false, true, "", ""},
+		{"ignored-plain-http", "host=tcp.example.com;plain-http", nil, true, false, "found-cert", "found-key"},
 		{"invalid-host", "host=../secret", nil, false, true, "", ""},
 		{"cli-host-rejected", "cert=cert;key=key", []string{"--host=tcp.example.com"}, false, true, "", ""},
 		{"no-host-no-lookup", "cert=cert;key=key", nil, false, false, "cert", "key"},

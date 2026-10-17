@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/url"
 	"strconv"
@@ -125,6 +126,12 @@ func parseConfig(args []string, getenv func(string) string, lookupACME func(stri
 				return c, errors.New("invalid PluginEnv options")
 			}
 			for name, values := range opts {
+				if f.Lookup(name) == nil && name != "scheme" && name != "tls" {
+					// Ignore host metadata, including repeated unknown keys. Neither
+					// names nor values are logged: a bare secret can look like a key.
+					log.Print("tcp-proxy: warning: ignoring unknown PluginEnv option")
+					continue
+				}
 				if len(values) != 1 {
 					return c, errors.New("duplicate PluginEnv option")
 				}
@@ -133,9 +140,6 @@ func parseConfig(args []string, getenv func(string) string, lookupACME func(stri
 				}
 				if name == "scheme" || name == "tls" {
 					continue
-				}
-				if f.Lookup(name) == nil {
-					return c, errors.New("unknown PluginEnv option")
 				}
 				if name == "host" {
 					sipHost = true

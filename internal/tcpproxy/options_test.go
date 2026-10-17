@@ -1,8 +1,10 @@
 package tcpproxy
 
 import (
+	"bytes"
 	"errors"
 	"flag"
+	"log"
 	"strings"
 	"testing"
 	"time"
@@ -52,6 +54,42 @@ func TestPluginEnvMappingAndPrecedence(t *testing.T) {
 	}
 	if _, err := ParseConfig([]string{"--server=false"}, getenv); err == nil {
 		t.Fatal("role conflict accepted")
+	}
+}
+
+func TestPluginEnvUnknownOptionsWarnAndPreserveKnownValidation(t *testing.T) {
+	var warnings bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&warnings)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	env := map[string]string{(string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_HOST"): "127.0.0.1", (string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_PORT"): "1081", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_HOST"): "example.com", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_PORT"): "443"}
+	getenv := func(k string) string { return env[k] }
+	for _, role := range []string{"", "server;"} {
+		env[(string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS")] = role + "token=secret;pool-size=3;transport=ws"
+		want, err := ParseConfig(nil, getenv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		warnings.Reset()
+		env[(string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS")] += ";__android_vpn;__android_vpn;future-option=private-value;bare-secret"
+		got, err := ParseConfig(nil, getenv)
+		if err != nil || got != want {
+			t.Fatalf("unknown metadata changed configuration: %v", err)
+		}
+		if strings.Count(warnings.String(), "warning: ignoring unknown PluginEnv option") != 3 {
+			t.Fatalf("missing warnings: %q", warnings.String())
+		}
+		for _, hidden := range []string{"secret", "private-value", "future-option", "__android_vpn"} {
+			if strings.Contains(warnings.String(), hidden) {
+				t.Fatal("option contents leaked into warning")
+			}
+		}
+	}
+	for _, invalid := range []string{"pool-size=bad", "pool-size=1;pool-size=2", "server=bad", "scheme=bad", "tls=bad", "remote=override"} {
+		env[(string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS")] = "__android_vpn;" + invalid
+		if _, err := ParseConfig(nil, getenv); err == nil {
+			t.Fatalf("unknown metadata bypassed validation for %q", invalid)
+		}
 	}
 }
 
@@ -166,8 +204,8 @@ func TestRemovedConnectionLimitsAreUnknown(t *testing.T) {
 				(string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS"): "token=secret;" + name + "=1",
 			}
 			_, err = ParseConfig(nil, func(k string) string { return env[k] })
-			if err == nil || !strings.Contains(err.Error(), "unknown PluginEnv option") {
-				t.Fatalf("removed PluginEnv option should be unknown: %v", err)
+			if err != nil {
+				t.Fatalf("removed PluginEnv option should be ignored: %v", err)
 			}
 		})
 	}
@@ -196,8 +234,8 @@ func TestH3StreamsPublicName(t *testing.T) {
 	}
 	env[(string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS")] = "token=secret;streams-per-transport=4"
 	_, err = ParseConfig(nil, func(k string) string { return env[k] })
-	if err == nil || !strings.Contains(err.Error(), "unknown PluginEnv option") {
-		t.Fatalf("old PluginEnv name should be unknown: %v", err)
+	if err != nil {
+		t.Fatalf("old PluginEnv name should be ignored: %v", err)
 	}
 }
 
@@ -272,7 +310,7 @@ func TestHTTPTimeoutPublicOption(t *testing.T) {
 		}
 		env := map[string]string{(string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_HOST"): "127.0.0.1", (string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_PORT"): "1081", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_HOST"): "example.com", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_PORT"): "443", (string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS"): "token=secret;" + name + "=1s"}
 		_, err = ParseConfig(nil, func(k string) string { return env[k] })
-		if err == nil || !strings.Contains(err.Error(), "unknown PluginEnv option") {
+		if err != nil {
 			t.Fatalf("removed PluginEnv %s: %v", name, err)
 		}
 	}
@@ -373,7 +411,7 @@ func TestPluginEnvSchemeAndTLSPrecedence(t *testing.T) {
 		{"transport=ws;scheme=http;scheme=https", "", true},
 		{"server;scheme=https", "", true},
 		{"server;tls=true", "", true},
-		{"plain-http", "", true},
+		{"plain-http", "https", false},
 	} {
 		t.Run(tc.options, func(t *testing.T) {
 			env := map[string]string{(string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_HOST"): "127.0.0.1", (string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_PORT"): "1081", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_HOST"): "network.example.com", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_PORT"): "443", (string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS"): "token=secret;host=identity.example.com;" + tc.options}
@@ -404,7 +442,7 @@ func TestPluginEnvSchemeAndTLSPrecedence(t *testing.T) {
 			env[(string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS")] += ";server"
 		}
 		_, err := ParseConfig(nil, func(k string) string { return env[k] })
-		if err == nil || !strings.Contains(err.Error(), "unknown PluginEnv option") {
+		if err != nil {
 			t.Fatalf("old plain-http server=%v: %v", server, err)
 		}
 	}

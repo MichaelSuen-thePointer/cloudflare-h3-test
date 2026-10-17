@@ -43,7 +43,7 @@ Options:
                                     explicit 0 keeps quic-go's field default
   --help                    show this help
 
-Durations require units, for example 5s. Unknown and duplicate options are rejected.
+Durations require units, for example 5s. Unknown CLI and duplicate known options are rejected.
 Server shares /: POST is H3, GET Upgrade is WS; ordinary authenticated GET returns 400.
 --path overrides only --transport's route.
 Connection counts and concurrent dials are limited by OS resources only.
