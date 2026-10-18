@@ -46,6 +46,16 @@ var _ MessageViewReader = (*WebSocketConn)(nil)
 type WebSocketSocketOptions struct {
 	SendBuffer    int
 	ReceiveBuffer int
+	// DisableWriteTimeout leaves established writes governed by connection
+	// closure only. Dial/upgrade cancellation remains independent.
+	DisableWriteTimeout bool
+}
+
+func (o WebSocketSocketOptions) writeTimeout(timeout time.Duration) time.Duration {
+	if o.DisableWriteTimeout {
+		return 0
+	}
+	return normalizeWebSocketWriteTimeout(timeout)
 }
 
 func DialWebSocket(ctx context.Context, rawURL, connectIP, token string, timeout time.Duration) (*WebSocketConn, error) {
@@ -142,7 +152,7 @@ func DialWebSocketWithOptions(ctx context.Context, rawURL, connectIP, token stri
 		conn.Close()
 		return nil, fmt.Errorf("bad websocket accept")
 	}
-	return &WebSocketConn{conn: conn, reader: br, mask: true, writeTimeout: normalizeWebSocketWriteTimeout(timeout)}, nil
+	return &WebSocketConn{conn: conn, reader: br, mask: true, writeTimeout: socketOptions.writeTimeout(timeout)}, nil
 }
 
 func AttachWebSocketSession(ctx context.Context, ws *WebSocketConn, sessionID string) (err error) {
@@ -260,7 +270,7 @@ func AcceptWebSocketWithOptions(w http.ResponseWriter, r *http.Request, socketOp
 		conn.Close()
 		return nil, err
 	}
-	return &WebSocketConn{conn: conn, reader: rw.Reader, mask: false, writeTimeout: DefaultWebSocketWriteTimeout}, nil
+	return &WebSocketConn{conn: conn, reader: rw.Reader, mask: false, writeTimeout: socketOptions.writeTimeout(DefaultWebSocketWriteTimeout)}, nil
 }
 
 func configureWebSocketSocket(conn net.Conn, options WebSocketSocketOptions) error {

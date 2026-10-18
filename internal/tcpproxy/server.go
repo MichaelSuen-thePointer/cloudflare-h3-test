@@ -247,7 +247,7 @@ func (s *tcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		setupDone := make(chan struct{})
 		setupTimer := time.AfterFunc(s.cfg.HTTPTimeout, func() { session.close(); close(setupDone) })
-		conn, err := relay.AcceptWebSocket(w, r)
+		conn, err := relay.AcceptWebSocketWithOptions(w, r, relay.WebSocketSocketOptions{DisableWriteTimeout: true})
 		if !setupTimer.Stop() {
 			<-setupDone
 		}

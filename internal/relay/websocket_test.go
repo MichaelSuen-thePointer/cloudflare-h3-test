@@ -34,6 +34,66 @@ func TestWebSocketProbeCancellation(t *testing.T) {
 	}
 }
 
+type writeDeadlineObserver struct {
+	net.Conn
+	deadlines []time.Time
+}
+
+func (c *writeDeadlineObserver) SetWriteDeadline(deadline time.Time) error {
+	c.deadlines = append(c.deadlines, deadline)
+	return c.Conn.SetWriteDeadline(deadline)
+}
+
+func TestWebSocketWriteTimeoutOption(t *testing.T) {
+	for _, disabled := range []bool{false, true} {
+		name := "default"
+		if disabled {
+			name = "disabled"
+		}
+		t.Run(name, func(t *testing.T) {
+			options := WebSocketSocketOptions{DisableWriteTimeout: disabled}
+			accepted := make(chan *WebSocketConn, 1)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				ws, err := AcceptWebSocketWithOptions(w, r, options)
+				if err != nil {
+					t.Errorf("accept: %v", err)
+				}
+				accepted <- ws
+			}))
+			defer srv.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			client, err := DialWebSocketWithOptions(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), "", "token", time.Second, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			server := <-accepted
+			if server == nil {
+				t.Fatal("server did not accept websocket")
+			}
+			defer server.Close()
+			for _, ws := range []*WebSocketConn{client, server} {
+				observed := &writeDeadlineObserver{Conn: ws.conn}
+				ws.conn = observed
+				if err := ws.WriteMessage([]byte("payload")); err != nil {
+					t.Fatal(err)
+				}
+				if err := ws.SendPing(); err != nil {
+					t.Fatal(err)
+				}
+				if disabled {
+					if len(observed.deadlines) != 0 {
+						t.Fatalf("disabled writes set deadlines: %v", observed.deadlines)
+					}
+				} else if len(observed.deadlines) != 4 || observed.deadlines[0].IsZero() || !observed.deadlines[1].IsZero() || observed.deadlines[2].IsZero() || !observed.deadlines[3].IsZero() {
+					t.Fatalf("default writes did not set and clear deadlines: %v", observed.deadlines)
+				}
+			}
+		})
+	}
+}
+
 func TestWebSocketAttachCancellationUnblocksWrite(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer serverConn.Close()

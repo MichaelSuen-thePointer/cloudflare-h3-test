@@ -203,7 +203,8 @@ func Main(args []string) {
 	})
 	defer recorder.Stop(2 * time.Second)
 	defer quality.InstallSIGTERM(recorder, func() { appLog.Warn("quality-stop-timeout") })()
-	wsSocketOptions := relay.WebSocketSocketOptions{SendBuffer: wsSocketSendBuffer, ReceiveBuffer: wsSocketReceiveBuffer}
+	// Established WS writes follow the connection lifecycle, without a per-write deadline.
+	wsSocketOptions := relay.WebSocketSocketOptions{SendBuffer: wsSocketSendBuffer, ReceiveBuffer: wsSocketReceiveBuffer, DisableWriteTimeout: true}
 	s := &server{quality: recorder, token: token, upstream: addr, benchEcho: benchEcho, idle: idle, udpBuffer: udpBuffer, downQueue: downQueue, batchSize: batchSize, batchDelay: batchDelay, wsSocketOptions: wsSocketOptions, downExpandLanesMax: downExpandLanesMax, downExpandHintTimeout: downExpandHintTimeout, metrics: metrics, sessions: map[string]*session{}}
 	go s.cleanupLoop()
 	if metricsBuild && metricsOut != "" {

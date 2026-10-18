@@ -71,7 +71,7 @@ func (d *wsDialer) Dial(ctx context.Context) (Carrier, error) {
 	d.cancelDials[id] = cancel
 	d.mu.Unlock()
 	defer func() { d.mu.Lock(); delete(d.cancelDials, id); d.mu.Unlock() }()
-	ws, err := relay.DialWebSocket(ctx, carrierURL(d.cfg), d.cfg.ConnectIP, d.cfg.Token, d.cfg.HTTPTimeout)
+	ws, err := relay.DialWebSocketWithOptions(ctx, carrierURL(d.cfg), d.cfg.ConnectIP, d.cfg.Token, d.cfg.HTTPTimeout, relay.WebSocketSocketOptions{DisableWriteTimeout: true})
 	if err != nil {
 		return nil, err
 	}

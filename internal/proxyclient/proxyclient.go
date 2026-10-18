@@ -260,7 +260,8 @@ func Main(args []string) {
 	})
 	defer recorder.Stop(2 * time.Second)
 	defer quality.InstallSIGTERM(recorder, func() { appLog.Warn("quality-stop-timeout") })()
-	wsSocketOptions := relay.WebSocketSocketOptions{SendBuffer: wsSocketSendBuffer, ReceiveBuffer: wsSocketReceiveBuffer}
+	// Acquisition/Attach retain their context budget; established writes have no deadline.
+	wsSocketOptions := relay.WebSocketSocketOptions{SendBuffer: wsSocketSendBuffer, ReceiveBuffer: wsSocketReceiveBuffer, DisableWriteTimeout: true}
 	state := &clientState{quality: recorder, transport: transport, laneTarget: lanesN, lanesIncremental: lanesIncremental, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, idle: idle, udp: udp, sessions: map[netip.AddrPort]*session{}, stats: stats, metrics: metrics}
 	if transport == "ws" {
 		state.provider = newWSProvider(remote, connectIP, token, poolSize, timeout, wsSocketOptions, metrics, recorder)
