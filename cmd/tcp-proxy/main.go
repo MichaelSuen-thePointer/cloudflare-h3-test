@@ -35,7 +35,7 @@ Options:
   --pool-size N             ready standby target (default 2; 0 means on demand)
   --ping-interval DURATION   standby PING / active send-idle interval (default 10s)
   --http-timeout DURATION    carrier setup / local accept through OPEN_OK (default 15s)
-  --h3-streams-per-transport N  H3 streams per QUIC transport (default 2)
+  --h3-streams-per-transport N  H3 streams per QUIC transport (default 10)
   --quic-initial-stream-window BYTES (default 6291456: 6 MiB)
   --quic-max-stream-window BYTES     (default 16777216: 16 MiB)
   --quic-initial-conn-window BYTES   (default 15728640: 15 MiB)
