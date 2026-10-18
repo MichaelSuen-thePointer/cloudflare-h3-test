@@ -20,7 +20,7 @@ func TestConfigDefaultsAndPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Server || c.Transport != TransportH3 || c.Path != DefaultH3Path || c.PoolSize != 2 || c.PingInterval != 10*time.Second || c.StreamsPerTransport != 10 {
+	if c.Server || c.Transport != TransportH3 || c.Path != DefaultH3Path || c.PoolSize != 10 || c.PingInterval != 10*time.Second || c.StreamsPerTransport != 2 {
 		t.Fatalf("unexpected defaults: %#v", c)
 	}
 	c, err = ParseConfig([]string{"--server", "--listen=:443", "--upstream=127.0.0.1:8388", "--token=secret", "--cert=cert.pem", "--key=key.pem"}, nil)
@@ -274,8 +274,8 @@ func TestH3DefaultsAndWindowOverrides(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if c.QUICWindows != tc.want || c.StreamsPerTransport != 10 {
-					t.Fatalf("windows=%+v streams=%d; want windows=%+v streams=10", c.QUICWindows, c.StreamsPerTransport, tc.want)
+				if c.QUICWindows != tc.want || c.StreamsPerTransport != 2 {
+					t.Fatalf("windows=%+v streams=%d; want windows=%+v streams=2", c.QUICWindows, c.StreamsPerTransport, tc.want)
 				}
 			})
 		}

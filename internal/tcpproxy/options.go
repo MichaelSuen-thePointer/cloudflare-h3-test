@@ -17,9 +17,9 @@ import (
 )
 
 func DefaultConfig() Config {
-	return Config{Transport: TransportH3, Token: "change-me-token", PoolSize: 2, PingInterval: 10 * time.Second, LogLevel: "info",
+	return Config{Transport: TransportH3, Token: "change-me-token", PoolSize: 10, PingInterval: 10 * time.Second, LogLevel: "info",
 		HTTPTimeout:         15 * time.Second,
-		StreamsPerTransport: 10,
+		StreamsPerTransport: 2,
 		QUICWindows:         relay.QUICReceiveWindows{InitialStream: 6 << 20, MaxStream: 16 << 20, InitialConnection: 15 << 20, MaxConnection: 24 << 20}}
 }
 
