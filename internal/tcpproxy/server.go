@@ -137,8 +137,8 @@ func RunServer(ctx context.Context, cfg Config) error {
 	}
 	state := newTCPServer(cfg)
 	server := &http.Server{Handler: state, ErrorLog: cfg.httpErrorLogger(), ReadHeaderTimeout: cfg.HTTPTimeout, BaseContext: func(net.Listener) context.Context { return ctx }}
-	cfg.logInfo("http", "tcp-process-start", "listen", ln.Addr().String())
-	defer cfg.logInfo("http", "tcp-process-stop")
+	cfg.LogInfo("tcp-process-start", "listen", ln.Addr().String())
+	defer cfg.LogInfo("tcp-process-stop")
 	done := make(chan struct{})
 	watcherDone := make(chan struct{})
 	go func() {
@@ -217,10 +217,10 @@ func (s *tcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// The session is fully closed and no session/controller locks are held
 		// while the potentially blocking diagnostic sink is used.
 		if !canceled && failure != nil {
-			s.cfg.logFailure(transport, failureStage, failure, "session", session.id, "remote", r.RemoteAddr)
+			s.cfg.logFailure(transport, failureStage, failure, "session", session.id)
 		}
 		if created {
-			s.cfg.logDebug(transport, "tcp-connection-close", "session", session.id, "remote", r.RemoteAddr)
+			s.cfg.logDebug("tcp-connection-close", "session", session.id)
 		}
 		s.wg.Done()
 	}()
@@ -271,7 +271,7 @@ func (s *tcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if ws {
 		created = true
-		s.cfg.logDebug(transport, "tcp-connection-create", "session", session.id, "remote", r.RemoteAddr)
+		s.cfg.logDebug("tcp-connection-create", "session", session.id)
 	}
 	if !ws {
 		w.Header().Set("Content-Type", "application/octet-stream")
@@ -282,7 +282,7 @@ func (s *tcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		created = true
-		s.cfg.logDebug(transport, "tcp-connection-create", "session", session.id, "remote", r.RemoteAddr)
+		s.cfg.logDebug("tcp-connection-create", "session", session.id)
 	}
 	reader := newRecordReader(carrier)
 	writer := newRecordWriter(carrier, nil, false)
@@ -334,7 +334,7 @@ opened:
 		fail("open-ok-write", err)
 		return
 	}
-	s.cfg.logDebug(transport, "tcp-connection-ready", "session", session.id, "remote", r.RemoteAddr)
+	s.cfg.logDebug("tcp-connection-ready", "session", session.id)
 	if err := s.relayRecords(session.ctx, carrier, upstream, reader, writer, stopAndJoinRequest); err != nil {
 		fail("relay-records", err)
 	}

@@ -60,8 +60,13 @@ func TestServerLogsActualCarrierLifecycleAfterCleanup(t *testing.T) {
 					t.Fatalf("event %s: %s", event, logs)
 				}
 			}
-			if strings.Count(logs, "transport: "+transport) != 3 || strings.Contains(logs, "[WARN]") {
+			if strings.Contains(logs, "[WARN]") {
 				t.Fatalf("incorrect lifecycle: %s", logs)
+			}
+			for _, field := range []string{"role:", "transport:", "remote:"} {
+				if strings.Contains(logs, field) {
+					t.Fatalf("redundant field %s: %s", field, logs)
+				}
 			}
 			if len(state.sessions) != 0 {
 				t.Fatal("session survived close log")

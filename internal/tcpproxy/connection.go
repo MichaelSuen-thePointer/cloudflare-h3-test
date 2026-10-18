@@ -11,12 +11,12 @@ import (
 
 func runClientConnection(life, acquire context.Context, cancelAcquire context.CancelFunc, cfg Config, p *standbyPool, local net.Conn) error {
 	id := newSessionID()
-	cfg.logDebug(cfg.Transport, "tcp-connection-create", "session", id, "local", local.LocalAddr(), "peer", local.RemoteAddr())
+	cfg.logDebug("tcp-connection-create", "session", id)
 	err := runClientSession(life, acquire, cancelAcquire, cfg, p, local, id)
 	if life.Err() == nil && err != nil && !errors.Is(err, context.Canceled) {
-		cfg.logFailure(cfg.Transport, "connection", err, "session", id, "local", local.LocalAddr(), "peer", local.RemoteAddr())
+		cfg.logFailure(cfg.Transport, "connection", err, "session", id)
 	}
-	cfg.logDebug(cfg.Transport, "tcp-connection-close", "session", id, "local", local.LocalAddr(), "peer", local.RemoteAddr())
+	cfg.logDebug("tcp-connection-close", "session", id)
 	return err
 }
 
@@ -153,7 +153,7 @@ func runClientSession(life, acquire context.Context, cancelAcquire context.Cance
 		}
 		return handshakeErr
 	}
-	cfg.logDebug(cfg.Transport, "tcp-connection-ready", "session", id, "local", local.LocalAddr(), "peer", local.RemoteAddr())
+	cfg.logDebug("tcp-connection-ready", "session", id)
 	cancelAcquire() // callback has been stopped and joined; active has no acquire deadline.
 	down := make(chan error, 1)
 	go func() {

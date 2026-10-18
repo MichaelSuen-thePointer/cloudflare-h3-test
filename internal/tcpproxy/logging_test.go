@@ -17,7 +17,7 @@ func TestTCPLoggingFailureFormatRateAndRedaction(t *testing.T) {
 	cfg.Token = "private-token"
 	err := errors.New("private-token https://user:password@example.com/path-private-token?q=hidden#fragment\nforged")
 	for i := 0; i < 20; i++ {
-		cfg.logFailure("h3", "transfer", err, "session", newSessionID(), "peer", "abc\nforged, role: server")
+		cfg.logFailure("h3", "transfer", err, "session", newSessionID(), "detail", "abc\nforged")
 	}
 	text := out.String()
 	if strings.Count(text, "[WARN] tcp-connection-failed") != 10 || strings.Count(text, "\n") != 10 {
@@ -28,12 +28,12 @@ func TestTCPLoggingFailureFormatRateAndRedaction(t *testing.T) {
 			t.Fatalf("leaked %s: %s", secret, text)
 		}
 	}
-	for _, expected := range []string{`"[REDACTED] [REDACTED-URL]\nforged"`, "role: client, transport: h3, stage: transfer", `peer: "abc\nforged, role: server"`} {
+	for _, expected := range []string{`"[REDACTED] [REDACTED-URL]\nforged"`, "stage: transfer, session:", `detail: "abc\nforged"`} {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("missing %q: %s", expected, text)
 		}
 	}
-	for _, unwanted := range []string{"cause:", "direction:", "op:"} {
+	for _, unwanted := range []string{"cause:", "direction:", "op:", "role:", "transport:", "local:", "peer:"} {
 		if strings.Contains(text, unwanted) {
 			t.Fatalf("unexpected inferred field %s: %s", unwanted, text)
 		}
@@ -58,13 +58,13 @@ func TestTCPLoggingPreservesOriginalError(t *testing.T) {
 func TestTCPLoggingDebugLevel(t *testing.T) {
 	var out bytes.Buffer
 	cfg := DefaultConfig().WithLogger(diaglog.NewWriter(diaglog.Info, &out))
-	cfg.logDebug("h3", "tcp-connection-create")
+	cfg.logDebug("tcp-connection-create")
 	if out.Len() != 0 {
 		t.Fatal("debug visible at info")
 	}
 	cfg.logger.SetLevel(diaglog.Debug)
-	cfg.logDebug("h3", "tcp-connection-create", "peer", "hello\nworld")
-	if strings.Count(out.String(), "\n") != 1 || !strings.Contains(out.String(), `peer: "hello\nworld"`) || !strings.Contains(out.String(), "[DEBUG] tcp-connection-create role: client, transport: h3") {
+	cfg.logDebug("tcp-connection-create", "session", uint64(42))
+	if !strings.HasSuffix(out.String(), "[DEBUG] tcp-connection-create session: 42\n") {
 		t.Fatal(out.String())
 	}
 }

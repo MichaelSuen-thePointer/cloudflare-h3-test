@@ -68,6 +68,11 @@ func TestTCPClientLifecycleLogBoundaries(t *testing.T) {
 				t.Fatal(err)
 			}
 			text := logs.String()
+			for _, field := range []string{"role:", "transport:", "local:", "peer:"} {
+				if strings.Contains(text, field) {
+					t.Fatalf("redundant field %s: %s", field, text)
+				}
+			}
 			if tc.level == diaglog.Info {
 				if text != "" {
 					t.Fatalf("normal INFO output: %s", text)

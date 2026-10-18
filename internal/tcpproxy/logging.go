@@ -53,7 +53,7 @@ func (c Config) initLogger(stderr io.Writer, useSyslog func(*diaglog.Logger, str
 // EmitConfigWarnings emits only a count, never unknown option keys or values.
 func (c Config) EmitConfigWarnings() {
 	if c.unknownOptions > 0 {
-		c.logger.Warn("tcp-unknown-PluginEnv-options", "role", c.role(), "count", c.unknownOptions)
+		c.logger.Warn("tcp-unknown-PluginEnv-options", "count", c.unknownOptions)
 	}
 }
 func (c Config) CloseLogger() { _ = c.logger.Close() }
@@ -67,22 +67,22 @@ func (c Config) logFailure(transport, stage string, err error, fields ...any) {
 	if err == nil || !c.logger.Enabled(diaglog.Warn) {
 		return
 	}
-	kv := c.mergeFields([]any{"err", c.redact(err.Error()), "role", c.role(), "transport", transport, "stage", stage}, fields)
+	kv := c.mergeFields([]any{"err", c.redact(err.Error()), "stage", stage}, fields)
 	c.logger.WarnRate(c.role()+"/"+transport+"/"+stage, 10*time.Second, "tcp-connection-failed", kv...)
 }
-func (c Config) logDebug(transport, event string, fields ...any) {
+func (c Config) logDebug(event string, fields ...any) {
 	if !c.logger.Enabled(diaglog.Debug) {
 		return
 	}
-	c.logger.Debug(event, c.mergeFields([]any{"role", c.role(), "transport", transport}, fields)...)
+	c.logger.Debug(event, c.mergeFields(nil, fields)...)
 }
 
 // LogInfo and LogError share TCP field escaping/redaction with connection logs.
 func (c Config) LogInfo(event string, fields ...any) {
-	c.logger.Info(event, c.mergeFields([]any{"role", c.role()}, fields)...)
+	c.logger.Info(event, c.mergeFields(nil, fields)...)
 }
 func (c Config) LogError(event string, err error, fields ...any) {
-	kv := []any{"err", c.redact(err.Error()), "role", c.role()}
+	kv := []any{"err", c.redact(err.Error())}
 	c.logger.Error(event, c.mergeFields(kv, fields)...)
 }
 
@@ -126,16 +126,13 @@ func initRuntimeLogger(c Config) (Config, func(), error) {
 	}
 	return initialized, initialized.CloseLogger, nil
 }
-func (c Config) logInfo(transport, event string, fields ...any) {
-	c.logger.Info(event, c.mergeFields([]any{"role", c.role(), "transport", transport}, fields)...)
-}
 
 type httpLogWriter struct{ cfg Config }
 
 func (w httpLogWriter) Write(p []byte) (int, error) {
 	message := strings.TrimSpace(string(p))
 	if message != "" {
-		w.cfg.logger.WarnRate("http-server-error", 10*time.Second, "tcp-http-server-error", "err", w.cfg.redact(message), "role", w.cfg.role())
+		w.cfg.logger.WarnRate("http-server-error", 10*time.Second, "tcp-http-server-error", "err", w.cfg.redact(message))
 	}
 	return len(p), nil
 }

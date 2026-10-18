@@ -32,8 +32,8 @@ func RunClient(ctx context.Context, cfg Config) error {
 
 // runClient takes ownership of listener and dialer, including on failure.
 func runClient(ctx context.Context, cfg Config, l net.Listener, d CarrierDialer) error {
-	cfg.logInfo(cfg.Transport, "tcp-process-start", "local", l.Addr().String())
-	defer cfg.logInfo(cfg.Transport, "tcp-process-stop", "local", l.Addr().String())
+	cfg.LogInfo("tcp-process-start")
+	defer cfg.LogInfo("tcp-process-stop")
 	life, cancel := context.WithCancel(ctx)
 	defer cancel()
 	p := newStandbyPool(life, cfg, d)
