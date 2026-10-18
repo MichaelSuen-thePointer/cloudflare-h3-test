@@ -20,7 +20,7 @@ const (
 	ControlOpen        uint16 = 0xffff
 	ControlOpenOK      uint16 = ControlOpen // direction determines OPEN or OPEN_OK
 	MaxRecordSize             = 64 << 10
-	MaxRecordPayload          = MaxRecordSize - 2
+	MaxRecordPayload          = MaxRecordSize - 6
 	CopyBufferSize            = 32 << 10
 )
 

@@ -34,7 +34,7 @@ func TestServerLogsActualCarrierLifecycleAfterCleanup(t *testing.T) {
 			state := newTCPServer(cfg)
 			state.dialUpstream = func(context.Context, string, string) (net.Conn, error) { return serverEOFUpstream{}, nil }
 			if transport == TransportH3 {
-				req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(testV2Control(ControlOpen)))
+				req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(testServerOpen(openParams{})))
 				req.ProtoMajor = 2
 				req.Header.Set("X-Relay-Token", cfg.Token)
 				state.ServeHTTP(httptest.NewRecorder(), req)
@@ -46,7 +46,7 @@ func TestServerLogsActualCarrierLifecycleAfterCleanup(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer ws.Close()
-				if err := ws.WriteMessage(testV2Control(ControlOpen)); err != nil {
+				if err := ws.WriteMessage(testServerOpen(openParams{})); err != nil {
 					t.Fatal(err)
 				}
 				if _, err := ws.ReadMessage(); err != nil {
@@ -118,7 +118,7 @@ func TestServerFailurePreservesErrorAndSessionID(t *testing.T) {
 	state.dialUpstream = func(context.Context, string, string) (net.Conn, error) {
 		return nil, errors.New("distinct upstream failure detail")
 	}
-	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(testV2Control(ControlOpen)))
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(testServerOpen(openParams{})))
 	req.ProtoMajor = 2
 	req.Header.Set("X-Relay-Token", state.cfg.Token)
 	state.ServeHTTP(httptest.NewRecorder(), req)
@@ -176,7 +176,7 @@ func TestServerCanceledSessionDoesNotWarn(t *testing.T) {
 		<-dialCtx.Done()
 		return nil, errors.New("concurrent upstream failure")
 	}
-	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(testV2Control(ControlOpen))).WithContext(ctx)
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(testServerOpen(openParams{}))).WithContext(ctx)
 	req.ProtoMajor = 2
 	req.Header.Set("X-Relay-Token", cfg.Token)
 	state.ServeHTTP(httptest.NewRecorder(), req)
@@ -248,7 +248,7 @@ func TestServerHTTP2NormalEOFCompletesWithoutWarning(t *testing.T) {
 	if response.ProtoMajor != 2 {
 		t.Fatalf("expected HTTP2: %s", response.Proto)
 	}
-	if _, err := uploadWriter.Write(testV2Control(ControlOpen)); err != nil {
+	if _, err := uploadWriter.Write(testServerOpen(openParams{})); err != nil {
 		t.Fatal(err)
 	}
 	wire, err := io.ReadAll(response.Body)

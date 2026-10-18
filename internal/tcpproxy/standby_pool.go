@@ -45,25 +45,27 @@ func (t realClientPingTimer) Reset(d time.Duration)  { t.Timer.Reset(d) }
 func (t realClientPingTimer) Stop()                  { t.Timer.Stop() }
 
 type standbyEntry struct {
-	pool        *standbyPool
-	stream      Carrier
-	reader      *recordReader
-	writer      *recordWriter
-	phase       entryPhase         // pool.mu
-	openStarted bool               // pool.mu
-	ownerCancel context.CancelFunc // pool.mu
-	pingCancel  context.CancelFunc
-	pingDone    chan struct{}
-	pingTimer   clientPingTimer
-	readDone    chan struct{}
-	ack         chan error
-	failed      chan struct{}
-	failure     error // immutable after failed closes
-	faultOnce   sync.Once
-	closeOnce   sync.Once
-	joinOnce    sync.Once
-	stopLife    func() bool
-	lifeDone    chan struct{}
+	pool                  *standbyPool
+	stream                Carrier
+	reader                *recordReader
+	writer                *recordWriter
+	phase                 entryPhase         // pool.mu
+	openParams            openParams         // connection owner; set before OPEN write
+	downstreamSequenceSet bool               // connection owner, after readDone
+	openStarted           bool               // pool.mu
+	ownerCancel           context.CancelFunc // pool.mu
+	pingCancel            context.CancelFunc
+	pingDone              chan struct{}
+	pingTimer             clientPingTimer
+	readDone              chan struct{}
+	ack                   chan error
+	failed                chan struct{}
+	failure               error // immutable after failed closes
+	faultOnce             sync.Once
+	closeOnce             sync.Once
+	joinOnce              sync.Once
+	stopLife              func() bool
+	lifeDone              chan struct{}
 }
 
 func newStandbyPool(life context.Context, cfg Config, d CarrierDialer) *standbyPool {
@@ -249,10 +251,20 @@ func (e *standbyEntry) pingLoop(ctx context.Context) {
 		timer.Reset(next)
 	}
 }
-func (e *standbyEntry) writeControl(ctx context.Context, header uint16) error {
+
+// initializeDownstreamSequence runs only after the ACK reader has joined. The
+// same connection owner calls it for active handoff and early upload-EOF drain.
+func (e *standbyEntry) initializeDownstreamSequence() {
+	if !e.downstreamSequenceSet {
+		e.reader.SetSequence(e.openParams.ServerInitial)
+		e.downstreamSequenceSet = true
+	}
+}
+func (e *standbyEntry) writeOpen(ctx context.Context, params openParams) error {
+	e.openParams = params
 	joined := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() { e.abort(); close(joined) })
-	err := e.writer.WriteControl(header)
+	err := e.writer.WriteOpen(params)
 	if !stop() {
 		<-joined
 	}

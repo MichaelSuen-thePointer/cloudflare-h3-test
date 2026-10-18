@@ -3,6 +3,7 @@ package tcpproxy
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"time"
@@ -16,12 +17,17 @@ var (
 )
 
 // recordReader has exactly one owner. DATA may be read in fragments; controls
-// are delivered only at record boundaries. The v2 wire uses fixed LittleEndian.
+// are delivered only at record boundaries. All wire integers are LittleEndian.
 type recordReader struct {
 	r         io.Reader
 	remaining int
 	err       error
 	header    [2]byte
+	buf       []byte
+	offset    int
+	loaded    bool
+	next      uint32
+	open      bool
 }
 
 func newRecordReader(r io.Reader) *recordReader { return &recordReader{r: r} }
@@ -29,6 +35,9 @@ func newRecordReader(r io.Reader) *recordReader { return &recordReader{r: r} }
 // Err returns the terminal decoder error, including a normal boundary EOF.
 // Call only from its owner, or after joining the sole reader goroutine.
 func (r *recordReader) Err() error { return r.err }
+
+// SetSequence initializes the expected DATA sequence before its owner reads DATA.
+func (r *recordReader) SetSequence(sequence uint32) { r.next = sequence }
 
 func (r *recordReader) ReadHeader() (uint16, error) {
 	if r.err != nil {
@@ -43,8 +52,14 @@ func (r *recordReader) ReadHeader() (uint16, error) {
 		return 0, err
 	}
 	header := binary.LittleEndian.Uint16(r.header[:])
-	if header > 0 && header < ControlOpen {
+	r.open = header == ControlOpen
+	if header > MaxRecordPayload && header != ControlOpen {
+		r.err = fmt.Errorf("%w: reserved header %d", errRecordControl, header)
+		return 0, r.err
+	}
+	if header > 0 && header <= MaxRecordPayload {
 		r.remaining = int(header)
+		r.loaded = false
 	}
 	return header, nil
 }
@@ -59,22 +74,37 @@ func (r *recordReader) ReadPayload(p []byte) (int, error) {
 	if r.remaining == 0 {
 		return 0, errRecordNoPayload
 	}
-	if len(p) > r.remaining {
-		p = p[:r.remaining]
-	}
-	n, err := r.r.Read(p)
-	if n < 0 || n > len(p) {
-		r.err = errors.New("invalid record reader byte count")
-		return 0, r.err
-	}
-	r.remaining -= n
-	if err != nil {
-		if errors.Is(err, io.EOF) && r.remaining != 0 {
-			err = io.ErrUnexpectedEOF
+	if !r.loaded {
+		if r.buf == nil {
+			r.buf = make([]byte, MaxRecordSize)
 		}
-		r.err = err
+		// Collect and validate the whole frame before exposing even one byte.
+		body := r.buf[:4+r.remaining]
+		if err := readRequired(r.r, body); err != nil {
+			r.err = err
+			return 0, err
+		}
+		sequence := binary.LittleEndian.Uint32(body[:4])
+		if sequence != r.next {
+			r.err = fmt.Errorf("%w: DATA sequence %d, expected %d", errRecordControl, sequence, r.next)
+			return 0, r.err
+		}
+		r.next++
+		r.offset = 4
+		r.loaded = true
 	}
-	return n, err
+	n := copy(p, r.buf[r.offset:r.offset+r.remaining])
+	r.offset += n
+	r.remaining -= n
+	return n, nil
+}
+
+func readRequired(r io.Reader, p []byte) error {
+	_, err := io.ReadFull(r, p)
+	if errors.Is(err, io.EOF) {
+		return io.ErrUnexpectedEOF
+	}
+	return err
 }
 
 // ReadData returns bytes from at most one DATA record. onControl validates
@@ -116,6 +146,7 @@ type recordWriter struct {
 	stopped   bool
 	err       error
 	buf       []byte
+	next      uint32
 }
 
 func newRecordWriter(w io.Writer, flush func() error, trackSend bool) *recordWriter {
@@ -147,8 +178,12 @@ func (w *recordWriter) writeLocked(header uint16, payload []byte) (int, error) {
 	if err := w.writableLocked(); err != nil {
 		return 0, err
 	}
-	size := 2 + len(payload)
-	if cap(w.buf) < size {
+	prefix := 2
+	if len(payload) != 0 {
+		prefix = 6
+	}
+	size := prefix + len(payload)
+	if cap(w.buf) < size || (len(payload) != 0 && cap(w.buf) < MaxRecordSize) {
 		capacity := 2
 		if len(payload) != 0 {
 			capacity = MaxRecordSize
@@ -159,7 +194,18 @@ func (w *recordWriter) writeLocked(header uint16, payload []byte) (int, error) {
 	}
 	w.buf = w.buf[:size]
 	binary.LittleEndian.PutUint16(w.buf[:2], header)
-	copy(w.buf[2:], payload)
+	if prefix == 6 {
+		binary.LittleEndian.PutUint32(w.buf[2:6], w.next)
+		w.next++
+	}
+	copy(w.buf[prefix:], payload)
+	return w.writeBufferLocked(prefix)
+}
+
+// writeBufferLocked writes a prepared record. Metadata never contributes to the
+// returned application payload count, including partially written records.
+func (w *recordWriter) writeBufferLocked(prefix int) (int, error) {
+	size := len(w.buf)
 	written := 0
 	var err error
 	for written < size {
@@ -178,7 +224,7 @@ func (w *recordWriter) writeLocked(header uint16, payload []byte) (int, error) {
 			break
 		}
 	}
-	count := written - 2
+	count := written - prefix
 	if count < 0 {
 		count = 0
 	}
@@ -193,6 +239,13 @@ func (w *recordWriter) writeLocked(header uint16, payload []byte) (int, error) {
 		w.lastSend = w.now()
 	}
 	return count, nil
+}
+
+// SetSequence initializes the outgoing DATA sequence under the writer lock.
+func (w *recordWriter) SetSequence(sequence uint32) {
+	w.mu.Lock()
+	w.next = sequence
+	w.mu.Unlock()
 }
 
 func (w *recordWriter) Write(p []byte) (int, error) {
