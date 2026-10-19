@@ -38,7 +38,6 @@ type Config struct {
 	DialHost            string
 	Path                string
 	Token               string
-	CAFile              string
 	CertFile            string
 	KeyFile             string
 	PoolSize            int

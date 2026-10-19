@@ -570,10 +570,7 @@ func TestH3ManagerPacksStreamsWithoutTotalCountLimit(t *testing.T) {
 	cfg := carrierTestConfig()
 	cfg.Remote = "https://127.0.0.1"
 	cfg.StreamsPerTransport = 2
-	m, err := newH3Manager(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	m := newH3Manager(cfg)
 	defer m.Close()
 	slots := make([]*h3Slot, 300)
 	for i := range slots {
@@ -654,17 +651,9 @@ func localH3Dialer(t *testing.T, handler http.Handler) *h3Dialer {
 	srv := &http3.Server{TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}}, Handler: handler}
 	go srv.Serve(packet)
 	t.Cleanup(func() { srv.Close(); packet.Close() })
-	ca := filepath.Join(t.TempDir(), "root.pem")
-	if err := os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]}), 0600); err != nil {
-		t.Fatal(err)
-	}
 	cfg := carrierTestConfig()
 	cfg.Remote = "https://" + packet.LocalAddr().String()
-	cfg.CAFile = ca
-	m, err := newH3Manager(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	m := newH3Manager(cfg)
 	d := &h3Dialer{cfg: cfg, manager: m}
 	t.Cleanup(func() { d.Close() })
 	return d

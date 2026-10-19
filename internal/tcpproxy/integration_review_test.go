@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -15,8 +14,6 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
-	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -27,7 +24,7 @@ import (
 
 // This is a local two-hop integration fixture, not a Cloudflare deployment:
 // real QUIC/H3 terminates at an edge proxy which streams to a real HTTP/2 origin.
-func reviewH3Edge(t *testing.T, originHandler http.Handler) (string, string, *atomic.Int32) {
+func reviewH3Edge(t *testing.T, originHandler http.Handler) (string, *atomic.Int32) {
 	t.Helper()
 	var originHTTP2 atomic.Int32
 	origin := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -74,11 +71,7 @@ func reviewH3Edge(t *testing.T, originHandler http.Handler) (string, string, *at
 		_ = packet.Close()
 		<-edgeDone
 	})
-	ca := filepath.Join(t.TempDir(), "edge-ca.pem")
-	if err := os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: origin.Certificate().Raw}), 0600); err != nil {
-		t.Fatal(err)
-	}
-	return "https://" + packet.LocalAddr().String(), ca, &originHTTP2
+	return "https://" + packet.LocalAddr().String(), &originHTTP2
 }
 
 type reviewUploadKey struct{}
@@ -206,7 +199,7 @@ func TestReviewRealClientsH3ToHTTP2AndWebSocket(t *testing.T) {
 				state := newTCPServer(serverCfg)
 				var requests *atomic.Int32
 				if transport == TransportH3 {
-					cfg.Remote, cfg.CAFile, requests = reviewH3Edge(t, state)
+					cfg.Remote, requests = reviewH3Edge(t, state)
 				} else {
 					origin := httptest.NewServer(state)
 					t.Cleanup(origin.Close)
@@ -275,7 +268,7 @@ func TestReviewServerFirstTailAcrossH3HTTP2(t *testing.T) {
 	serverCfg := cfg
 	serverCfg.Upstream = upstream
 	state := newTCPServer(serverCfg)
-	cfg.Remote, cfg.CAFile, _ = reviewH3Edge(t, state)
+	cfg.Remote, _ = reviewH3Edge(t, state)
 	t.Cleanup(state.shutdown)
 	address := reviewStartClient(t, cfg)
 	c, err := net.DialTimeout("tcp", address, time.Second)
@@ -311,7 +304,7 @@ func TestReviewUploadEOFReachesFixedUpstream(t *testing.T) {
 			serverCfg.Upstream = upstream
 			state := newTCPServer(serverCfg)
 			if transport == TransportH3 {
-				cfg.Remote, cfg.CAFile, _ = reviewH3Edge(t, state)
+				cfg.Remote, _ = reviewH3Edge(t, state)
 			} else {
 				origin := httptest.NewServer(state)
 				t.Cleanup(origin.Close)
@@ -423,7 +416,7 @@ func TestReviewH3ActivePingReachesOriginWithoutLeakingToSS(t *testing.T) {
 			serverCfg.Upstream = upstream
 			state := newTCPServer(serverCfg)
 			var pings atomic.Int32
-			cfg.Remote, cfg.CAFile, _ = reviewH3Edge(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			cfg.Remote, _ = reviewH3Edge(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				r.Body = &reviewRecordBody{ReadCloser: r.Body, pings: &pings}
 				state.ServeHTTP(w, r)
 			}))

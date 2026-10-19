@@ -63,11 +63,7 @@ func NewCarrierDialer(cfg Config) (CarrierDialer, error) {
 	if cfg.Transport == TransportWebSocket {
 		return &wsDialer{cfg: cfg}, nil
 	}
-	m, err := newH3Manager(cfg)
-	if err != nil {
-		return nil, err
-	}
-	return &h3Dialer{cfg: cfg, manager: m}, nil
+	return &h3Dialer{cfg: cfg, manager: newH3Manager(cfg)}, nil
 }
 
 type h3Dialer struct {

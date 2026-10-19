@@ -15,6 +15,20 @@ func clientArgs(extra ...string) []string {
 	return append([]string{"--listen=127.0.0.1:1081", "--remote=https://example.com", "--token=secret"}, extra...)
 }
 
+func TestRemovedCAOption(t *testing.T) {
+	for _, transport := range []string{TransportH3, TransportWebSocket} {
+		_, err := ParseConfig(clientArgs("--transport="+transport, "--ca=removed.pem"), nil)
+		if err == nil || !strings.Contains(err.Error(), "unknown command-line option") {
+			t.Fatalf("removed CA CLI option for %s: %v", transport, err)
+		}
+		env := map[string]string{(string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_HOST"): "127.0.0.1", (string(rune('R'+1)) + string(rune('R'+1)) + "_LOCAL_PORT"): "1081", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_HOST"): "example.com", (string(rune('R'+1)) + string(rune('R'+1)) + "_REMOTE_PORT"): "443", (string(rune('R'+1)) + string(rune('R'+1)) + "_PLUGIN_OPTIONS"): "transport=" + transport + ";ca=removed.pem"}
+		cfg, err := ParseConfig(nil, func(key string) string { return env[key] })
+		if err != nil || cfg.unknownOptions != 1 {
+			t.Fatalf("removed CA PluginEnv option for %s: warnings=%d err=%v", transport, cfg.unknownOptions, err)
+		}
+	}
+}
+
 func TestConfigDefaultsAndPaths(t *testing.T) {
 	c, err := ParseConfig(clientArgs(), nil)
 	if err != nil {

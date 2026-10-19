@@ -30,7 +30,6 @@ Options:
   --connect-ip IP           literal network IP override; certificate checks remain enabled
   --path PATH               carrier path (default / for both carriers)
   --token TOKEN             X-Relay-Token value (default change-me-token; empty rejected)
-  --ca FILE                 additional H3 client CA certificates
   --cert FILE --key FILE    server TLS certificate and key
   --pool-size N             ready standby target (default 10; 0 means on demand)
   --ping-interval DURATION   standby PING / active send-idle interval (default 10s)

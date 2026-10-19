@@ -43,7 +43,7 @@ func parseConfig(args []string, getenv func(string) string, lookupACME func(stri
 	}{
 		{"transport", &c.Transport}, {"listen", &c.Listen}, {"remote", &c.Remote}, {"upstream", &c.Upstream},
 		{"host", &c.Host}, {"connect-ip", &c.ConnectIP}, {"path", &c.Path}, {"token", &c.Token},
-		{"ca", &c.CAFile}, {"cert", &c.CertFile}, {"key", &c.KeyFile},
+		{"cert", &c.CertFile}, {"key", &c.KeyFile},
 	} {
 		f.StringVar(p.dst, p.name, *p.dst, p.name)
 	}
@@ -333,9 +333,6 @@ func (c Config) Validate() error {
 		if c.Remote != "" {
 			return errors.New("remote is a client-only option")
 		}
-		if c.CAFile != "" {
-			return errors.New("ca is a client-only option")
-		}
 	} else {
 		if c.Upstream != "" || c.CertFile != "" {
 			return errors.New("upstream and cert/key are server-only options")
@@ -348,9 +345,6 @@ func (c Config) Validate() error {
 			return errors.New("h3 remote requires HTTPS")
 		}
 		if c.Transport == TransportWebSocket {
-			if c.CAFile != "" {
-				return errors.New("custom ca is supported only for h3")
-			}
 			if u.Scheme != "wss" && u.Scheme != "ws" && u.Scheme != "https" && u.Scheme != "http" {
 				return errors.New("websocket remote requires http, https, ws or wss")
 			}

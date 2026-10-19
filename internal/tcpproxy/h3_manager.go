@@ -1,9 +1,7 @@
 package tcpproxy
 
 import (
-	"crypto/x509"
 	"io"
-	"os"
 	"sync"
 
 	"cloudflare-h3-test/internal/relay"
@@ -17,27 +15,12 @@ type h3Slot struct {
 type h3Manager struct {
 	mu     sync.Mutex
 	cfg    Config
-	roots  *x509.CertPool
 	slots  []*h3Slot
 	closed bool
 }
 
-func newH3Manager(cfg Config) (*h3Manager, error) {
-	m := &h3Manager{cfg: cfg}
-	if cfg.CAFile != "" {
-		b, err := os.ReadFile(cfg.CAFile)
-		if err != nil {
-			return nil, err
-		}
-		m.roots, err = x509.SystemCertPool()
-		if err != nil || m.roots == nil {
-			m.roots = x509.NewCertPool()
-		}
-		if !m.roots.AppendCertsFromPEM(b) {
-			return nil, os.ErrInvalid
-		}
-	}
-	return m, nil
+func newH3Manager(cfg Config) *h3Manager {
+	return &h3Manager{cfg: cfg}
 }
 func (m *h3Manager) acquire() (*h3Slot, error) {
 	m.mu.Lock()
@@ -51,7 +34,7 @@ func (m *h3Manager) acquire() (*h3Slot, error) {
 			return s, nil
 		}
 	}
-	tr, err := relay.NewHTTP3TransportWithOptions(relay.HTTP3ClientOptions{URL: carrierURL(m.cfg), ConnectIP: m.cfg.ConnectIP, RootCAs: m.roots, QUICReceiveWindows: m.cfg.QUICWindows})
+	tr, err := relay.NewHTTP3TransportWithOptions(relay.HTTP3ClientOptions{URL: carrierURL(m.cfg), ConnectIP: m.cfg.ConnectIP, QUICReceiveWindows: m.cfg.QUICWindows})
 	if err != nil {
 		return nil, err
 	}
