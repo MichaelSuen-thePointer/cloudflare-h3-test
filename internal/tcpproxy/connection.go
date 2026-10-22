@@ -22,10 +22,6 @@ func runClientConnection(life, acquire context.Context, cancelAcquire context.Ca
 
 func runClientSession(life, acquire context.Context, cancelAcquire context.CancelFunc, cfg Config, p *standbyPool, local net.Conn, id uint64) error {
 	defer local.Close()
-	params, err := newOpenParams()
-	if err != nil {
-		return err
-	}
 	var e *standbyEntry
 	for {
 		var err error
@@ -66,7 +62,7 @@ func runClientSession(life, acquire context.Context, cancelAcquire context.Cance
 			<-acquireJoined
 		}
 	}()
-	if err := e.writeOpen(acquire, params); err != nil {
+	if err := e.writeControl(acquire, ControlOpen); err != nil {
 		e.abort()
 		<-e.readDone
 		return err
@@ -116,7 +112,6 @@ func runClientSession(life, acquire context.Context, cancelAcquire context.Cance
 	}
 	if handshakeErr == nil {
 		<-e.readDone
-		e.initializeDownstreamSequence()
 		// This can wait for an in-flight PING. Let EOF publish termination while
 		// waiting; only the final nonblocking ownership commit holds terminalMu.
 		p.prepareHandoff(e, acquire)
@@ -226,7 +221,6 @@ func finishClientEOF(e *standbyEntry, local net.Conn, up <-chan error, upEnded b
 		e.abort()
 	} // wake response reads instead of draining forever
 	<-e.readDone
-	e.initializeDownstreamSequence()
 	if down != nil && !downEnded {
 		<-down
 	}

@@ -375,9 +375,8 @@ func (b *reviewRecordBody) Read(p []byte) (int, error) {
 			b.pings.Add(1)
 		case header == 65535:
 			b.opened = true
-			b.left = 16
-		case header > 0 && header <= MaxRecordPayload:
-			b.left = 4 + int(header)
+		case header > 0 && header < 65535:
+			b.left = int(header)
 		}
 	}
 	return n, err

@@ -11,13 +11,9 @@ import (
 )
 
 func testRecord(header uint16, payload []byte) []byte {
-	prefix := 2
-	if header > 0 && header <= MaxRecordPayload {
-		prefix = 6
-	}
-	b := make([]byte, prefix+len(payload))
+	b := make([]byte, 2+len(payload))
 	binary.LittleEndian.PutUint16(b, header)
-	copy(b[prefix:], payload)
+	copy(b[2:], payload)
 	return b
 }
 
@@ -48,7 +44,7 @@ func TestRecordRoundTripSplitAndCoalesced(t *testing.T) {
 	if n, err := w.Write(payload); n != len(payload) || err != nil {
 		t.Fatal(n, err)
 	}
-	if wire.Len() != 8+6+MaxRecordPayload || !bytes.Equal(wire.Bytes()[:8], []byte{0, 0, 0, 0, 255, 255, 255, 255}) || binary.LittleEndian.Uint16(wire.Bytes()[8:10]) != 65530 {
+	if wire.Len() != 8+2+MaxRecordPayload || !bytes.Equal(wire.Bytes()[:8], []byte{0, 0, 0, 0, 255, 255, 255, 255}) || binary.LittleEndian.Uint16(wire.Bytes()[8:10]) != 65534 {
 		t.Fatal("wire encoding")
 	}
 	for _, split := range []int{1, 3, 65536} {
@@ -124,7 +120,7 @@ func TestRecordDataSplittingAndControlCallbacks(t *testing.T) {
 }
 
 func TestRecord64KiBBufferBoundaryAndReuse(t *testing.T) {
-	if ControlPing != 0 || ControlPong != 0 || ControlOpen != 65535 || ControlOpenOK != 65535 || MaxRecordPayload != 65530 || MaxRecordSize != 65536 {
+	if ControlPing != 0 || ControlPong != 0 || ControlOpen != 65535 || ControlOpenOK != 65535 || MaxRecordPayload != 65534 || MaxRecordSize != 65536 {
 		t.Fatal("directional wire constants")
 	}
 	var wire bytes.Buffer
@@ -133,7 +129,7 @@ func TestRecord64KiBBufferBoundaryAndReuse(t *testing.T) {
 		t.Fatal("standby allocated a DATA buffer", err, cap(w.buf))
 	}
 	wire.Reset()
-	if _, err := w.Write([]byte{0xaa}); err != nil || !bytes.Equal(wire.Bytes(), []byte{1, 0, 0, 0, 0, 0, 0xaa}) {
+	if _, err := w.Write([]byte{0xaa}); err != nil || !bytes.Equal(wire.Bytes(), []byte{1, 0, 0xaa}) {
 		t.Fatal("minimum DATA", wire.Bytes(), err)
 	}
 	if cap(w.buf) != 65536 {
@@ -146,7 +142,7 @@ func TestRecord64KiBBufferBoundaryAndReuse(t *testing.T) {
 		t.Fatal(n, err)
 	}
 	got := wire.Bytes()
-	if len(got) != 65547 || got[0] != 0xfa || got[1] != 0xff || binary.LittleEndian.Uint32(got[2:6]) != 1 || !bytes.Equal(got[6:65536], payload[:65530]) || !bytes.Equal(got[65536:], []byte{5, 0, 2, 0, 0, 0, 0x55, 0x55, 0x55, 0x55, 0x55}) {
+	if len(got) != 65539 || got[0] != 0xfe || got[1] != 0xff || !bytes.Equal(got[2:65536], payload[:65534]) || !bytes.Equal(got[65536:], []byte{1, 0, 0x55}) {
 		t.Fatal("maximum DATA or next-record boundary")
 	}
 	if &w.buf[0] != base || cap(w.buf) != 65536 {
@@ -185,7 +181,7 @@ func TestRecordTruncationAndBoundaryEOF(t *testing.T) {
 		prefix string
 	}{
 		{nil, io.EOF, ""}, {[]byte{0}, io.ErrUnexpectedEOF, ""},
-		{testRecord(3, nil), io.ErrUnexpectedEOF, ""}, {testRecord(3, []byte("ab")), io.ErrUnexpectedEOF, ""},
+		{testRecord(3, nil), io.ErrUnexpectedEOF, ""}, {testRecord(3, []byte("ab")), io.ErrUnexpectedEOF, "ab"},
 		{testRecord(3, []byte("abc")), io.EOF, "abc"},
 	} {
 		r := newRecordReader(bytes.NewReader(tc.wire))
@@ -222,7 +218,7 @@ func TestRecordWriterPartialFailurePoisonsAndCountsPayload(t *testing.T) {
 		wantN   int
 		wantErr error
 	}{
-		{0, nil, 0, io.ErrShortWrite}, {-1, nil, 0, io.ErrShortWrite}, {10, nil, 0, io.ErrShortWrite}, {1, sentinel, 0, sentinel}, {4, sentinel, 0, sentinel}, {6, sentinel, 0, sentinel}, {8, sentinel, 2, sentinel}, {9, sentinel, 3, sentinel},
+		{0, nil, 0, io.ErrShortWrite}, {-1, nil, 0, io.ErrShortWrite}, {6, nil, 0, io.ErrShortWrite}, {1, sentinel, 0, sentinel}, {4, sentinel, 2, sentinel}, {5, sentinel, 3, sentinel},
 	} {
 		calls := 0
 		w := newRecordWriter(recordWriteFunc(func(p []byte) (int, error) { calls++; return tc.written, tc.err }), nil, true)
@@ -270,12 +266,12 @@ func TestRecordWriterCompletesProgressingShortWrites(t *testing.T) {
 		t.Fatal(wire.Bytes(), flushes)
 	}
 	// After a short prefix, zero progress poisons the stream and reports only
-	// the actual DATA payload prefix, excluding the header and sequence.
+	// the actual DATA payload prefix, excluding the two-byte header.
 	calls := 0
 	w = newRecordWriter(recordWriteFunc(func([]byte) (int, error) {
 		calls++
 		if calls == 1 {
-			return 7, nil
+			return 3, nil
 		}
 		return 0, nil
 	}), nil, false)
@@ -319,7 +315,7 @@ func TestRecordPingRechecksSendAfterWaitingForWriter(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := <-pingDone
-	if result.err != nil || result.next != 8*time.Second || wire.Len() != 9 {
+	if result.err != nil || result.next != 8*time.Second || wire.Len() != 5 {
 		t.Fatal(result, wire.Len())
 	}
 }
@@ -396,7 +392,7 @@ func TestRecordPingLatestSendAndClock(t *testing.T) {
 	if _, err := w.Write([]byte("abc")); err != nil {
 		t.Fatal(err)
 	}
-	if next, err := w.Ping(10 * time.Second); err != nil || next != 10*time.Second || wire.Len() != 13 {
+	if next, err := w.Ping(10 * time.Second); err != nil || next != 10*time.Second || wire.Len() != 9 {
 		t.Fatal(next, err, wire.Len())
 	}
 	w.Stop()

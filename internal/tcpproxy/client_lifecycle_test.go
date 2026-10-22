@@ -67,19 +67,6 @@ func startClientTestConnection(t *testing.T, cfg Config, d CarrierDialer) (net.C
 	t.Cleanup(func() { cancel(); app.Close(); p.Close() })
 	return app, cancel, done, p
 }
-func clientTestOpenReader(r io.Reader) (*recordReader, openParams, error) {
-	reader := newRecordReader(r)
-	header, err := reader.ReadHeader()
-	if err != nil {
-		return reader, openParams{}, err
-	}
-	if header != ControlOpen {
-		return reader, openParams{}, errors.New("missing OPEN")
-	}
-	params, err := reader.ReadOpen()
-	reader.SetSequence(params.ClientInitial)
-	return reader, params, err
-}
 func TestTCPClientEarlyUploadAndExactACKBoundary(t *testing.T) {
 	cfg := clientTestConfig()
 	front, back := net.Pipe()
@@ -90,16 +77,20 @@ func TestTCPClientEarlyUploadAndExactACKBoundary(t *testing.T) {
 	payload := []byte{1, 2, 3, 4, 0, 255}
 	upload := []byte("before-ack")
 	go func() {
-		reader, params, err := clientTestOpenReader(back)
+		var open [2]byte
+		_, err := io.ReadFull(back, open[:])
+		if err == nil && binary.LittleEndian.Uint16(open[:]) != ControlOpen {
+			err = errors.New("missing OPEN")
+		}
 		b := make([]byte, len(upload))
 		if err == nil {
-			_, err = io.ReadFull(clientUploadTestReader{reader}, b)
+			_, err = io.ReadFull(clientUploadTestReader{newRecordReader(back)}, b)
 		}
 		if err == nil && !bytes.Equal(b, upload) {
 			err = errors.New("upload mismatch")
 		}
 		if err == nil {
-			_, err = back.Write(append(clientTestControls(ControlPong, ControlOpenOK, ControlPong), clientTestDataWire(payload, params.ServerInitial)...))
+			_, err = back.Write(append(clientTestControls(ControlPong, ControlOpenOK, ControlPong), clientTestDataWire(payload)...))
 		}
 		server <- err
 	}()
@@ -140,7 +131,7 @@ func TestTCPClientRecordsSerializeAuthorizedPingAndOPEN(t *testing.T) {
 			<-releasePing
 			return n, err
 		}
-		if len(b) == 18 && binary.LittleEndian.Uint16(b) == ControlOpen {
+		if len(b) == 2 && binary.LittleEndian.Uint16(b) == ControlOpen {
 			openCalled <- struct{}{}
 		}
 		return front.Write(b)
@@ -163,8 +154,6 @@ func TestTCPClientRecordsSerializeAuthorizedPingAndOPEN(t *testing.T) {
 			}
 			h := binary.LittleEndian.Uint16(b[:])
 			if h == ControlOpen {
-				var params [16]byte
-				_, err = io.ReadFull(back, params[:])
 				break
 			}
 			if h != ControlPing {
@@ -217,7 +206,7 @@ func TestTCPClientFastACKCannotHideFailedOPEN(t *testing.T) {
 	app, _, done, _ := startClientTestConnection(t, cfg, d)
 	defer app.Close()
 	go func() {
-		var b [18]byte
+		var b [2]byte
 		_, _ = io.ReadFull(back, b[:])
 		_, _ = back.Write(clientTestControls(ControlOpenOK))
 		close(ackSent)
@@ -247,11 +236,11 @@ func TestTCPPoolCloseHasNoAuthorityAfterHandoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	go func() {
-		var b [18]byte
+		var b [2]byte
 		_, _ = io.ReadFull(back, b[:])
 		_, _ = back.Write(clientTestControls(ControlOpenOK))
 	}()
-	if err = e.writeOpen(ctx, openParams{}); err != nil {
+	if err = e.writeControl(ctx, ControlOpen); err != nil {
 		t.Fatal(err)
 	}
 	if err = clientTestWait(t, e.ack); err != nil {
@@ -288,7 +277,7 @@ func (c *clientTailCarrier) Write(b []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	n, err := c.buf.Write(b)
-	if len(b) == 18 && binary.LittleEndian.Uint16(b) == ControlOpen {
+	if len(b) == 2 && binary.LittleEndian.Uint16(b) == ControlOpen {
 		go func() { _, _ = c.writer.Write(clientTestControls(ControlOpenOK)) }()
 	}
 	return n, err
@@ -417,9 +406,8 @@ func TestTCPClientLateACKAfterUploadEOFCannotHandoff(t *testing.T) {
 	}
 	app.Close()
 	clientTestWait(t, finished)
-	// The connection already became terminal before this ACK could arrive. Its
-	// drain still consumes DATA using the random downstream initial sequence.
-	_, _ = w.Write(append(clientTestControls(ControlOpenOK), clientTestDataWire([]byte("late downstream tail"), gated.downstreamSequence())...))
+	// The connection already became terminal before this ACK could arrive.
+	_, _ = w.Write(clientTestControls(ControlOpenOK))
 	_ = w.Close()
 	if err := clientTestWait(t, done); err != nil {
 		t.Fatalf("late ACK result: %v", err)
@@ -446,11 +434,6 @@ func (c *clientEOFCarrier) Write(b []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.buf.Write(b)
-}
-func (c *clientEOFCarrier) downstreamSequence() uint32 {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return binary.LittleEndian.Uint32(c.buf.Bytes()[6:10])
 }
 func (c *clientEOFCarrier) Close() error       { _ = c.reader.Close(); return c.writer.Close() }
 func (c *clientEOFCarrier) FinishWrite() error { c.once.Do(func() { close(c.finish) }); return nil }
@@ -546,30 +529,6 @@ func TestTCPClientBlockedOPENHonorsAcquireCancellation(t *testing.T) {
 	}
 }
 
-func TestTCPClientPartialOPENHonorsAcquireCancellation(t *testing.T) {
-	cfg := clientTestConfig()
-	cfg.HTTPTimeout = 50 * time.Millisecond
-	front, back := net.Pipe()
-	defer back.Close()
-	d := &clientTestDialer{dial: func(context.Context) (Carrier, error) { return &clientPipeCarrier{Conn: front}, nil }}
-	app, _, done, _ := startClientTestConnection(t, cfg, d)
-	defer app.Close()
-	// Leave the atomic OPEN write blocked midway through its parameter region.
-	var partial [10]byte
-	if _, err := io.ReadFull(back, partial[:]); err != nil {
-		t.Fatal(err)
-	}
-	if binary.LittleEndian.Uint16(partial[:2]) != ControlOpen {
-		t.Fatal("missing OPEN")
-	}
-	if err := clientTestWait(t, done); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("partial OPEN did not honor HTTP deadline: %v", err)
-	}
-	if d.calls.Load() != 1 {
-		t.Fatal("partial OPEN retried")
-	}
-}
-
 type clientArbitratedLocal struct {
 	net.Conn
 	downBlocked chan struct{}
@@ -613,11 +572,8 @@ func (c *clientArbitratedCarrier) Write(b []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	n, err := c.buf.Write(b)
-	if len(b) == 18 && binary.LittleEndian.Uint16(b) == ControlOpen {
-		serverInitial := binary.LittleEndian.Uint32(b[6:10])
-		go func() {
-			_, _ = c.w.Write(append(clientTestControls(ControlOpenOK), clientTestDataWire([]byte{99}, serverInitial)...))
-		}()
+	if len(b) == 2 && binary.LittleEndian.Uint16(b) == ControlOpen {
+		go func() { _, _ = c.w.Write(append(clientTestControls(ControlOpenOK), clientTestDataWire([]byte{99})...)) }()
 	}
 	return n, err
 }
@@ -723,7 +679,7 @@ func TestTCPClientHTTPTimeoutInterruptsClaimedBlockedPing(t *testing.T) {
 		if len(b) == 2 && binary.LittleEndian.Uint16(b) == ControlPing {
 			once.Do(func() { close(started) })
 		}
-		if len(b) == 18 && binary.LittleEndian.Uint16(b) == ControlOpen {
+		if len(b) == 2 && binary.LittleEndian.Uint16(b) == ControlOpen {
 			opens.Add(1)
 		}
 		return front.Write(b)
@@ -792,7 +748,7 @@ func TestTCPClientOnDemandSetupUsesRemainingHTTPBudget(t *testing.T) {
 		t.Fatalf("setup reset total HTTP budget: got %v want %v", got, wantDeadline)
 	}
 	opened := make(chan struct{})
-	go func() { var b [18]byte; _, _ = io.ReadFull(back, b[:]); close(opened) }()
+	go func() { var b [2]byte; _, _ = io.ReadFull(back, b[:]); close(opened) }()
 	clientTestWait(t, opened)
 	// No OPEN_OK: the same original deadline must terminate the ACK wait.
 	if err := clientTestWait(t, done); !errors.Is(err, context.DeadlineExceeded) {
@@ -811,7 +767,7 @@ type clientDrainObservationCarrier struct {
 
 func (c *clientDrainObservationCarrier) Write(b []byte) (int, error) {
 	n, err := c.clientEOFCarrier.Write(b)
-	if len(b) == 18 && binary.LittleEndian.Uint16(b) == ControlOpen {
+	if len(b) == 2 && binary.LittleEndian.Uint16(b) == ControlOpen {
 		c.openOnce.Do(func() { close(c.opened) })
 	}
 	return n, err
@@ -868,7 +824,7 @@ func TestTCPClientDrainWaitsForPeerAndProcessCancellationJoinsWorkers(t *testing
 			ackDone <- ctx.Err()
 			return
 		}
-		_, err := w.Write(append(clientTestControls(ControlOpenOK), clientTestDataWire([]byte{99}, carrier.downstreamSequence())...))
+		_, err := w.Write(append(clientTestControls(ControlOpenOK), clientTestDataWire([]byte{99})...))
 		ackDone <- err
 	}()
 	var raw [1]byte
@@ -886,10 +842,7 @@ func TestTCPClientDrainWaitsForPeerAndProcessCancellationJoinsWorkers(t *testing
 	// Wake the old business reader once. Its local write fails because EOF has
 	// already closed local business, then the same reader enters transport drain.
 	consumed := make(chan error, 1)
-	go func() {
-		_, err := w.Write(clientTestDataWire([]byte{1}, carrier.downstreamSequence()+1))
-		consumed <- err
-	}()
+	go func() { _, err := w.Write(clientTestDataWire([]byte{1})); consumed <- err }()
 	if err := clientTestWait(t, consumed); err != nil {
 		t.Fatalf("normal EOF immediately aborted carrier: %v", err)
 	}
@@ -911,7 +864,7 @@ func TestTCPClientDrainWaitsForPeerAndProcessCancellationJoinsWorkers(t *testing
 		t.Fatal(err)
 	}
 	clientTestWait(t, d.closed)
-	if _, err := w.Write(clientTestDataWire([]byte{1}, carrier.downstreamSequence()+1)); err == nil {
+	if _, err := w.Write(clientTestDataWire([]byte{1})); err == nil {
 		t.Fatal("process shutdown did not abort stalled response")
 	}
 	mu.Lock()
@@ -929,13 +882,9 @@ func clientTestControls(headers ...uint16) []byte {
 	}
 	return b
 }
-func clientTestDataWire(payload []byte, sequence ...uint32) []byte {
+func clientTestDataWire(payload []byte) []byte {
 	var b bytes.Buffer
-	writer := newRecordWriter(&b, nil, false)
-	if len(sequence) > 0 {
-		writer.SetSequence(sequence[0])
-	}
-	_, _ = writer.Write(payload)
+	_, _ = newRecordWriter(&b, nil, false).Write(payload)
 	return b.Bytes()
 }
 func clientTestDecodeUpload(t *testing.T, wire []byte) []byte {
@@ -957,11 +906,6 @@ func clientTestDecodeUpload(t *testing.T, wire []byte) []byte {
 			if opened {
 				t.Fatal("duplicate OPEN")
 			}
-			params, err := r.ReadOpen()
-			if err != nil {
-				t.Fatal(err)
-			}
-			r.SetSequence(params.ClientInitial)
 			opened = true
 		default:
 			if !opened || h == ControlPing || h == ControlOpen {
@@ -1051,8 +995,11 @@ func TestTCPClientPoolZeroPingsDuringOpeningAndActive(t *testing.T) {
 	_ = app.SetDeadline(time.Now().Add(2 * time.Second))
 	observed := make(chan error, 1)
 	go func() {
-		r, params, err := clientTestOpenReader(back)
-		var h uint16
+		r := newRecordReader(back)
+		h, err := r.ReadHeader()
+		if err == nil && h != ControlOpen {
+			err = errors.New("missing OPEN")
+		}
 		if err == nil {
 			h, err = r.ReadHeader()
 			if h != ControlPing {
@@ -1060,7 +1007,7 @@ func TestTCPClientPoolZeroPingsDuringOpeningAndActive(t *testing.T) {
 			}
 		}
 		if err == nil {
-			_, err = back.Write(append(clientTestControls(ControlPong, ControlOpenOK, ControlPong), clientTestDataWire([]byte("server-first"), params.ServerInitial)...))
+			_, err = back.Write(append(clientTestControls(ControlPong, ControlOpenOK, ControlPong), clientTestDataWire([]byte("server-first"))...))
 		}
 		if err == nil {
 			h, err = r.ReadHeader()
@@ -1108,9 +1055,9 @@ func TestTCPClientActivePingFailureWakesLocalCopy(t *testing.T) {
 	app, _, done, _ := startClientTestConnection(t, cfg, d)
 	_ = app.SetDeadline(time.Now().Add(time.Second))
 	go func() {
-		var open [18]byte
+		var open [2]byte
 		_, _ = io.ReadFull(back, open[:])
-		_, _ = back.Write(append(clientTestControls(ControlOpenOK), clientTestDataWire([]byte{42}, binary.LittleEndian.Uint32(open[6:10]))...))
+		_, _ = back.Write(append(clientTestControls(ControlOpenOK), clientTestDataWire([]byte{42})...))
 	}()
 	var data [1]byte
 	if _, err := io.ReadFull(app, data[:]); err != nil {
@@ -1141,14 +1088,15 @@ func TestTCPPoolCloseLeavesActiveBlockedPingWithConnectionOwner(t *testing.T) {
 	d := &clientTestDialer{dial: func(context.Context) (Carrier, error) { return carrier, nil }}
 	app, cancel, done, p := startClientTestConnection(t, cfg, d)
 	_ = app.SetDeadline(time.Now().Add(time.Second))
-	var r *recordReader
+	r := newRecordReader(back)
 	initial := make(chan error, 1)
-	var params openParams
 	go func() {
-		var err error
-		r, params, err = clientTestOpenReader(back)
+		h, err := r.ReadHeader()
+		if err == nil && h != ControlOpen {
+			err = errors.New("missing OPEN")
+		}
 		if err == nil {
-			_, err = back.Write(append(clientTestControls(ControlOpenOK), clientTestDataWire([]byte{7}, params.ServerInitial)...))
+			_, err = back.Write(append(clientTestControls(ControlOpenOK), clientTestDataWire([]byte{7})...))
 		}
 		initial <- err
 	}()
@@ -1173,7 +1121,7 @@ func TestTCPPoolCloseLeavesActiveBlockedPingWithConnectionOwner(t *testing.T) {
 		data := make([]byte, 1)
 		_, err := io.ReadFull(clientUploadTestReader{r}, data)
 		if err == nil {
-			_, err = back.Write(clientTestDataWire(data, params.ServerInitial+1))
+			_, err = back.Write(clientTestDataWire(data))
 		}
 		server <- err
 	}()
@@ -1215,14 +1163,12 @@ func TestTCPClientEOFPingJoinPrecedesFinishWrite(t *testing.T) {
 	d := &clientTestDialer{dial: func(context.Context) (Carrier, error) { return carrier, nil }}
 	app, _, done, _ := startClientTestConnection(t, cfg, d)
 	_ = app.SetDeadline(time.Now().Add(time.Second))
-	var r *recordReader
+	r := newRecordReader(back)
 	initial := make(chan error, 1)
 	go func() {
-		var params openParams
-		var err error
-		r, params, err = clientTestOpenReader(back)
+		_, err := r.ReadHeader()
 		if err == nil {
-			_, err = back.Write(append(clientTestControls(ControlOpenOK), clientTestDataWire([]byte{9}, params.ServerInitial)...))
+			_, err = back.Write(append(clientTestControls(ControlOpenOK), clientTestDataWire([]byte{9})...))
 		}
 		initial <- err
 	}()
@@ -1271,8 +1217,7 @@ func TestTCPClientActiveRejectsDuplicateACKAndTruncatedDATA(t *testing.T) {
 		want []byte
 	}{
 		{"duplicate-ACK", clientTestControls(ControlOpenOK), nil},
-		{"truncated-sequence", append(clientTestControls(8), []byte{1, 2}...), nil},
-		{"truncated-DATA", append(clientTestControls(8), []byte{0, 0, 0, 0, 1, 2}...), nil},
+		{"truncated-DATA", append(clientTestControls(8), []byte{1, 2}...), []byte{1, 2}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := clientTestConfig()
@@ -1282,13 +1227,9 @@ func TestTCPClientActiveRejectsDuplicateACKAndTruncatedDATA(t *testing.T) {
 			app, _, done, _ := startClientTestConnection(t, cfg, d)
 			_ = app.SetDeadline(time.Now().Add(time.Second))
 			go func() {
-				var open [18]byte
+				var open [2]byte
 				_, _ = io.ReadFull(back, open[:])
-				tail := append([]byte(nil), tc.tail...)
-				if tc.name == "truncated-DATA" {
-					binary.LittleEndian.PutUint32(tail[2:6], binary.LittleEndian.Uint32(open[6:10]))
-				}
-				_, _ = back.Write(append(clientTestControls(ControlOpenOK), tail...))
+				_, _ = back.Write(append(clientTestControls(ControlOpenOK), tc.tail...))
 				back.Close()
 			}()
 			got, err := io.ReadAll(app)
@@ -1318,7 +1259,7 @@ func startClientEOFReview(t *testing.T, finishErr error) (net.Conn, <-chan error
 	sent := make(chan error, 1)
 	go func() {
 		<-carrier.opened
-		_, err := w.Write(append(clientTestControls(ControlOpenOK), clientTestDataWire([]byte{99}, carrier.downstreamSequence())...))
+		_, err := w.Write(append(clientTestControls(ControlOpenOK), clientTestDataWire([]byte{99})...))
 		sent <- err
 	}()
 	var b [1]byte
@@ -1420,7 +1361,7 @@ func TestTCPClientEOFDuringBlockedPingHandoffCannotActivate(t *testing.T) {
 	defer ca()
 	done := make(chan error, 1)
 	go func() { done <- runClientConnection(life, acquire, ca, cfg, p, local) }()
-	var open [18]byte
+	var open [2]byte
 	if _, err := io.ReadFull(back, open[:]); err != nil {
 		t.Fatal(err)
 	}

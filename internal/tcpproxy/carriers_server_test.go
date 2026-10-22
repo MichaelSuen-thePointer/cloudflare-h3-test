@@ -63,7 +63,7 @@ func TestOriginJoinedRecordFailureOverridesAdjacentNormalEOF(t *testing.T) {
 		wire                 []byte
 		finishErr, errorWant error
 		finishCount          int
-	}{{"both-normal", nil, nil, nil, 1}, {"local-network-interruption", nil, nil, nil, 1}, {"truncated-header", []byte{4}, nil, io.ErrUnexpectedEOF, 0}, {"truncated-payload", []byte{8, 0, 0, 0, 0, 0, 7, 6}, nil, io.ErrUnexpectedEOF, 0}, {"duplicate-open", testServerOpen(openParams{}), nil, errRecordControl, 0}, {"finish-failure", nil, finishFailure, finishFailure, 1}} {
+	}{{"both-normal", nil, nil, nil, 1}, {"local-network-interruption", nil, nil, nil, 1}, {"truncated-header", []byte{4}, nil, io.ErrUnexpectedEOF, 0}, {"truncated-payload", []byte{8, 0, 7, 6}, nil, io.ErrUnexpectedEOF, 0}, {"duplicate-open", testV2Control(ControlOpen), nil, errRecordControl, 0}, {"finish-failure", nil, finishFailure, finishFailure, 1}} {
 		t.Run(tc.name, func(t *testing.T) {
 			released := make(chan struct{})
 			var input io.Reader = bytes.NewReader(tc.wire)
@@ -130,14 +130,6 @@ func testV2Control(header uint16) []byte {
 	var wire [2]byte
 	binary.LittleEndian.PutUint16(wire[:], header)
 	return wire[:]
-}
-func testServerOpen(params openParams) []byte {
-	wire := make([]byte, 18)
-	binary.LittleEndian.PutUint16(wire[:2], ControlOpen)
-	binary.LittleEndian.PutUint32(wire[2:6], params.ClientInitial)
-	binary.LittleEndian.PutUint32(wire[6:10], params.ServerInitial)
-	copy(wire[10:], params.SessionID[:])
-	return wire
 }
 func testV2Data(payload []byte) []byte {
 	var wire bytes.Buffer
@@ -431,7 +423,7 @@ func TestOriginShutdownCancelsWebSocketUpstreamDial(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ws.Close()
-	if err := ws.WriteMessage(testServerOpen(openParams{})); err != nil {
+	if err := ws.WriteMessage(testV2Control(ControlOpen)); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -775,21 +767,11 @@ func TestOriginWebSocketNoDialBeforeOpenAndPreservesCoalescedPayload(t *testing.
 	case <-time.After(30 * time.Millisecond):
 	}
 	reader := newRecordReader(c)
-	params := openParams{ClientInitial: 0xffffffff, ServerInitial: 0x12345678, SessionID: [8]byte{8, 7, 6, 5, 4, 3, 2, 1}}
-	reader.SetSequence(params.ServerInitial)
 	c.Write(testV2Control(ControlPing))
 	if header, err := reader.ReadHeader(); err != nil || header != ControlPong {
 		t.Fatalf("PONG: %v %v", header, err)
 	}
-	// Two raw DATA blocks exercise a nonzero client initial and wrap through zero.
-	dataWire := make([]byte, len(payload)+12)
-	binary.LittleEndian.PutUint16(dataWire[:2], 4)
-	binary.LittleEndian.PutUint32(dataWire[2:6], params.ClientInitial)
-	copy(dataWire[6:10], payload[:4])
-	binary.LittleEndian.PutUint16(dataWire[10:12], uint16(len(payload)-4))
-	binary.LittleEndian.PutUint32(dataWire[12:16], 0)
-	copy(dataWire[16:], payload[4:])
-	if _, err := c.Write(append(testServerOpen(params), dataWire...)); err != nil {
+	if _, err := c.Write(append(testV2Control(ControlOpen), testV2Data(payload)...)); err != nil {
 		t.Fatal(err)
 	}
 	if header, err := reader.ReadHeader(); err != nil || header != ControlOpenOK {
@@ -836,7 +818,7 @@ func TestOriginHTTP1DownstreamEOFWakesOpenUploadAndPreservesTail(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	if _, err := writer.Write(testServerOpen(openParams{})); err != nil {
+	if _, err := writer.Write(testV2Control(ControlOpen)); err != nil {
 		t.Fatal(err)
 	}
 	got, err := io.ReadAll(response.Body)
@@ -887,7 +869,7 @@ func TestOriginHTTP2DownstreamEOFCompletesResponseWithUploadOpen(t *testing.T) {
 	if response.ProtoMajor != 2 {
 		t.Fatalf("expected HTTP2, got %s", response.Proto)
 	}
-	if _, err := writer.Write(testServerOpen(openParams{})); err != nil {
+	if _, err := writer.Write(testV2Control(ControlOpen)); err != nil {
 		t.Fatal(err)
 	}
 	got, err := io.ReadAll(response.Body)
@@ -1070,7 +1052,7 @@ func TestOriginV2DelayedDialActivePingAndDataStaySeparated(t *testing.T) {
 	carrier := &wsCarrier{ws: ws}
 	defer carrier.Close()
 	ws.SetDeadline(time.Now().Add(3 * time.Second))
-	if _, err := carrier.Write(append(append(testServerOpen(openParams{}), testV2Control(ControlPing)...), testV2Data(payload)...)); err != nil {
+	if _, err := carrier.Write(append(append(testV2Control(ControlOpen), testV2Control(ControlPing)...), testV2Data(payload)...)); err != nil {
 		t.Fatal(err)
 	}
 	<-dialStarted
@@ -1161,16 +1143,7 @@ func TestOriginV2RejectsTruncatedAndWrongStageRecords(t *testing.T) {
 		name string
 		wire []byte
 		dial bool
-	}{
-		{"half-open", testServerOpen(openParams{})[:1], false},
-		{"missing-open-params", testServerOpen(openParams{})[:2], false},
-		{"partial-open-params", testServerOpen(openParams{})[:17], false},
-		{"data-before-open", testV2Data([]byte{9}), false},
-		{"duplicate-open", append(testServerOpen(openParams{}), testServerOpen(openParams{})...), true},
-		{"truncated-sequence", append(testServerOpen(openParams{}), []byte{8, 0, 7, 6}...), true},
-		{"truncated-data", append(testServerOpen(openParams{}), []byte{8, 0, 0, 0, 0, 0, 7, 6}...), true},
-		{"reserved-header", append(testServerOpen(openParams{}), []byte{0xfb, 0xff}...), true},
-	} {
+	}{{"half-open", testV2Control(ControlOpen)[:1], false}, {"data-before-open", testV2Data([]byte{9}), false}, {"duplicate-open", append(testV2Control(ControlOpen), testV2Control(ControlOpen)...), true}, {"truncated-data", append(testV2Control(ControlOpen), []byte{8, 0, 7, 6}...), true}} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := carrierTestConfig()
 			state := newTCPServer(cfg)
@@ -1194,8 +1167,11 @@ func TestOriginV2RejectsTruncatedAndWrongStageRecords(t *testing.T) {
 			if tc.dial {
 				select {
 				case data := <-upDone:
-					if len(data) != 0 {
-						t.Fatalf("invalid record leaked payload into SS: %v", data)
+					if tc.name == "duplicate-open" && len(data) != 0 {
+						t.Fatal("control leaked into SS")
+					}
+					if tc.name == "truncated-data" && !bytes.Equal(data, []byte{7, 6}) {
+						t.Fatalf("truncated DATA prefix=%v", data)
 					}
 				case <-time.After(time.Second):
 					t.Fatal("truncated connection did not release upstream")

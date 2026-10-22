@@ -30,7 +30,6 @@ type tcpServer struct {
 }
 type serverSession struct {
 	id          uint64
-	openParams  openParams // wire identity is separate from the diagnostic id
 	mu          sync.Mutex
 	closed      bool
 	closeDone   chan struct{}
@@ -301,14 +300,6 @@ func (s *tcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		case ControlOpen:
-			params, err := reader.ReadOpen()
-			if err != nil {
-				fail("open-read", err)
-				return
-			}
-			session.openParams = params
-			reader.SetSequence(params.ClientInitial)
-			writer.SetSequence(params.ServerInitial)
 			goto opened
 		default:
 			fail("open-read", fmt.Errorf("%w: invalid pre-OPEN record", errRecordControl))

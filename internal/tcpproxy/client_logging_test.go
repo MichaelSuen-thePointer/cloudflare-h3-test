@@ -3,7 +3,6 @@ package tcpproxy
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -46,10 +45,10 @@ func TestTCPClientLifecycleLogBoundaries(t *testing.T) {
 			app, _, done, _ := startClientTestConnection(t, cfg, d)
 			opened := make(chan error, 1)
 			go func() {
-				var open [18]byte
+				var open [2]byte
 				_, err := io.ReadFull(back, open[:])
 				if tc.ack && err == nil {
-					_, err = back.Write(append(clientTestControls(ControlOpenOK), clientTestDataWire([]byte("x"), binary.LittleEndian.Uint32(open[6:10]))...))
+					_, err = back.Write(append(clientTestControls(ControlOpenOK), clientTestDataWire([]byte("x"))...))
 				}
 				opened <- err
 			}()
@@ -212,9 +211,9 @@ func TestTCPClientActiveReadFailurePreservesCause(t *testing.T) {
 	d := &clientTestDialer{dial: func(context.Context) (Carrier, error) { return &clientPipeCarrier{Conn: front}, nil }}
 	app, _, done, _ := startClientTestConnection(t, cfg, d)
 	go func() {
-		var open [18]byte
+		var open [2]byte
 		_, _ = io.ReadFull(back, open[:])
-		_, _ = back.Write(append(clientTestControls(ControlOpenOK), clientTestDataWire([]byte("x"), binary.LittleEndian.Uint32(open[6:10]))...))
+		_, _ = back.Write(append(clientTestControls(ControlOpenOK), clientTestDataWire([]byte("x"))...))
 		_, _ = back.Write([]byte{1})
 		back.Close()
 	}()

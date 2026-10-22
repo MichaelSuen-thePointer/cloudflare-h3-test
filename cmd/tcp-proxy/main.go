@@ -48,8 +48,7 @@ Durations require units, for example 5s. Unknown CLI and duplicate known options
 Server shares /: POST is H3, GET Upgrade is WS; ordinary authenticated GET returns 400.
 --path overrides only --transport's route.
 Connection counts and concurrent dials are limited by OS resources only.
-TCP wire uses a 2-byte little-endian header and 4-byte DATA sequence.
-OPEN carries two initial sequences and an 8-byte session ID; upgrade both peers together.
+TCP wire v2 uses a 2-byte little-endian header; both peers must use v2.
 Client PING continues after OPEN; active uploads defer it until send-idle.
 No UDP forwarding, application multiplexing, reconnection, or TCP half-close.
 `
