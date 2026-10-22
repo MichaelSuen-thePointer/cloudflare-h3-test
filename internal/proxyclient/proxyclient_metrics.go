@@ -146,7 +146,12 @@ func (c *clientState) writeMetrics(path string, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	enc := json.NewEncoder(f)
-	for range ticker.C {
+	for {
+		select {
+		case <-c.lifecycleDone():
+			return
+		case <-ticker.C:
+		}
 		if err := enc.Encode(c.snapshot()); err != nil {
 			appLog.Warn("metrics-write-failed", "path", path, "err", err)
 			return

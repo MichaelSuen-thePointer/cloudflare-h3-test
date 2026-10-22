@@ -77,44 +77,34 @@ func openDuplexMessageStream(ctx context.Context, transport http.RoundTripper, c
 	request.Header.Set("Content-Type", "application/octet-stream")
 	request.Header.Set("X-Relay-Token", token)
 	stream := &H3MessageStream{requestWriter: writer, cancel: cancel, closeTransport: closeTransport, closed: make(chan struct{})}
-	type result struct {
-		response *http.Response
-		err      error
+	// Setup cancellation aborts the request, and the caller joins RoundTrip
+	// before returning. No detached late-response cleanup survives pool shutdown.
+	canceled := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(canceled)
+		cancel()
+		_ = writer.CloseWithError(ctx.Err())
+	})
+	response, err := transport.RoundTrip(request)
+	if !stop() {
+		<-canceled
 	}
-	ready := make(chan result, 1)
-	go func() {
-		response, err := transport.RoundTrip(request)
-		ready <- result{response, err}
-	}()
-	select {
-	case <-ctx.Done():
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	if err != nil {
+		if response != nil {
+			_ = response.Body.Close()
+		}
 		_ = stream.Close()
-		go func() {
-			got := <-ready
-			if got.response != nil {
-				_ = got.response.Body.Close()
-			}
-		}()
-		return nil, ctx.Err()
-	case got := <-ready:
-		if err := ctx.Err(); err != nil {
-			if got.response != nil {
-				_ = got.response.Body.Close()
-			}
-			_ = stream.Close()
-			return nil, err
-		}
-		if got.err != nil {
-			_ = stream.Close()
-			return nil, got.err
-		}
-		stream.responseBody = got.response.Body
-		if got.response.StatusCode != http.StatusOK {
-			_ = stream.Close()
-			return nil, fmt.Errorf("duplex status=%d", got.response.StatusCode)
-		}
-		return stream, nil
+		return nil, err
 	}
+	stream.responseBody = response.Body
+	if response.StatusCode != http.StatusOK {
+		_ = stream.Close()
+		return nil, fmt.Errorf("duplex status=%d", response.StatusCode)
+	}
+	return stream, nil
 }
 
 func (s *H3MessageStream) WriteMessage(payload []byte) error {

@@ -10,10 +10,50 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/quic-go/quic-go/http3"
 )
+
+type lateResponseBody struct{ closed bool }
+
+func (*lateResponseBody) Read([]byte) (int, error) { return 0, io.EOF }
+func (b *lateResponseBody) Close() error           { b.closed = true; return nil }
+
+func TestDuplexCancellationJoinsLateResponse(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		entered, release := make(chan struct{}), make(chan struct{})
+		body := &lateResponseBody{}
+		done := make(chan error, 1)
+		go func() {
+			_, err := openDuplexMessageStream(ctx, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				close(entered)
+				<-r.Context().Done()
+				<-release
+				return &http.Response{StatusCode: 200, Body: body}, nil
+			}), nil, "https://example.com/", "token")
+			done <- err
+		}()
+		<-entered
+		cancel()
+		synctest.Wait()
+		select {
+		case <-done:
+			t.Fatal("returned with RoundTrip still running")
+		default:
+		}
+		close(release)
+		if err := <-done; err != context.Canceled {
+			t.Fatal(err)
+		}
+		if !body.closed {
+			t.Fatal("late response leaked")
+		}
+	})
+}
 
 func TestDuplexMessageStreamOverHTTP2(t *testing.T) {
 	requestEOF := make(chan struct{})

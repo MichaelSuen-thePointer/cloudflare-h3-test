@@ -194,8 +194,7 @@ func TestStreamLaneKeepaliveContinuousBusinessAndSibling(t *testing.T) {
 				idle := newStreamLane(1, idleStream)
 				s.lanes = append(s.lanes, idle)
 				// Separate queues let the test direct all business traffic to one lane.
-				idleSession := *s.state
-				idleSession.batchSize = 4
+				idleSession := clientState{transport: transport, batchSize: 4, stats: s.state.stats, metrics: s.state.metrics}
 				s.goRun(func() { s.laneWriteLoop(s.state, busy) })
 				s.goRun(func() { s.laneWriteLoop(&idleSession, idle) })
 				for range 4 {

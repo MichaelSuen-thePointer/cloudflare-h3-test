@@ -5,10 +5,12 @@ package quality
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"syscall"
@@ -18,7 +20,7 @@ import (
 	"cloudflare-h3-test/internal/qualitytest"
 )
 
-// The helper uses real os.Exit, so this marker must never be executed on SIGTERM.
+// Signals belong to the process owner; normal return must run business defers.
 func TestSIGTERMProcessHelper(t *testing.T) {
 	if os.Getenv("QUALITY_SIGTERM_HELPER") != "1" {
 		return
@@ -34,7 +36,9 @@ func TestSIGTERMProcessHelper(t *testing.T) {
 	defer barrier.Release()
 	initialized := make(chan error, 2)
 	r := New(c, "client", func(_ string, err error) { initialized <- err })
-	defer InstallSIGTERM(r, func() { fmt.Fprintln(os.Stderr, "quality-stop-timeout") })()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+	defer r.Close()
 	if err := <-initialized; err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +62,7 @@ func TestSIGTERMProcessHelper(t *testing.T) {
 		barrier.Release()
 	}()
 	fmt.Println("READY")
-	select {}
+	<-ctx.Done()
 }
 
 func runSIGTERMProcess(t *testing.T, dir string) {
@@ -112,8 +116,8 @@ func runSIGTERMProcess(t *testing.T, dir string) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("SIGTERM did not exit within budget")
 	}
-	if _, err := os.Stat(filepath.Join(dir, "business-defer")); !os.IsNotExist(err) {
-		t.Fatalf("business defer executed: %v", err)
+	if _, err := os.Stat(filepath.Join(dir, "business-defer")); err != nil {
+		t.Fatalf("business defer did not execute: %v", err)
 	}
 }
 

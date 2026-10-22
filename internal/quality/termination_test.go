@@ -7,13 +7,37 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sync"
-	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"cloudflare-h3-test/internal/qualitytest"
 )
+
+func TestCloseWaitsWithoutDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var disabled *Recorder
+		disabled.Close()
+		r := &Recorder{stop: make(chan struct{}), done: make(chan struct{})}
+		r.accepting.Store(true)
+		closed := make(chan struct{})
+		go func() { r.Close(); close(closed) }()
+		<-r.stop
+		if r.Enabled() {
+			t.Fatal("still accepting")
+		}
+		time.Sleep(time.Minute)
+		select {
+		case <-closed:
+			t.Fatal("Close returned before writer exit")
+		default:
+		}
+		close(r.done)
+		synctest.Wait()
+		<-closed
+		r.Close()
+	})
+}
 
 func TestStopCompletion(t *testing.T) {
 	var disabled *Recorder
@@ -113,212 +137,6 @@ func TestStorageCloseReportsErrorAndClosesDatabase(t *testing.T) {
 	}
 	if err := w.db.Ping(); err == nil {
 		t.Fatal("database was not closed after connection error")
-	}
-}
-
-func TestTerminationRepeatsAndCompletion(t *testing.T) {
-	signals := make(chan os.Signal, 1)
-	entered, release := make(chan struct{}), make(chan struct{})
-	exit := make(chan int, 1)
-	var calls, unsub atomic.Int32
-	cleanup := watchTermination(signals, func() { unsub.Add(1) }, func(timeout time.Duration) bool {
-		if timeout != 10*time.Second {
-			t.Errorf("budget = %s", timeout)
-		}
-		calls.Add(1)
-		close(entered)
-		<-release
-		return true
-	}, func() { t.Error("unexpected timeout") }, func(code int) { exit <- code })
-	signals <- os.Interrupt
-	select {
-	case <-entered:
-	case <-time.After(time.Second):
-		t.Fatal("signal ignored")
-	}
-	for i := 0; i < 20; i++ {
-		select {
-		case signals <- os.Interrupt:
-		default:
-		}
-	}
-	select {
-	case <-exit:
-		t.Fatal("exited before writer completion")
-	default:
-	}
-	close(release)
-	select {
-	case code := <-exit:
-		if code != 0 {
-			t.Fatalf("exit %d", code)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("exit not called")
-	}
-	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func() { defer wg.Done(); cleanup() }()
-	}
-	wg.Wait()
-	if calls.Load() != 1 || unsub.Load() != 1 {
-		t.Fatalf("stops=%d unsubscribe=%d", calls.Load(), unsub.Load())
-	}
-}
-
-func TestTerminationTimeout(t *testing.T) {
-	signals := make(chan os.Signal, 1)
-	exit := make(chan int, 1)
-	reported := make(chan struct{})
-	cleanup := watchTermination(signals, func() {}, func(timeout time.Duration) bool {
-		if timeout != terminationTimeout {
-			t.Errorf("budget %s", timeout)
-		}
-		return false
-	}, func() { close(reported) }, func(code int) { exit <- code })
-	defer cleanup()
-	signals <- os.Interrupt
-	select {
-	case code := <-exit:
-		if code != 1 {
-			t.Fatalf("exit=%d", code)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timeout not handled")
-	}
-	select {
-	case <-reported:
-	case <-time.After(time.Second):
-		t.Fatal("diagnostic not attempted")
-	}
-}
-
-func TestTerminationTimeoutWithBlockedDiagnostic(t *testing.T) {
-	signals := make(chan os.Signal, 1)
-	exit := make(chan int, 1)
-	entered, release, reported := make(chan struct{}), make(chan struct{}), make(chan struct{})
-	cleanup := watchTermination(signals, func() {}, func(time.Duration) bool { return false }, func() { close(entered); <-release; close(reported) }, func(code int) { exit <- code })
-	defer func() {
-		// Release a synchronously blocked reporter before waiting for the helper.
-		// This cleanup must also finish when the behavior under test regresses.
-		close(release)
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		cleaned := make(chan struct{})
-		go func() { cleanup(); close(cleaned) }()
-		select {
-		case <-reported:
-		case <-ctx.Done():
-			t.Error("diagnostic did not finish during cleanup")
-		}
-		select {
-		case <-cleaned:
-		case <-ctx.Done():
-			t.Error("termination helper did not finish during cleanup")
-		}
-	}()
-	signals <- os.Interrupt
-	select {
-	case code := <-exit:
-		if code != 1 {
-			t.Fatalf("exit=%d", code)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("blocked diagnostic prevented exit")
-	}
-	select {
-	case <-entered:
-	case <-time.After(time.Second):
-		t.Fatal("diagnostic not attempted")
-	}
-	select {
-	case <-reported:
-		t.Fatal("diagnostic unexpectedly completed")
-	default:
-	}
-}
-
-func TestTerminationNormalReturn(t *testing.T) {
-	signals := make(chan os.Signal, 1)
-	var unsub atomic.Int32
-	cleanup := watchTermination(signals, func() { unsub.Add(1) }, func(time.Duration) bool { t.Error("normal return stopped recorder"); return true }, nil, func(int) { t.Error("normal return exited process") })
-	cleanup()
-	cleanup()
-	if unsub.Load() != 1 {
-		t.Fatal("not unsubscribed once")
-	}
-}
-
-func TestTerminationSingleConcurrentInstall(t *testing.T) {
-	var installs, unsubs atomic.Int32
-	signals := make(chan os.Signal, 1)
-	r := &Recorder{}
-	install := func() func() {
-		installs.Add(1)
-		return watchTermination(signals, func() { unsubs.Add(1) }, func(time.Duration) bool { t.Error("unexpected stop"); return true }, nil, func(int) { t.Error("unexpected exit") })
-	}
-	var wg sync.WaitGroup
-	for i := 0; i < 16; i++ {
-		wg.Add(1)
-		go func() { defer wg.Done(); r.installTermination(install)() }()
-	}
-	wg.Wait()
-	if installs.Load() != 1 || unsubs.Load() != 1 {
-		t.Fatalf("installs=%d unsubscribe=%d", installs.Load(), unsubs.Load())
-	}
-	var nilRecorder *Recorder
-	nilRecorder.installTermination(func() func() { t.Fatal("nil recorder subscribed"); return func() {} })()
-}
-
-func TestTerminationCleanupWhileStopping(t *testing.T) {
-	signals := make(chan os.Signal, 1)
-	entered, release := make(chan struct{}), make(chan struct{})
-	cleanupStarted, cleanupDone := make(chan struct{}), make(chan struct{})
-	unsubscribed := make(chan struct{})
-	var stops, exits atomic.Int32
-	cleanup := watchTermination(signals, func() { close(unsubscribed) }, func(time.Duration) bool { stops.Add(1); close(entered); <-release; return true }, nil, func(code int) {
-		if code != 0 {
-			t.Errorf("exit %d", code)
-		}
-		exits.Add(1)
-	})
-	signals <- os.Interrupt
-	select {
-	case <-entered:
-	case <-time.After(time.Second):
-		t.Fatal("stop not entered")
-	}
-	go func() { close(cleanupStarted); cleanup(); close(cleanupDone) }()
-	<-cleanupStarted
-	// While Stop is blocked, neither cancellation of the subscription nor cleanup
-	// completion is allowed. Repeated signals remain buffered/coalesced.
-	select {
-	case <-unsubscribed:
-		t.Fatal("unsubscribed during Stop")
-	case <-cleanupDone:
-		t.Fatal("cleanup finished during Stop")
-	case <-time.After(20 * time.Millisecond):
-	}
-	for i := 0; i < 8; i++ {
-		select {
-		case signals <- os.Interrupt:
-		default:
-		}
-	}
-	close(release)
-	select {
-	case <-cleanupDone:
-	case <-time.After(time.Second):
-		t.Fatal("cleanup stuck")
-	}
-	select {
-	case <-unsubscribed:
-	default:
-		t.Fatal("not unsubscribed after Stop")
-	}
-	if stops.Load() != 1 || exits.Load() != 1 {
-		t.Fatalf("stop=%d exit=%d", stops.Load(), exits.Load())
 	}
 }
 

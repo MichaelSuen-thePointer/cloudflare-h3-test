@@ -18,7 +18,12 @@ const metricsBuild = true
 func (s *server) metricsLoop() {
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
-	for range t.C {
+	for {
+		select {
+		case <-s.lifecycleDone():
+			return
+		case <-t.C:
+		}
 		b, _ := json.Marshal(s.snapshot())
 		log.Print(string(b))
 	}
@@ -34,7 +39,12 @@ func (s *server) writeMetrics(path string, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	enc := json.NewEncoder(f)
-	for range t.C {
+	for {
+		select {
+		case <-s.lifecycleDone():
+			return
+		case <-t.C:
+		}
 		if err := enc.Encode(s.snapshot()); err != nil {
 			appLog.Warn("metrics-write-failed", "path", path, "err", err)
 			return

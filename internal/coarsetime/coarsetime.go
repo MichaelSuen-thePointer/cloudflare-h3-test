@@ -1,6 +1,7 @@
 package coarsetime
 
 import (
+	"context"
 	"sync/atomic"
 	"time"
 )
@@ -11,13 +12,22 @@ var unixNano atomic.Int64
 
 func init() {
 	unixNano.Store(time.Now().UnixNano())
-	go func() {
-		ticker := time.NewTicker(Tick)
-		defer ticker.Stop()
-		for now := range ticker.C {
+}
+
+// Run is owned and joined by the UDP process, rather than started by import.
+// Reading the cached time still requires only one atomic load.
+func Run(ctx context.Context) {
+	unixNano.Store(time.Now().UnixNano())
+	ticker := time.NewTicker(Tick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
 			unixNano.Store(now.UnixNano())
 		}
-	}()
+	}
 }
 
 func UnixNano() int64 {

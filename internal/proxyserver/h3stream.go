@@ -78,6 +78,7 @@ func (s *h3ServerStream) Close() error {
 		s.closed.Store(true)
 		// Unblock an in-flight downlink write before waiting for its write lock.
 		_ = http.NewResponseController(s.response).SetWriteDeadline(time.Now())
+		_ = http.NewResponseController(s.response).SetReadDeadline(time.Now())
 		_ = s.requestBody.Close()
 		s.writeMu.Lock()
 		s.writeMu.Unlock()

@@ -9,15 +9,16 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"net/http"
-	_ "net/http/pprof"
 	"net/netip"
 	"net/url"
+	"os"
+	"os/signal"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"cloudflare-h3-test/internal/coarsetime"
@@ -100,6 +101,18 @@ const streamEncodeBufferRetainLimit = 512 << 10
 const streamKeepaliveInterval = 10 * time.Second
 
 func Main(args []string) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := Run(ctx, args); err != nil {
+		stop()
+		log.Fatal(err)
+	}
+}
+
+// Run owns all client resources until cancellation and worker completion.
+func Run(ctx context.Context, args []string) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	qualityConfig := quality.Defaults("client")
 	var listen, remote, token, connectIP, metricsOut, transport, logLevel, pprofAddr string
 	var lanesN, wsLanesN, poolSize, wsPoolSize, h3StreamsPerTransport, batchSize, sendQueue, wsSocketSendBuffer, wsSocketReceiveBuffer int
@@ -147,6 +160,7 @@ func Main(args []string) {
 	if err := configureLogger("proxy-client", logLevel, useSyslog); err != nil {
 		log.Fatal(err)
 	}
+	defer appLog.Close()
 
 	pluginEnv, err := PluginEnv.LoadFromEnv()
 	if err != nil {
@@ -224,16 +238,6 @@ func Main(args []string) {
 	if idle <= 0 {
 		idle = 120 * time.Second
 	}
-	if pprofAddr != "" {
-		runtime.SetBlockProfileRate(1)
-		runtime.SetMutexProfileFraction(10)
-		go func() {
-			appLog.Info("proxy-client-pprof-start", "listen", pprofAddr)
-			if err := http.ListenAndServe(pprofAddr, nil); err != nil {
-				appLog.Warn("proxy-client-pprof-failed", "listen", pprofAddr, "err", err)
-			}
-		}()
-	}
 	addr, err := net.ResolveUDPAddr("udp", listen)
 	if err != nil {
 		log.Fatal(err)
@@ -258,31 +262,51 @@ func Main(args []string) {
 			appLog.Info("quality-start", "path", path)
 		}
 	})
-	defer recorder.Stop(2 * time.Second)
-	defer quality.InstallSIGTERM(recorder, func() { appLog.Warn("quality-stop-timeout") })()
+	defer recorder.Close()
 	// Acquisition/Attach retain their context budget; established writes have no deadline.
 	wsSocketOptions := relay.WebSocketSocketOptions{SendBuffer: wsSocketSendBuffer, ReceiveBuffer: wsSocketReceiveBuffer, DisableWriteTimeout: true}
-	state := &clientState{quality: recorder, transport: transport, laneTarget: lanesN, lanesIncremental: lanesIncremental, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, idle: idle, udp: udp, sessions: map[netip.AddrPort]*session{}, stats: stats, metrics: metrics}
+	state := &clientState{ctx: ctx, quality: recorder, transport: transport, laneTarget: lanesN, lanesIncremental: lanesIncremental, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, idle: idle, udp: udp, sessions: map[netip.AddrPort]*session{}, stats: stats, metrics: metrics}
 	if transport == "ws" {
 		state.provider = newWSProvider(remote, connectIP, token, poolSize, timeout, wsSocketOptions, metrics, recorder)
 	} else {
 		state.provider, err = newH3Provider(relay.HTTP3ClientOptions{URL: remote, ConnectIP: connectIP, QUICReceiveWindows: quicWindows}, token, h3StreamsPerTransport, poolSize, timeout, metrics, recorder)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 	}
-	defer state.provider.Close()
+	stopProfile := func() {}
+	defer func() { cancel(); state.shutdown(); stopProfile() }()
+	state.goRun(func() { coarsetime.Run(ctx) })
 	if metricsBuild && metricsOut != "" {
-		go state.writeMetrics(metricsOut, metricsInterval)
+		state.goRun(func() { state.writeMetrics(metricsOut, metricsInterval) })
 	}
-	go state.cleanupLoop()
+	state.goRun(state.cleanupLoop)
+	if pprofAddr != "" {
+		runtime.SetBlockProfileRate(1)
+		runtime.SetMutexProfileFraction(10)
+		profileClose, profileErr := startProfile(ctx, pprofAddr)
+		if profileErr != nil {
+			return profileErr
+		}
+		stopProfile = profileClose
+	}
+	readStopped := make(chan struct{})
+	stopRead := context.AfterFunc(ctx, func() { _ = udp.Close(); close(readStopped) })
+	defer func() {
+		if !stopRead() {
+			<-readStopped
+		}
+	}()
 	appLog.Info("proxy-client-start", "listen", listen, "remote", remote, "connect_ip", connectIP, "transport", transport, "lanes", lanesN, "pool_size", poolSize, "lanes_incremental", lanesIncremental, "h3_streams_per_transport", h3StreamsPerTransport, "ws_socket_send_buffer", wsSocketSendBuffer, "ws_socket_recv_buffer", wsSocketReceiveBuffer)
 	buf := make([]byte, 65535)
 	for {
 		n, peer, err := udp.ReadFromUDP(buf)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			recorder.Error(quality.Subject{}, "udp-read", err, nil)
-			log.Fatal(err)
+			return err
 		}
 		key, ok := udpPeerKeyFromAddr(peer)
 		if !ok {
@@ -291,11 +315,16 @@ func Main(args []string) {
 		}
 		payload := append([]byte(nil), buf[:n]...)
 		sess := state.getSession(key, peer)
-		sess.enqueue(payload)
+		if sess != nil {
+			sess.enqueue(payload)
+		}
 	}
 }
 
 type clientState struct {
+	ctx              context.Context
+	stopping         bool // protected by mu
+	workers          sync.WaitGroup
 	quality          *quality.Recorder
 	transport        string
 	laneTarget       int
@@ -344,13 +373,20 @@ func udpPeerKeyFromAddr(addr *net.UDPAddr) (netip.AddrPort, bool) {
 func (c *clientState) getSession(key netip.AddrPort, peer *net.UDPAddr) *session {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.stopping || (c.ctx != nil && c.ctx.Err() != nil) {
+		return nil
+	}
 	if sess := c.sessions[key]; sess != nil {
 		sess.touch()
 		return sess
 	}
 	peerLabel := key.String()
 	id := randomID()
-	ctx, cancel := context.WithCancel(context.Background())
+	parent := c.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
 	var batchQ chan []relay.Frame
 	if !c.usesDirectLaneWrite() {
 		batchQ = make(chan []relay.Frame, batchQueueCapacity(c.sendQueue, c.batchSize))
@@ -376,7 +412,12 @@ func (c *clientState) getSession(key netip.AddrPort, peer *net.UDPAddr) *session
 func (c *clientState) cleanupLoop() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
+	for {
+		select {
+		case <-c.lifecycleDone():
+			return
+		case <-ticker.C:
+		}
 		cutoff := time.Now().Add(-c.idle)
 		var expired []struct {
 			key  netip.AddrPort
@@ -430,9 +471,9 @@ func (c *clientState) connectInitialLanes(sess *session, key netip.AddrPort, pee
 		if !errors.Is(err, errSessionClosed) {
 			appLog.WarnRate("stream_initial_connect_failed", 10*time.Second, "stream-initial-connect-failed", "session", sess.id, "peer", peerLabel, "err", err, "transport", c.transport)
 			if sess.state != nil {
-				go sess.state.closeSession(key, sess, "initial-connect-failed")
+				sess.state.goRun(func() { sess.state.closeSession(key, sess, "initial-connect-failed") })
 			} else {
-				sess.close("initial-connect-failed")
+				sess.stop("initial-connect-failed")
 			}
 		}
 		return
@@ -798,6 +839,18 @@ func (s *session) idleBefore(cutoff time.Time) bool {
 }
 
 func (s *session) close(reasons ...string) {
+	s.stop(reasons...)
+	s.wait()
+}
+
+func (s *session) wait() {
+	s.wgMu.Lock()
+	s.wgMu.Unlock()
+	s.wg.Wait()
+}
+
+// stop never waits for workers, so a worker may initiate its own cancellation.
+func (s *session) stop(reasons ...string) {
 	s.closeOnce.Do(func() {
 		s.qr.Life(s.q, "session-lifecycle", "close", reasons...)
 		close(s.closed)
@@ -815,18 +868,6 @@ func (s *session) close(reasons ...string) {
 			if ln.stream != nil {
 				_ = ln.stream.Close()
 			}
-		}
-		s.wgMu.Lock()
-		s.wgMu.Unlock()
-		done := make(chan struct{})
-		go func() {
-			s.wg.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			appLog.Warn("session-close-timeout", "session", s.id)
 		}
 	})
 }

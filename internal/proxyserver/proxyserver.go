@@ -1,6 +1,7 @@
 package proxyserver
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -9,10 +10,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"cloudflare-h3-test/internal/coarsetime"
@@ -67,6 +70,11 @@ type serverLane struct {
 }
 
 type server struct {
+	ctx                   context.Context
+	stopping              bool // protected by mu
+	requests              map[*serverRequest]struct{}
+	workers               sync.WaitGroup
+	handlers              sync.WaitGroup
 	quality               *quality.Recorder
 	token                 string
 	upstream              *net.UDPAddr
@@ -113,6 +121,18 @@ type serverStats struct {
 }
 
 func Main(args []string) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := Run(ctx, args); err != nil {
+		stop()
+		log.Fatal(err)
+	}
+}
+
+// Run returns only after accepted streams and all workers have been joined.
+func Run(ctx context.Context, args []string) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	qualityConfig := quality.Defaults("server")
 	var listen, cert, key, token, upstream, metricsOut, logLevel string
 	var udpBuffer, downQueue, batchSize, downExpandLanesMax, wsSocketSendBuffer, wsSocketReceiveBuffer int
@@ -144,6 +164,7 @@ func Main(args []string) {
 	if err := configureLogger("proxy-server", logLevel, useSyslog); err != nil {
 		log.Fatal(err)
 	}
+	defer appLog.Close()
 
 	pluginEnv, err := PluginEnv.LoadFromEnv()
 	if err != nil {
@@ -201,31 +222,49 @@ func Main(args []string) {
 			appLog.Info("quality-start", "path", path)
 		}
 	})
-	defer recorder.Stop(2 * time.Second)
-	defer quality.InstallSIGTERM(recorder, func() { appLog.Warn("quality-stop-timeout") })()
+	defer recorder.Close()
 	// Established WS writes follow the connection lifecycle, without a per-write deadline.
 	wsSocketOptions := relay.WebSocketSocketOptions{SendBuffer: wsSocketSendBuffer, ReceiveBuffer: wsSocketReceiveBuffer, DisableWriteTimeout: true}
-	s := &server{quality: recorder, token: token, upstream: addr, benchEcho: benchEcho, idle: idle, udpBuffer: udpBuffer, downQueue: downQueue, batchSize: batchSize, batchDelay: batchDelay, wsSocketOptions: wsSocketOptions, downExpandLanesMax: downExpandLanesMax, downExpandHintTimeout: downExpandHintTimeout, metrics: metrics, sessions: map[string]*session{}}
-	go s.cleanupLoop()
+	s := &server{ctx: ctx, quality: recorder, token: token, upstream: addr, benchEcho: benchEcho, idle: idle, udpBuffer: udpBuffer, downQueue: downQueue, batchSize: batchSize, batchDelay: batchDelay, wsSocketOptions: wsSocketOptions, downExpandLanesMax: downExpandLanesMax, downExpandHintTimeout: downExpandHintTimeout, metrics: metrics, sessions: map[string]*session{}}
+	s.goRun(func() { coarsetime.Run(ctx) })
+	s.goRun(s.cleanupLoop)
 	if metricsBuild && metricsOut != "" {
-		go s.writeMetrics(metricsOut, 5*time.Second)
+		s.goRun(func() { s.writeMetrics(metricsOut, 5*time.Second) })
 	} else if metricsBuild && s.metrics {
-		go s.metricsLoop()
+		s.goRun(s.metricsLoop)
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handle)
 	appLog.Info("proxy-server-start", "listen", listen, "upstream", upstream, "bench_echo", benchEcho, "metrics", metrics, "batch_size", batchSize, "batch_delay", batchDelay, "ws_socket_send_buffer", wsSocketSendBuffer, "ws_socket_recv_buffer", wsSocketReceiveBuffer, "down_expand_lanes_max", downExpandLanesMax, "down_expand_hint_timeout", downExpandHintTimeout)
-	httpServer := &http.Server{Addr: listen, Handler: mux, ErrorLog: appLog.StdLogger(diaglog.Warn, "http-server-error")}
+	httpServer := &http.Server{Addr: listen, Handler: mux, BaseContext: func(net.Listener) context.Context { return ctx }, ErrorLog: appLog.StdLogger(diaglog.Warn, "http-server-error")}
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		<-ctx.Done()
+		_ = httpServer.Close()
+		s.shutdown()
+	}()
 	if cert == "" && key == "" {
-		log.Fatal(httpServer.ListenAndServe())
+		err = httpServer.ListenAndServe()
+	} else if cert == "" || key == "" {
+		err = errors.New("-cert and -key must be provided together")
+	} else {
+		err = httpServer.ListenAndServeTLS(cert, key)
 	}
-	if cert == "" || key == "" {
-		log.Fatal("-cert and -key must be provided together")
+	cancel()
+	<-stopped
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
 	}
-	log.Fatal(httpServer.ListenAndServeTLS(cert, key))
+	return err
 }
 
 func (s *server) handle(w http.ResponseWriter, r *http.Request) {
+	owned := s.beginRequest(w)
+	if owned == nil {
+		return
+	}
+	defer s.endRequest(owned)
 	s.countMethod()
 	if r.Header.Get("X-Relay-Token") != s.token {
 		s.countStatus(http.StatusNotFound)
@@ -238,18 +277,22 @@ func (s *server) handle(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "bad websocket", http.StatusBadRequest)
 			return
 		}
-		s.handleWebSocket(w, r)
+		s.handleWebSocket(w, r, owned)
 		return
 	}
 	if r.Method == http.MethodPost && r.URL.Path == "/" && r.Header.Get("X-Client-HTTP-Version") == "HTTP/3" {
-		s.handleH3Stream(w, r)
+		s.handleH3Stream(w, r, owned)
 		return
 	}
 	s.countStatus(http.StatusNotFound)
 	http.NotFound(w, r)
 }
 
-func (s *server) handleH3Stream(w http.ResponseWriter, r *http.Request) {
+func (s *server) handleH3Stream(w http.ResponseWriter, r *http.Request, owned *serverRequest) {
+	stream := &h3ServerStream{requestBody: r.Body, response: w}
+	if !owned.setStream(stream) {
+		return
+	}
 	if r.ProtoMajor == 1 {
 		if err := http.NewResponseController(w).EnableFullDuplex(); err != nil {
 			s.countStatus(http.StatusInternalServerError)
@@ -265,7 +308,6 @@ func (s *server) handleH3Stream(w http.ResponseWriter, r *http.Request) {
 		s.quality.Error(quality.Subject{}, "h3-response-flush", err, nil)
 		return
 	}
-	stream := &h3ServerStream{requestBody: r.Body, response: w}
 	op := s.quality.Begin(quality.Subject{}, "h3-attach-read")
 	id, err := readH3AttachSession(stream)
 	op.End(err)
@@ -274,14 +316,17 @@ func (s *server) handleH3Stream(w http.ResponseWriter, r *http.Request) {
 		appLog.WarnRate("h3_attach_failed", 10*time.Second, "h3-attach-failed", "remote", r.RemoteAddr, "err", err)
 		return
 	}
-	s.serveAttachedStream(stream, "h3", id, r.RemoteAddr, r.Context().Done())
+	s.serveAttachedStream(stream, "h3", id, r.RemoteAddr, r.Context())
 }
 
-func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	ws, err := relay.AcceptWebSocketWithOptions(w, r, s.wsSocketOptions)
+func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request, owned *serverRequest) {
+	ws, err := relay.AcceptWebSocketWithOptions(upgradeResponse{ResponseWriter: w, owned: owned}, r, s.wsSocketOptions)
 	if err != nil {
 		s.quality.Error(quality.Subject{}, "websocket-accept-failed", err, nil)
 		appLog.WarnRate("websocket_accept_failed", 10*time.Second, "websocket-accept-failed", "remote", r.RemoteAddr, "err", err)
+		return
+	}
+	if !owned.setStream(ws) {
 		return
 	}
 	s.countUnattachedWS(1)
@@ -294,10 +339,13 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		_ = ws.Close()
 		return
 	}
-	s.serveAttachedStream(ws, "ws", id, r.RemoteAddr, r.Context().Done())
+	s.serveAttachedStream(ws, "ws", id, r.RemoteAddr, r.Context())
 }
 
-func (s *server) serveAttachedStream(stream relay.MessageStream, transport, id, remoteAddr string, requestDone <-chan struct{}) {
+func (s *server) serveAttachedStream(stream relay.MessageStream, transport, id, remoteAddr string, ctx context.Context) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	requestDone := ctx.Done()
 	acquire := s.quality.Begin(quality.Subject{}, transport+"-session-acquire")
 	sess, err := s.getSession(id)
 	acquire.End(err)
@@ -334,8 +382,10 @@ func (s *server) serveAttachedStream(stream relay.MessageStream, transport, id, 
 		sess.startDownBatchLoop(s)
 	}
 	done := make(chan struct{})
+	defer func() { cancel(); _ = stream.Close(); <-done }()
 	go func() {
 		defer close(done)
+		defer stream.Close()
 		if s.usesDirectLaneWrite() {
 			s.writeLaneDownDirectLoop(lane, sess, id, remoteAddr, requestDone)
 			return
@@ -427,7 +477,7 @@ func (s *server) handleInboundFrameAfterTouch(sess *session, f relay.Frame) erro
 
 func (sess *session) startDownBatchLoop(parent *server) {
 	sess.batchOnce.Do(func() {
-		go sess.downBatchLoop(parent)
+		parent.goRun(func() { sess.downBatchLoop(parent) })
 	})
 }
 
@@ -436,7 +486,7 @@ func (sess *session) startExpandHintLoop(parent *server) {
 		return
 	}
 	sess.expandHintOnce.Do(func() {
-		go sess.expandHintLoop(parent)
+		parent.goRun(func() { sess.expandHintLoop(parent) })
 	})
 }
 
@@ -742,6 +792,9 @@ func (l *serverLane) retainEncodeBuffer(body []byte) {
 func (s *server) getSession(id string) (*session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.stopping {
+		return nil, errSessionClosed
+	}
 	if sess := s.sessions[id]; sess != nil {
 		return sess, nil
 	}
@@ -773,7 +826,7 @@ func (s *server) getSession(id string) (*session, error) {
 	s.sessions[id] = sess
 	s.countSessionMade()
 	if !s.benchEcho {
-		go sess.readLoop(s)
+		s.goRunLocked(func() { sess.readLoop(s) })
 	}
 	return sess, nil
 }
@@ -798,7 +851,12 @@ func (s *server) closeSession(id string, reasons ...string) {
 func (s *server) cleanupLoop() {
 	t := time.NewTicker(10 * time.Second)
 	defer t.Stop()
-	for range t.C {
+	for {
+		select {
+		case <-s.lifecycleDone():
+			return
+		case <-t.C:
+		}
 		cutoff := time.Now().Add(-s.idle)
 		var ids []string
 		s.mu.Lock()
@@ -887,25 +945,12 @@ func (s *session) close(reasons ...string) {
 			lanes = append(lanes, ln)
 		}
 		s.lanesMu.Unlock()
+		if s.udp != nil {
+			_ = s.udp.Close()
+		}
 		for _, ln := range lanes {
 			if ln.stream != nil {
 				_ = ln.stream.Close()
-			}
-		}
-		for {
-			select {
-			case <-s.queue:
-			default:
-				for {
-					select {
-					case <-s.batchQ:
-					default:
-						if s.udp != nil {
-							_ = s.udp.Close()
-						}
-						return
-					}
-				}
 			}
 		}
 	})
