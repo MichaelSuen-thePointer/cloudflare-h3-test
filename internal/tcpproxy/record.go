@@ -6,6 +6,8 @@ import (
 	"io"
 	"sync"
 	"time"
+
+	"cloudflare-h3-test/internal/quality"
 )
 
 var (
@@ -106,16 +108,19 @@ func (r *recordReader) ReadData(p []byte, onControl func(uint16) error) (int, er
 // recordWriter serializes one complete record plus Flush. Arbitrarily large
 // Writes release mu between records so control writes can make progress.
 type recordWriter struct {
-	mu        sync.Mutex
-	w         io.Writer
-	flush     func() error
-	trackSend bool
-	now       func() time.Time
-	lastSend  time.Time
-	active    bool
-	stopped   bool
-	err       error
-	buf       []byte
+	// Immutable before business Write begins; controls never access these fields.
+	qualityRecorder *quality.Recorder
+	qualitySubject  quality.Subject
+	mu              sync.Mutex
+	w               io.Writer
+	flush           func() error
+	trackSend       bool
+	now             func() time.Time
+	lastSend        time.Time
+	active          bool
+	stopped         bool
+	err             error
+	buf             []byte
 }
 
 func newRecordWriter(w io.Writer, flush func() error, trackSend bool) *recordWriter {
@@ -196,7 +201,10 @@ func (w *recordWriter) writeLocked(header uint16, payload []byte) (int, error) {
 }
 
 func (w *recordWriter) Write(p []byte) (int, error) {
+	sample := w.qualityRecorder.Transfer()
 	if len(p) == 0 {
+		sample.Returned()
+		sample.ByteStreamDone(w.qualitySubject, "data-write", 0, nil)
 		return 0, nil
 	}
 	total := 0
@@ -210,10 +218,14 @@ func (w *recordWriter) Write(p []byte) (int, error) {
 		w.mu.Unlock()
 		total += n
 		if err != nil {
+			sample.Returned()
+			sample.ByteStreamDone(w.qualitySubject, "data-write", total, err)
 			return total, err
 		}
 		p = p[size:]
 	}
+	sample.Returned()
+	sample.ByteStreamDone(w.qualitySubject, "data-write", total, nil)
 	return total, nil
 }
 

@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"cloudflare-h3-test/internal/quality"
 	"cloudflare-h3-test/internal/relay"
 )
 
@@ -200,6 +201,8 @@ func (s *tcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if ws {
 		transport = TransportWebSocket
 	}
+	subject := s.cfg.QualityRecorder.NewTCPSession(session.id, transport)
+	s.cfg.QualityRecorder.TCPLife(subject, "handler-start", nil, false, "")
 	created := false
 	var failure error
 	failureStage := ""
@@ -221,6 +224,7 @@ func (s *tcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if created {
 			s.cfg.logDebug("tcp-connection-close", "session", session.id)
 		}
+		s.cfg.QualityRecorder.TCPLife(subject, "handler-end", failure, failure != nil, failureStage)
 		s.wg.Done()
 	}()
 	requestDone := make(chan struct{})
@@ -285,6 +289,9 @@ func (s *tcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	reader := newRecordReader(carrier)
 	writer := newRecordWriter(carrier, nil, false)
+	writer.qualityRecorder = s.cfg.QualityRecorder
+	writer.qualitySubject = subject
+
 	for {
 		header, err := reader.ReadHeader()
 		if err != nil {
@@ -312,7 +319,10 @@ opened:
 	idle = false
 	s.mu.Unlock()
 	dialCtx, cancel := context.WithTimeout(session.ctx, upstreamDialTimeout)
+	dial := s.cfg.QualityRecorder.Call()
 	upstream, err := s.dialUpstream(dialCtx, "tcp", s.cfg.Upstream)
+	dial.Returned()
+	dial.CallDone(subject, "upstream-dial", err)
 	cancel()
 	if err != nil {
 		fail("upstream-dial", err)
@@ -326,6 +336,7 @@ opened:
 		return
 	}
 	s.cfg.logDebug("tcp-connection-ready", "session", session.id)
+	s.cfg.QualityRecorder.TCPLife(subject, "ready", nil, false, "")
 	if err := s.relayRecords(session.ctx, carrier, upstream, reader, writer, stopAndJoinRequest); err != nil {
 		fail("relay-records", err)
 	}
@@ -346,7 +357,7 @@ func (s *tcpServer) relayRecords(ctx context.Context, c Carrier, upstream net.Co
 	}
 	done := make(chan result, 2)
 	go func() {
-		_, err := io.CopyBuffer(upstream, &serverDataReader{reader: reader, writer: writer}, make([]byte, CopyBufferSize))
+		_, err := io.CopyBuffer(upstream, &serverDataReader{reader: reader, writer: writer, qualityRecorder: writer.qualityRecorder, qualitySubject: writer.qualitySubject}, make([]byte, CopyBufferSize))
 		done <- result{err: err}
 	}()
 	go func() {
@@ -419,17 +430,23 @@ func isServerRecordProtocolError(err error) bool {
 }
 
 type serverDataReader struct {
-	reader *recordReader
-	writer *recordWriter
+	reader          *recordReader
+	writer          *recordWriter
+	qualityRecorder *quality.Recorder
+	qualitySubject  quality.Subject
 }
 
 func (r *serverDataReader) Read(p []byte) (int, error) {
-	return r.reader.ReadData(p, func(header uint16) error {
+	sample := r.qualityRecorder.Transfer()
+	n, err := r.reader.ReadData(p, func(header uint16) error {
 		if header != ControlPing {
 			return fmt.Errorf("%w: invalid active upstream control record", errRecordControl)
 		}
 		return r.writer.WriteControl(ControlPong)
 	})
+	sample.Returned()
+	sample.ByteStreamDone(r.qualitySubject, "data-read", n, err)
+	return n, err
 }
 
 type originH3Carrier struct {

@@ -62,11 +62,15 @@ type Recorder struct {
 	stop, done                       chan struct{}
 	stopOnce                         sync.Once
 	report                           func(string, error)
+	tcp                              bool
 }
 
 // New returns immediately. All file creation and SQLite work belongs to writer.
 // A nil recorder is the entire disabled path; its methods are safe to call.
 func New(c Config, role string, report func(string, error)) *Recorder {
+	return newRecorder(c, role, report, false)
+}
+func newRecorder(c Config, role string, report func(string, error), tcp bool) *Recorder {
 	if c.DBDir == "" {
 		return nil
 	}
@@ -87,7 +91,7 @@ func New(c Config, role string, report func(string, error)) *Recorder {
 	id[8] = (id[8] & 63) | 128
 	h := hex.EncodeToString(id[:])
 	run := h[:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:]
-	r := &Recorder{config: c, run: run, started: time.Now(), input: make(chan record, c.ChannelCapacity), stop: make(chan struct{}), done: make(chan struct{}), report: report}
+	r := &Recorder{config: c, run: run, started: time.Now(), input: make(chan record, c.ChannelCapacity), stop: make(chan struct{}), done: make(chan struct{}), report: report, tcp: tcp}
 	r.accepting.Store(true)
 	go r.write(role)
 	return r
@@ -173,6 +177,14 @@ func setError(e *record, err error) {
 	if err == nil {
 		return
 	}
+	setErrorFacts(e, err)
+	t := err.Error()
+	if len(t) > maxTextBytes {
+		t = t[:maxTextBytes]
+	}
+	e.ErrorText = strings.Clone(t)
+}
+func setErrorFacts(e *record, err error) {
 	e.Outcome = "error"
 	e.ErrorDomain = fmt.Sprintf("%T", err)
 	// Read concrete error codes when exposed; text alone does not classify cause.
@@ -199,11 +211,6 @@ func setError(e *record, err error) {
 		}
 	}
 
-	t := err.Error()
-	if len(t) > maxTextBytes {
-		t = t[:maxTextBytes]
-	}
-	e.ErrorText = strings.Clone(t)
 }
 func (r *Recorder) Error(s Subject, domain string, err error, encoded *int64) {
 	if !r.Enabled() || err == nil {

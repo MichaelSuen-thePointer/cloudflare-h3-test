@@ -7,12 +7,17 @@ import (
 	"io"
 	"net"
 	"sync"
+
+	"cloudflare-h3-test/internal/quality"
 )
 
 func runClientConnection(life, acquire context.Context, cancelAcquire context.CancelFunc, cfg Config, p *standbyPool, local net.Conn) error {
 	id := newSessionID()
+	subject := cfg.QualityRecorder.NewTCPSession(id, cfg.Transport)
+	cfg.QualityRecorder.TCPLife(subject, "handler-start", nil, false, "")
 	cfg.logDebug("tcp-connection-create", "session", id)
-	err := runClientSession(life, acquire, cancelAcquire, cfg, p, local, id)
+	err := runClientSession(life, acquire, cancelAcquire, cfg, p, local, id, subject)
+	cfg.QualityRecorder.TCPLife(subject, "handler-end", err, true, "")
 	if life.Err() == nil && err != nil && !errors.Is(err, context.Canceled) {
 		cfg.logFailure(cfg.Transport, "connection", err, "session", id)
 	}
@@ -20,12 +25,15 @@ func runClientConnection(life, acquire context.Context, cancelAcquire context.Ca
 	return err
 }
 
-func runClientSession(life, acquire context.Context, cancelAcquire context.CancelFunc, cfg Config, p *standbyPool, local net.Conn, id uint64) error {
+func runClientSession(life, acquire context.Context, cancelAcquire context.CancelFunc, cfg Config, p *standbyPool, local net.Conn, id uint64, subject quality.Subject) error {
 	defer local.Close()
 	var e *standbyEntry
 	for {
 		var err error
+		claim := cfg.QualityRecorder.Call()
 		e, err = p.claim(acquire, cancelAcquire)
+		claim.Returned()
+		claim.CallDone(subject, "claim", err)
 		if err != nil {
 			return err
 		}
@@ -62,11 +70,20 @@ func runClientSession(life, acquire context.Context, cancelAcquire context.Cance
 			<-acquireJoined
 		}
 	}()
-	if err := e.writeControl(acquire, ControlOpen); err != nil {
+	open := cfg.QualityRecorder.Call()
+	openErr := e.writeControl(acquire, ControlOpen)
+	open.Returned()
+	open.CallDone(subject, "open-write", openErr)
+	if err := openErr; err != nil {
 		e.abort()
 		<-e.readDone
 		return err
 	}
+	// Only Write reads these fields. Control/PING workers never access them;
+	// publish once before the first business writer goroutine starts.
+	e.writer.qualityRecorder = cfg.QualityRecorder
+	e.writer.qualitySubject = subject
+
 	// Upload starts as soon as OPEN succeeds; ACK progresses on the old reader.
 	up := make(chan error, 1)
 	var terminalMu sync.Mutex
@@ -149,10 +166,11 @@ func runClientSession(life, acquire context.Context, cancelAcquire context.Cance
 		return handshakeErr
 	}
 	cfg.logDebug("tcp-connection-ready", "session", id)
+	cfg.QualityRecorder.TCPLife(subject, "ready", nil, false, "")
 	cancelAcquire() // callback has been stopped and joined; active has no acquire deadline.
 	down := make(chan error, 1)
 	go func() {
-		err := copyTCPRaw(local, clientDataReader{reader: e.reader})
+		err := copyTCPRaw(local, clientDataReader{reader: e.reader, qualityRecorder: cfg.QualityRecorder, qualitySubject: subject})
 		recordTerminal(terminalResult{err: err})
 		down <- err
 	}()
@@ -250,13 +268,21 @@ func clientDrainError(err error) error {
 
 // clientDataReader keeps the same decoder across OPEN_OK, business and drain.
 // Only PONG may be interleaved with downstream DATA in this phase.
-type clientDataReader struct{ reader *recordReader }
+type clientDataReader struct {
+	reader          *recordReader
+	qualityRecorder *quality.Recorder
+	qualitySubject  quality.Subject
+}
 
 func (r clientDataReader) Read(b []byte) (int, error) {
-	return r.reader.ReadData(b, func(header uint16) error {
+	sample := r.qualityRecorder.Transfer()
+	n, err := r.reader.ReadData(b, func(header uint16) error {
 		if header == ControlPong {
 			return nil
 		}
 		return fmt.Errorf("%w: unexpected active client record header %d", errRecordControl, header)
 	})
+	sample.Returned()
+	sample.ByteStreamDone(r.qualitySubject, "data-read", n, err)
+	return n, err
 }

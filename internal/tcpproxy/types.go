@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"cloudflare-h3-test/internal/diaglog"
+	"cloudflare-h3-test/internal/quality"
 	"cloudflare-h3-test/internal/relay"
 )
 
@@ -47,6 +48,8 @@ type Config struct {
 	QUICWindows         relay.QUICReceiveWindows
 	LogLevel            string
 	UseSyslog           bool
+	Quality             quality.Config
+	QualityRecorder     *quality.Recorder
 	logger              *diaglog.Logger
 	unknownOptions      int
 }

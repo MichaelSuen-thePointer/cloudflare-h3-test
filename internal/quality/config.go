@@ -24,7 +24,21 @@ func Defaults(role string) Config {
 	}
 	return Config{DBFilename: role + "-quality.sqlite3", ChannelCapacity: 4096, BatchSize: 1024, CacheKiB: cache, FlushInterval: 250 * time.Millisecond, TransferSampleEvery: 1000, QueueSampleEvery: 1000}
 }
+
+// TCPDefaults keeps TCP storage separate from the UDP layout.
+func TCPDefaults(role string) Config {
+	c := Defaults(role)
+	c.DBFilename = "tcp-" + role + "-quality.sqlite3"
+	return c
+}
+
 func (c *Config) Flags(fs *flag.FlagSet) {
+	c.StorageFlags(fs)
+	fs.IntVar(&c.QueueSampleEvery, "quality-queue-sample-every", c.QueueSampleEvery, "independent queue sampling denominator; 0 disables normal samples")
+}
+
+// StorageFlags registers the storage and transfer controls shared by UDP and TCP.
+func (c *Config) StorageFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.DBDir, "quality-db-dir", c.DBDir, "raw observation database directory; empty disables recording")
 	fs.StringVar(&c.DBFilename, "quality-db-filename", c.DBFilename, "raw observation database filename")
 	fs.IntVar(&c.ChannelCapacity, "quality-channel-capacity", c.ChannelCapacity, "raw observation channel capacity")
@@ -32,7 +46,6 @@ func (c *Config) Flags(fs *flag.FlagSet) {
 	fs.IntVar(&c.CacheKiB, "quality-db-cache-kib", c.CacheKiB, "SQLite page cache budget in KiB")
 	fs.DurationVar(&c.FlushInterval, "quality-db-flush-interval", c.FlushInterval, "raw observation batch flush interval")
 	fs.IntVar(&c.TransferSampleEvery, "quality-transfer-sample-every", c.TransferSampleEvery, "independent transfer sampling denominator; 0 disables normal samples")
-	fs.IntVar(&c.QueueSampleEvery, "quality-queue-sample-every", c.QueueSampleEvery, "independent queue sampling denominator; 0 disables normal samples")
 }
 func IsOption(name string) bool {
 	switch name {

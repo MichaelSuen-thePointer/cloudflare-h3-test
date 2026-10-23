@@ -42,6 +42,13 @@ Options:
                                     explicit 0 keeps quic-go's field default
   --log-level LEVEL         debug|info|warn|error (default info)
   --use-syslog[=true|false]  system syslog sink (default false)
+  --quality-db-dir DIR      raw quality database directory (empty disables recording)
+  --quality-db-filename FILE default tcp-client-quality.sqlite3 / tcp-server-quality.sqlite3
+  --quality-channel-capacity N       bounded observation channel (default 4096)
+  --quality-db-batch-size N          transaction record limit (default 1024)
+  --quality-db-flush-interval DURATION  nonempty batch interval (default 250ms)
+  --quality-db-cache-kib N   SQLite cache budget (client 4096 / server 16384)
+  --quality-transfer-sample-every N   independent DATA call sample (default 1000; 0 disables normal samples)
   --help                    show this help
 
 Durations require units, for example 5s. Unknown CLI and duplicate known options are rejected.
@@ -71,6 +78,8 @@ func run(ctx context.Context, args []string, getenv func(string) string, out, er
 		return 1
 	}
 	defer cfg.CloseLogger()
+	cfg = cfg.InitQuality()
+	defer cfg.QualityRecorder.Close()
 	start := client
 	if cfg.Server {
 		start = server

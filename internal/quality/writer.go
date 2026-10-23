@@ -52,6 +52,7 @@ type storage struct {
 	conn                           *sql.Conn
 	session, lane, op, observation *sql.Stmt
 	cache                          recentKeys
+	tcpRunInitialized              bool
 }
 
 func (w *storage) close() error {
@@ -75,6 +76,9 @@ func (w *storage) close() error {
 	return errors.Join(failures...)
 }
 func openStorage(ctx context.Context, path string, c Config, run, role string, started time.Time) (_ *storage, err error) {
+	return openLayoutStorage(ctx, path, c, run, role, started, false)
+}
+func openLayoutStorage(ctx context.Context, path string, c Config, run, role string, started time.Time, tcp bool) (_ *storage, err error) {
 	w := &storage{}
 	defer func() {
 		if err != nil {
@@ -94,6 +98,11 @@ func openStorage(ctx context.Context, path string, c Config, run, role string, s
 	if err != nil {
 		return nil, err
 	}
+	if tcp {
+		if err = w.initializeTCP(ctx, run, role, started); err != nil {
+			return nil, err
+		}
+	}
 	settings := []struct{ name, value string }{{"journal_mode", "off"}, {"synchronous", "0"}, {"locking_mode", "exclusive"}, {"foreign_keys", "0"}, {"temp_store", "2"}, {"cache_size", strconv.Itoa(-c.CacheKiB)}, {"busy_timeout", "0"}}
 	for _, p := range settings {
 		if _, err = w.conn.ExecContext(ctx, "PRAGMA "+p.name+"="+p.value); err != nil {
@@ -106,6 +115,17 @@ func openStorage(ctx context.Context, path string, c Config, run, role string, s
 		if strings.ToLower(actual) != p.value {
 			return nil, fmt.Errorf("PRAGMA %s: requested %s, actual %s", p.name, p.value, actual)
 		}
+	}
+	if tcp {
+		if !w.tcpRunInitialized {
+			if _, err = w.conn.ExecContext(ctx, "INSERT INTO run(run_id,role,process_started_at) VALUES(?,?,?)", run, role, wall(started)); err != nil {
+				return nil, err
+			}
+		}
+		if err = w.prepareTCP(ctx); err != nil {
+			return nil, err
+		}
+		return w, nil
 	}
 	var version int
 	if err = w.conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
@@ -197,6 +217,15 @@ func (w *storage) batch(ctx context.Context, r *Recorder, batch []record) error 
 	}
 	for _, e := range batch {
 		s := e.Subject
+		if r.tcp {
+			if err := insert(fmt.Sprint("s", s.SessionNo), w.session, r.run, s.SessionNo, s.Session, s.Transport); err != nil {
+				return err
+			}
+			if err := w.insertTCP(ctx, r, e); err != nil {
+				return err
+			}
+			continue
+		}
 		if e.Op.No != 0 {
 			s = e.Op.Subject
 		}
@@ -252,7 +281,7 @@ func (r *Recorder) write(role string) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	w, err := openStorage(ctx, path, r.config, r.run, role, r.started)
+	w, err := openLayoutStorage(ctx, path, r.config, r.run, role, r.started, r.tcp)
 	cancel()
 	if err != nil {
 		fail(err)

@@ -53,6 +53,10 @@ func init() {
 		if b == nil {
 			return nil
 		}
+		if b.tcp {
+			b.conn = conn
+			return nil
+		}
 		_, err = conn.ExecContext(context.Background(), `CREATE TRIGGER IF NOT EXISTS quality_test_barrier AFTER INSERT ON observation WHEN NEW.event_name='test-barrier' BEGIN SELECT quality_test_barrier(NEW.action); END`, nil)
 		return err
 	})
@@ -62,6 +66,41 @@ type Barrier struct {
 	token                  string
 	entered, release       chan struct{}
 	enterOnce, releaseOnce sync.Once
+	tcp                    bool
+	conn                   sqlite.ExecQuerierContext
+}
+
+// NewTCP registers a barrier without touching the preflight-validated schema.
+// Call InstallTCP synchronously from the recorder's successful ready report.
+func NewTCP(t testing.TB, path string) *Barrier {
+	t.Helper()
+	path, err := filepath.Abs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := &Barrier{token: fmt.Sprintf("barrier-%d", next.Add(1)), entered: make(chan struct{}), release: make(chan struct{}), tcp: true}
+	registry.Lock()
+	registry.paths[path] = b
+	registry.tokens[b.token] = b
+	registry.Unlock()
+	t.Cleanup(func() {
+		b.Release()
+		registry.Lock()
+		delete(registry.paths, path)
+		delete(registry.tokens, b.token)
+		registry.Unlock()
+	})
+	return b
+}
+
+// InstallTCP installs only a TEMP fixture, after runtime temp_store is set. The
+// marker must be a valid tcp-session/handler-end whose reason is Token().
+func (b *Barrier) InstallTCP() error {
+	if !b.tcp || b.conn == nil {
+		return fmt.Errorf("TCP barrier has no recorder connection")
+	}
+	_, err := b.conn.ExecContext(context.Background(), `CREATE TEMP TRIGGER quality_test_barrier AFTER INSERT ON main.observation WHEN NEW.event_name='tcp-session' AND NEW.action='handler-end' AND NEW.reason_code='`+b.token+`' BEGIN SELECT quality_test_barrier(NEW.reason_code); END`, nil)
+	return err
 }
 
 // New initializes the exact real schema before recorder startup so its dedicated

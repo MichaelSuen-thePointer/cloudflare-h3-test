@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
+	"cloudflare-h3-test/internal/quality"
 	"cloudflare-h3-test/internal/tcpproxy"
 )
 
@@ -106,6 +108,67 @@ func TestRunPendingWarningsUseConfiguredLevelAndWriter(t *testing.T) {
 		}
 		if strings.Contains(stderr.String(), "bare-secret") || strings.Contains(stderr.String(), "private") || strings.Contains(stderr.String(), "future") {
 			t.Fatal("unknown contents leaked")
+		}
+	}
+}
+
+func TestRunOwnsRecorderOnEveryRunnerExit(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		for _, mode := range []string{"success", "error", "cancel"} {
+			t.Run(fmt.Sprintf("enabled=%v/%s", enabled, mode), func(t *testing.T) {
+				args := []string{"--listen=127.0.0.1:12345", "--remote=https://example.com", "--pool-size=0"}
+				if enabled {
+					args = append(args, "--quality-db-dir="+t.TempDir())
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				var recorder *quality.Recorder
+				var retained tcpproxy.Config
+				var out, stderr bytes.Buffer
+				finished := false
+				start := func(_ context.Context, cfg tcpproxy.Config) error {
+					recorder = cfg.QualityRecorder
+					retained = cfg
+					if enabled && recorder == nil {
+						t.Fatal("runner missing recorder")
+					}
+					if !enabled && recorder != nil {
+						t.Fatal("disabled runner has recorder")
+					}
+					cfg.LogInfo("business-cleaned")
+					finished = true
+					switch mode {
+					case "error":
+						return errors.New("runner failure")
+					case "cancel":
+						cancel()
+						return context.Canceled
+					}
+					return nil
+				}
+				code := run(ctx, args, nil, &out, &stderr, start, start)
+				want := 0
+				if mode == "error" {
+					want = 1
+				}
+				if code != want || !finished {
+					t.Fatalf("code=%d want=%d finished=%v", code, want, finished)
+				}
+				if !recorder.Stop(0) {
+					t.Fatal("run returned before recorder writer joined")
+				}
+				if recorder.Enabled() {
+					t.Fatal("run left recorder accepting")
+				}
+				if !strings.Contains(stderr.String(), "business-cleaned") {
+					t.Fatal("logger closed before runner finished")
+				}
+				before := stderr.Len()
+				retained.LogInfo("after-return")
+				if stderr.Len() != before {
+					t.Fatal("logger left open after run")
+				}
+			})
 		}
 	}
 }

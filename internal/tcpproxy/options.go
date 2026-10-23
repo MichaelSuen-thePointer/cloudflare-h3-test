@@ -13,11 +13,13 @@ import (
 
 	"cloudflare-h3-test/internal/diaglog"
 	PluginEnv "cloudflare-h3-test/internal/pluginopts"
+	"cloudflare-h3-test/internal/quality"
 	"cloudflare-h3-test/internal/relay"
 )
 
 func DefaultConfig() Config {
 	return Config{Transport: TransportH3, Token: "change-me-token", PoolSize: 10, PingInterval: 10 * time.Second, LogLevel: "info",
+		Quality:             quality.TCPDefaults("client"),
 		HTTPTimeout:         15 * time.Second,
 		StreamsPerTransport: 2,
 		QUICWindows:         relay.QUICReceiveWindows{InitialStream: 6 << 20, MaxStream: 16 << 20, InitialConnection: 15 << 20, MaxConnection: 24 << 20}}
@@ -34,6 +36,7 @@ func parseConfig(args []string, getenv func(string) string, lookupACME func(stri
 	sipHost := false
 	f := flag.NewFlagSet("tcp-proxy", flag.ContinueOnError)
 	f.SetOutput(io.Discard)
+	c.Quality.StorageFlags(f)
 	f.BoolVar(&c.Server, "server", c.Server, "run server role")
 	f.BoolVar(&c.UseSyslog, "use-syslog", c.UseSyslog, "write to system syslog")
 	f.StringVar(&c.LogLevel, "log-level", c.LogLevel, "minimum log severity")
@@ -73,6 +76,7 @@ func parseConfig(args []string, getenv func(string) string, lookupACME func(stri
 		f.Uint64Var(p.dst, p.name, *p.dst, p.name)
 	}
 	seen := map[string]bool{}
+	qualityExplicit := map[string]bool{}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if a == "--help" || a == "-help" || a == "-h" {
@@ -90,6 +94,7 @@ func parseConfig(args []string, getenv func(string) string, lookupACME func(stri
 			return c, fmt.Errorf("duplicate option --%s", name)
 		}
 		seen[name] = true
+		qualityExplicit[name] = true
 		if !eq {
 			if b, ok := opt.Value.(interface{ IsBoolFlag() bool }); ok && b.IsBoolFlag() {
 				value = "true"
@@ -158,6 +163,7 @@ func parseConfig(args []string, getenv func(string) string, lookupACME func(stri
 					}
 					value = strconv.FormatBool(b)
 				}
+				qualityExplicit[name] = true
 				if err := f.Set(name, value); err != nil {
 					return c, errors.New("invalid PluginEnv option value")
 				}
@@ -209,6 +215,13 @@ func parseConfig(args []string, getenv func(string) string, lookupACME func(stri
 		}
 	}
 	if c.Server {
+		defaults := quality.TCPDefaults("server")
+		if !qualityExplicit["quality-db-filename"] {
+			c.Quality.DBFilename = defaults.DBFilename
+		}
+		if !qualityExplicit["quality-db-cache-kib"] {
+			c.Quality.CacheKiB = defaults.CacheKiB
+		}
 		if seen["host"] {
 			return c, errors.New("server --host is unsupported; use PluginEnv host for acme.sh lookup")
 		}
@@ -285,6 +298,9 @@ func validAddress(s string) bool {
 }
 
 func (c Config) Validate() error {
+	if err := c.Quality.Validate(); err != nil {
+		return err
+	}
 	if _, err := diaglog.ParseLevel(c.LogLevel); err != nil {
 		return errors.New("invalid log-level (use debug, info, warn or error)")
 	}
