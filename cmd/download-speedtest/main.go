@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
@@ -23,24 +24,27 @@ import (
 	quic "github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/quic-go/qlogwriter"
+	"golang.org/x/net/proxy"
 )
 
 type result struct {
-	Label      string     `json:"label"`
-	Mode       string     `json:"mode"`
-	URL        string     `json:"url"`
-	ConnectIP  string     `json:"connect_ip,omitempty"`
-	RemoteAddr string     `json:"remote_addr,omitempty"`
-	Proto      string     `json:"proto"`
-	Status     int        `json:"status"`
-	Bytes      int64      `json:"bytes"`
-	Seconds    float64    `json:"seconds"`
-	MBps       float64    `json:"MBps"`
-	Mbps       float64    `json:"Mbps"`
-	Error      string     `json:"error,omitempty"`
-	QUICStats  *quicStats `json:"quic_stats,omitempty"`
-	Started    string     `json:"started"`
-	Finished   string     `json:"finished"`
+	Label       string     `json:"label"`
+	Mode        string     `json:"mode"`
+	URL         string     `json:"url"`
+	ConnectIP   string     `json:"connect_ip,omitempty"`
+	RemoteAddr  string     `json:"remote_addr,omitempty"`
+	Proto       string     `json:"proto"`
+	Status      int        `json:"status"`
+	Bytes       int64      `json:"bytes"`
+	Seconds     float64    `json:"seconds"`
+	TTFBSeconds float64    `json:"ttfb_seconds,omitempty"`
+	SHA256      string     `json:"sha256,omitempty"`
+	MBps        float64    `json:"MBps"`
+	Mbps        float64    `json:"Mbps"`
+	Error       string     `json:"error,omitempty"`
+	QUICStats   *quicStats `json:"quic_stats,omitempty"`
+	Started     string     `json:"started"`
+	Finished    string     `json:"finished"`
 }
 
 type quicStats struct {
@@ -81,7 +85,7 @@ type quicWindowOptions struct {
 }
 
 func main() {
-	var rawURL, out, onlyMode, onlyLabel, connectIPOverride, socks5UDP, cpuProfile, memProfile, traceOut, quicQlog string
+	var rawURL, out, onlyMode, onlyLabel, connectIPOverride, socks5UDP, socks5TCP, cpuProfile, memProfile, traceOut, quicQlog string
 	var count, concurrency int
 	var maxBytes int64
 	var quicInitialStreamWindow, quicMaxStreamWindow, quicInitialConnWindow, quicMaxConnWindow uint64
@@ -93,6 +97,7 @@ func main() {
 	flag.StringVar(&onlyLabel, "label", "", "optional target label filter")
 	flag.StringVar(&connectIPOverride, "connect-ip", "", "optional single connect IP override")
 	flag.StringVar(&socks5UDP, "socks5-udp", "", "optional SOCKS5 server for HTTP/3 UDP ASSOCIATE, for example 192.168.0.254:11081")
+	flag.StringVar(&socks5TCP, "socks5", "", "optional SOCKS5 server for TCP downloads, for example 127.0.0.1:11090")
 	flag.IntVar(&count, "count", 1, "requests per selected target/mode")
 	flag.IntVar(&concurrency, "concurrency", 1, "parallel requests when count is greater than 1")
 	flag.Int64Var(&maxBytes, "max-bytes", 0, "maximum response bytes to read per request, 0 reads the full response")
@@ -158,10 +163,10 @@ func main() {
 				continue
 			}
 			if count <= 1 {
-				res := run(rawURL, mode, target.label, target.ip, socks5UDP, timeout, maxBytes, includeQUICStats, quicQlog, quicWindows)
+				res := run(rawURL, mode, target.label, target.ip, socks5UDP, socks5TCP, timeout, maxBytes, includeQUICStats, quicQlog, quicWindows)
 				_ = enc.Encode(res)
 			} else {
-				res := runBatch(rawURL, mode, target.label, target.ip, socks5UDP, timeout, count, concurrency, maxBytes)
+				res := runBatch(rawURL, mode, target.label, target.ip, socks5UDP, socks5TCP, timeout, count, concurrency, maxBytes)
 				_ = enc.Encode(res)
 			}
 			time.Sleep(time.Second)
@@ -217,7 +222,7 @@ func writeHeapProfile(path string) {
 	}
 }
 
-func runBatch(rawURL, mode, label, connectIP, socks5UDP string, timeout time.Duration, count, concurrency int, maxBytes int64) batchResult {
+func runBatch(rawURL, mode, label, connectIP, socks5UDP, socks5TCP string, timeout time.Duration, count, concurrency int, maxBytes int64) batchResult {
 	if concurrency < 1 {
 		concurrency = 1
 	}
@@ -226,7 +231,7 @@ func runBatch(rawURL, mode, label, connectIP, socks5UDP string, timeout time.Dur
 	}
 	started := time.Now()
 	res := batchResult{Label: label, Mode: mode, URL: rawURL, ConnectIP: connectIP, Count: count, Concurrency: concurrency, Started: started.Format(time.RFC3339Nano)}
-	client, closeFn, err := newClient(rawURL, mode, connectIP, socks5UDP, timeout)
+	client, closeFn, err := newClient(rawURL, mode, connectIP, socks5UDP, socks5TCP, timeout)
 	if err != nil {
 		res.Errors = int64(count)
 		res.Finished = time.Now().Format(time.RFC3339Nano)
@@ -298,10 +303,10 @@ func fetchOnce(client *http.Client, rawURL string, maxBytes int64) (int64, error
 	return n, nil
 }
 
-func run(rawURL, mode, label, connectIP, socks5UDP string, timeout time.Duration, maxBytes int64, includeQUICStats bool, quicQlog string, quicWindows quicWindowOptions) result {
+func run(rawURL, mode, label, connectIP, socks5UDP, socks5TCP string, timeout time.Duration, maxBytes int64, includeQUICStats bool, quicQlog string, quicWindows quicWindowOptions) result {
 	started := time.Now()
 	res := result{Label: label, Mode: mode, URL: rawURL, ConnectIP: connectIP, Started: started.Format(time.RFC3339Nano)}
-	client, closeFn, quicConn, err := newClientWithOptions(rawURL, mode, connectIP, socks5UDP, timeout, quicQlog, quicWindows)
+	client, closeFn, quicConn, err := newClientWithOptions(rawURL, mode, connectIP, socks5UDP, socks5TCP, timeout, quicQlog, quicWindows)
 	if err != nil {
 		res.Error = err.Error()
 		res.Finished = time.Now().Format(time.RFC3339Nano)
@@ -318,12 +323,17 @@ func run(rawURL, mode, label, connectIP, socks5UDP string, timeout time.Duration
 	}
 	req.Header.Set("Cache-Control", "no-cache")
 	var remoteAddr string
+	var firstByte atomic.Int64
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
 		GotConn: func(info httptrace.GotConnInfo) {
 			remoteAddr = info.Conn.RemoteAddr().String()
 		},
+		GotFirstResponseByte: func() {
+			firstByte.CompareAndSwap(0, time.Since(started).Nanoseconds())
+		},
 	}))
 	resp, err := client.Do(req)
+	res.TTFBSeconds = time.Duration(firstByte.Load()).Seconds()
 	if err != nil {
 		res.Error = err.Error()
 		res.Finished = time.Now().Format(time.RFC3339Nano)
@@ -335,12 +345,14 @@ func run(rawURL, mode, label, connectIP, socks5UDP string, timeout time.Duration
 	if maxBytes > 0 {
 		reader = io.LimitReader(resp.Body, maxBytes)
 	}
-	n, err := io.Copy(io.Discard, reader)
+	hash := sha256.New()
+	n, err := io.Copy(hash, reader)
 	finished := time.Now()
 	res.RemoteAddr = remoteAddr
 	res.Proto = resp.Proto
 	res.Status = resp.StatusCode
 	res.Bytes = n
+	res.SHA256 = fmt.Sprintf("%x", hash.Sum(nil))
 	res.Seconds = finished.Sub(started).Seconds()
 	if res.Seconds > 0 {
 		res.MBps = float64(n) / 1_000_000 / res.Seconds
@@ -356,12 +368,12 @@ func run(rawURL, mode, label, connectIP, socks5UDP string, timeout time.Duration
 	return res
 }
 
-func newClient(rawURL, mode, connectIP, socks5UDP string, timeout time.Duration) (*http.Client, func() error, error) {
-	client, closeFn, _, err := newClientWithOptions(rawURL, mode, connectIP, socks5UDP, timeout, "", quicWindowOptions{})
+func newClient(rawURL, mode, connectIP, socks5UDP, socks5TCP string, timeout time.Duration) (*http.Client, func() error, error) {
+	client, closeFn, _, err := newClientWithOptions(rawURL, mode, connectIP, socks5UDP, socks5TCP, timeout, "", quicWindowOptions{})
 	return client, closeFn, err
 }
 
-func newClientWithOptions(rawURL, mode, connectIP, socks5UDP string, timeout time.Duration, quicQlog string, quicWindows quicWindowOptions) (*http.Client, func() error, *atomic.Pointer[quic.Conn], error) {
+func newClientWithOptions(rawURL, mode, connectIP, socks5UDP, socks5TCP string, timeout time.Duration, quicQlog string, quicWindows quicWindowOptions) (*http.Client, func() error, *atomic.Pointer[quic.Conn], error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, nil, nil, err
@@ -374,20 +386,29 @@ func newClientWithOptions(rawURL, mode, connectIP, socks5UDP string, timeout tim
 	switch mode {
 	case "tcp":
 		dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+		dialContext := dialer.DialContext
+		if socks5TCP != "" {
+			socksDialer, err := proxy.SOCKS5("tcp", socks5TCP, nil, dialer)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			dialContext = socksDialer.(proxy.ContextDialer).DialContext
+		}
 		tr := &http.Transport{
 			ForceAttemptHTTP2:  true,
 			DisableCompression: true,
 			TLSClientConfig:    &tls.Config{ServerName: u.Hostname()},
 		}
-		if connectIP != "" {
+		tr.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			if connectIP == "" {
+				return dialContext(ctx, network, address)
+			}
 			port := u.Port()
 			if port == "" {
 				port = "443"
 			}
 			dialAddr := net.JoinHostPort(connectIP, port)
-			tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
-				return dialer.DialContext(ctx, network, dialAddr)
-			}
+			return dialContext(ctx, network, dialAddr)
 		}
 		return &http.Client{Transport: tr, Timeout: timeout}, func() error {
 			tr.CloseIdleConnections()
