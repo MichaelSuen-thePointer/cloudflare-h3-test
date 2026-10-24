@@ -35,7 +35,7 @@ func TestServerLanesAcceptNonComparableStream(t *testing.T) {
 }
 
 func TestLegacyHTTPRelayMethodsAreRejected(t *testing.T) {
-	s := &server{token: "example-token", sessions: map[string]*session{}}
+	s := &server{token: "example-token", sessions: map[uint32]*session{}}
 	for _, method := range []string{http.MethodPost, http.MethodGet, http.MethodDelete} {
 		t.Run(method, func(t *testing.T) {
 			req := httptest.NewRequest(method, "/", nil)
@@ -54,9 +54,9 @@ func TestServerSnapshotIncludesWebSocketLaneDownlinkStats(t *testing.T) {
 	if !metricsBuild {
 		t.Skip("metrics snapshot requires -tags metrics")
 	}
-	s := &server{sessions: map[string]*session{}}
+	s := &server{sessions: map[uint32]*session{}}
 	sess := &session{
-		id:    "session-1",
+		id:    1,
 		queue: make(chan relay.Frame, 1),
 		done:  make(chan struct{}),
 		lanes: make(map[*serverLane]struct{}),
@@ -72,7 +72,7 @@ func TestServerSnapshotIncludesWebSocketLaneDownlinkStats(t *testing.T) {
 		t.Fatalf("ws_lanes=%#v, want one lane", snap["ws_lanes"])
 	}
 	got := lanes[0]
-	if got["session"] != "session-1" || got["lane"] != int64(3) || got["writes"] != int64(1) || got["frames"] != int64(2) || got["bytes"] != int64(128) {
+	if got["session"] != uint32(1) || got["lane"] != int64(3) || got["writes"] != int64(1) || got["frames"] != int64(2) || got["bytes"] != int64(128) {
 		t.Fatalf("lane stats=%#v, want session/lane/writes/frames/bytes", got)
 	}
 }
@@ -80,26 +80,26 @@ func TestServerSnapshotIncludesWebSocketLaneDownlinkStats(t *testing.T) {
 func TestBenchEchoCopiesViewBackedPayloadBeforeQueue(t *testing.T) {
 	s := &server{benchEcho: true}
 	sess := &session{
-		id:    "echo-session",
+		id:    2,
 		queue: make(chan relay.Frame, 1),
 		done:  make(chan struct{}),
 		lanes: make(map[*serverLane]struct{}),
 	}
 	payload := []byte("payload")
-	if err := s.handleInboundFrameAfterTouch(sess, relay.Frame{PacketID: 9, Payload: payload}); err != nil {
+	if err := s.handleInboundFrameAfterTouch(sess, relay.Frame{Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
 	copy(payload, "changed")
 	got := <-sess.queue
-	if got.PacketID != 9 || string(got.Payload) != "payload" {
-		t.Fatalf("queued frame id=%d payload=%q, want stable payload", got.PacketID, got.Payload)
+	if string(got.Payload) != "payload" {
+		t.Fatalf("queued frame payload=%q, want stable payload", got.Payload)
 	}
 }
 
 func TestServerDownBatchLoopAggregatesFrames(t *testing.T) {
 	s := &server{batchSize: 3, batchDelay: 50 * time.Millisecond}
 	sess := &session{
-		id:     "batch-session",
+		id:     3,
 		queue:  make(chan relay.Frame, 3),
 		batchQ: make(chan []relay.Frame, 3),
 		done:   make(chan struct{}),
@@ -108,9 +108,9 @@ func TestServerDownBatchLoopAggregatesFrames(t *testing.T) {
 	defer sess.close()
 	go sess.downBatchLoop(s)
 
-	sess.queue <- relay.Frame{PacketID: 1, Payload: []byte("one")}
-	sess.queue <- relay.Frame{PacketID: 2, Payload: []byte("two")}
-	sess.queue <- relay.Frame{PacketID: 3, Payload: []byte("three")}
+	sess.queue <- relay.Frame{Payload: []byte("one")}
+	sess.queue <- relay.Frame{Payload: []byte("two")}
+	sess.queue <- relay.Frame{Payload: []byte("three")}
 
 	select {
 	case batch := <-sess.batchQ:
@@ -118,8 +118,8 @@ func TestServerDownBatchLoopAggregatesFrames(t *testing.T) {
 			t.Fatalf("batch len=%d, want 3", len(batch))
 		}
 		for i, f := range batch {
-			if f.PacketID != uint64(i+1) {
-				t.Fatalf("batch[%d].PacketID=%d, want %d", i, f.PacketID, i+1)
+			if string(f.Payload) != []string{"one", "two", "three"}[i] {
+				t.Fatalf("batch[%d]=%q", i, f.Payload)
 			}
 		}
 	case <-time.After(time.Second):
@@ -130,7 +130,7 @@ func TestServerDownBatchLoopAggregatesFrames(t *testing.T) {
 func TestServerDownBatchLoopDrainsWithoutDelay(t *testing.T) {
 	s := &server{batchSize: 3, batchDelay: 0}
 	sess := &session{
-		id:     "batch-session",
+		id:     3,
 		queue:  make(chan relay.Frame, 4),
 		batchQ: make(chan []relay.Frame, 3),
 		done:   make(chan struct{}),
@@ -139,10 +139,10 @@ func TestServerDownBatchLoopDrainsWithoutDelay(t *testing.T) {
 	defer sess.close()
 	go sess.downBatchLoop(s)
 
-	sess.queue <- relay.Frame{PacketID: 1, Payload: []byte("one")}
-	sess.queue <- relay.Frame{PacketID: 2, Payload: []byte("two")}
-	sess.queue <- relay.Frame{PacketID: 3, Payload: []byte("three")}
-	sess.queue <- relay.Frame{PacketID: 4, Payload: []byte("four")}
+	sess.queue <- relay.Frame{Payload: []byte("one")}
+	sess.queue <- relay.Frame{Payload: []byte("two")}
+	sess.queue <- relay.Frame{Payload: []byte("three")}
+	sess.queue <- relay.Frame{Payload: []byte("four")}
 
 	select {
 	case batch := <-sess.batchQ:
@@ -150,8 +150,8 @@ func TestServerDownBatchLoopDrainsWithoutDelay(t *testing.T) {
 			t.Fatalf("batch len=%d, want 3", len(batch))
 		}
 		for i, f := range batch {
-			if f.PacketID != uint64(i+1) {
-				t.Fatalf("batch[%d].PacketID=%d, want %d", i, f.PacketID, i+1)
+			if string(f.Payload) != []string{"one", "two", "three"}[i] {
+				t.Fatalf("batch[%d]=%q", i, f.Payload)
 			}
 		}
 	case <-time.After(time.Second):
@@ -164,7 +164,7 @@ func TestServerBatchQueueWaitMetrics(t *testing.T) {
 		t.Skip("metrics counters require -tags metrics")
 	}
 	s := &server{metrics: true}
-	frames := []relay.Frame{{PacketID: 1}, {PacketID: 2}}
+	frames := []relay.Frame{{}, {}}
 	s.markBatchQueued(frames)
 	time.Sleep(time.Millisecond)
 	s.observeBatchQueueWait(frames)
@@ -207,9 +207,9 @@ func TestServerBatchSizeOneForcesZeroDelayAndSkipsBatchQueue(t *testing.T) {
 		benchEcho: true,
 		downQueue: 4,
 		batchSize: batchSize,
-		sessions:  map[string]*session{},
+		sessions:  map[uint32]*session{},
 	}
-	sess, err := s.getSession("direct-session")
+	sess, err := s.getSession(4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,308 +219,6 @@ func TestServerBatchSizeOneForcesZeroDelayAndSkipsBatchQueue(t *testing.T) {
 	}
 	if !s.usesDirectLaneWrite() {
 		t.Fatal("usesDirectLaneWrite=false, want true")
-	}
-}
-
-func TestServerExpandHintQueuedWhenBatchBacklogged(t *testing.T) {
-	s := &server{metrics: true, downExpandLanesMax: 2, downExpandHintTimeout: 15 * time.Second}
-	sess := &session{
-		id:     "hint-session",
-		queue:  make(chan relay.Frame, 1),
-		batchQ: make(chan []relay.Frame, 2),
-		done:   make(chan struct{}),
-		lanes:  make(map[*serverLane]struct{}),
-	}
-	sess.lanes[&serverLane{id: 1}] = struct{}{}
-	sess.batchQ <- []relay.Frame{{PacketID: 1}}
-	sess.batchQ <- []relay.Frame{{PacketID: 2}}
-
-	sess.maybeQueueExpandHint(s, time.Now())
-
-	if !sess.expandHintPending.Load() {
-		t.Fatal("expandHintPending=false, want true")
-	}
-}
-
-func TestServerExpandHintQueuedWhenDirectQueueBacklogged(t *testing.T) {
-	s := &server{metrics: true, batchSize: 1, downExpandLanesMax: 2, downExpandHintTimeout: 15 * time.Second}
-	sess := &session{
-		id:    "hint-session",
-		queue: make(chan relay.Frame, 2),
-		done:  make(chan struct{}),
-		lanes: make(map[*serverLane]struct{}),
-	}
-	sess.lanes[&serverLane{id: 1}] = struct{}{}
-	sess.queue <- relay.Frame{PacketID: 1}
-	sess.queue <- relay.Frame{PacketID: 2}
-
-	sess.maybeQueueExpandHint(s, time.Now())
-
-	if !sess.expandHintPending.Load() {
-		t.Fatal("expandHintPending=false, want true")
-	}
-}
-
-func TestServerExpandHintLoopNotStartedWhenMaxLaneOne(t *testing.T) {
-	sess := &session{
-		id:     "hint-session",
-		queue:  make(chan relay.Frame, 1),
-		batchQ: make(chan []relay.Frame, 2),
-		done:   make(chan struct{}),
-		lanes:  make(map[*serverLane]struct{}),
-	}
-	defer close(sess.done)
-	sess.lanes[&serverLane{id: 1}] = struct{}{}
-	sess.batchQ <- []relay.Frame{{PacketID: 1}}
-	sess.batchQ <- []relay.Frame{{PacketID: 2}}
-
-	sess.startExpandHintLoop(&server{downExpandLanesMax: 1, downExpandHintTimeout: 15 * time.Second})
-	time.Sleep(30 * time.Millisecond)
-	if sess.expandHintPending.Load() {
-		t.Fatal("expandHintPending=true, want false with max lane 1")
-	}
-
-	sess.startExpandHintLoop(&server{downExpandLanesMax: 2, downExpandHintTimeout: 15 * time.Second})
-	deadline := time.After(time.Second)
-	for {
-		if sess.expandHintPending.Load() {
-			return
-		}
-		select {
-		case <-deadline:
-			t.Fatal("expand hint loop did not start after max lane increased")
-		case <-time.After(10 * time.Millisecond):
-		}
-	}
-}
-
-func TestServerExpandHintNotQueuedForSingleBatch(t *testing.T) {
-	s := &server{metrics: true, downExpandLanesMax: 2, downExpandHintTimeout: 15 * time.Second}
-	sess := &session{
-		id:     "hint-session",
-		queue:  make(chan relay.Frame, 1),
-		batchQ: make(chan []relay.Frame, 2),
-		done:   make(chan struct{}),
-		lanes:  make(map[*serverLane]struct{}),
-	}
-	sess.lanes[&serverLane{id: 1}] = struct{}{}
-	sess.batchQ <- []relay.Frame{{PacketID: 1}}
-
-	sess.maybeQueueExpandHint(s, time.Now())
-
-	if sess.expandHintPending.Load() {
-		t.Fatal("expandHintPending=true, want false")
-	}
-}
-
-func TestServerExpandHintSkippedAtMaxLanes(t *testing.T) {
-	if !metricsBuild {
-		t.Skip("metrics counters require -tags metrics")
-	}
-	s := &server{metrics: true, downExpandLanesMax: 1, downExpandHintTimeout: 15 * time.Second}
-	sess := &session{
-		id:     "hint-session",
-		queue:  make(chan relay.Frame, 1),
-		batchQ: make(chan []relay.Frame, 2),
-		done:   make(chan struct{}),
-		lanes:  make(map[*serverLane]struct{}),
-	}
-	sess.lanes[&serverLane{id: 1}] = struct{}{}
-	sess.batchQ <- []relay.Frame{{PacketID: 1}}
-	sess.batchQ <- []relay.Frame{{PacketID: 2}}
-
-	sess.maybeQueueExpandHint(s, time.Now())
-
-	if sess.expandHintPending.Load() {
-		t.Fatal("expandHintPending=true, want false")
-	}
-	if got := s.stats.expandHintsSkippedMaxLanes.Load(); got != 1 {
-		t.Fatalf("expandHintsSkippedMaxLanes=%d, want 1", got)
-	}
-}
-
-func TestServerExpandHintInFlightExpires(t *testing.T) {
-	if !metricsBuild {
-		t.Skip("metrics counters require -tags metrics")
-	}
-	s := &server{metrics: true, downExpandLanesMax: 2, downExpandHintTimeout: 15 * time.Second}
-	sess := &session{
-		id:     "hint-session",
-		queue:  make(chan relay.Frame, 1),
-		batchQ: make(chan []relay.Frame, 2),
-		done:   make(chan struct{}),
-		lanes:  make(map[*serverLane]struct{}),
-	}
-	sess.lanes[&serverLane{id: 1}] = struct{}{}
-	sess.batchQ <- []relay.Frame{{PacketID: 1}}
-	sess.batchQ <- []relay.Frame{{PacketID: 2}}
-	now := time.Now()
-	sess.expandHintInFlight.Store(true)
-	sess.expandHintInFlightAt.Store(now.Add(-16 * time.Second).UnixNano())
-
-	sess.maybeQueueExpandHint(s, now)
-
-	if sess.expandHintInFlight.Load() {
-		t.Fatal("expandHintInFlight=true, want false after expiry")
-	}
-	if !sess.expandHintPending.Load() {
-		t.Fatal("expandHintPending=false, want true after expiry")
-	}
-	if got := s.stats.expandHintsExpired.Load(); got != 1 {
-		t.Fatalf("expandHintsExpired=%d, want 1", got)
-	}
-}
-
-func TestServerWritePendingExpandHintWritesControl(t *testing.T) {
-	if !metricsBuild {
-		t.Skip("metrics counters require -tags metrics")
-	}
-	s := &server{metrics: true, downExpandLanesMax: 2}
-	sess := &session{
-		id:     "hint-session",
-		queue:  make(chan relay.Frame, 1),
-		batchQ: make(chan []relay.Frame, 1),
-		done:   make(chan struct{}),
-		lanes:  make(map[*serverLane]struct{}),
-	}
-	defer sess.close()
-	sess.expandHintPending.Store(true)
-	errCh := make(chan error, 1)
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ws, err := relay.AcceptWebSocket(w, r)
-		if err != nil {
-			errCh <- err
-			return
-		}
-		defer ws.Close()
-		if !s.writePendingExpandHint(&serverLane{stream: ws, transport: "ws"}, sess, sess.id, r.RemoteAddr) {
-			errCh <- io.ErrUnexpectedEOF
-			return
-		}
-		errCh <- nil
-	}))
-	defer ts.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	ws, err := relay.DialWebSocket(ctx, ts.URL, "", "example-token", time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ws.Close()
-	body, err := ws.ReadMessage()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := <-errCh; err != nil {
-		t.Fatal(err)
-	}
-	op, payload, err := relay.DecodeControl(body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if op != relay.ControlOpExpandLanesHint || len(payload) != 0 {
-		t.Fatalf("op=%d payload_len=%d, want expand hint empty", op, len(payload))
-	}
-	if !sess.expandHintInFlight.Load() {
-		t.Fatal("expandHintInFlight=false, want true")
-	}
-	if got := s.stats.expandHintsSent.Load(); got != 1 {
-		t.Fatalf("expandHintsSent=%d, want 1", got)
-	}
-}
-
-func TestServerDirectDownlinkWritesPendingExpandHintBeforeData(t *testing.T) {
-	if !metricsBuild {
-		t.Skip("metrics counters require -tags metrics")
-	}
-	s := &server{metrics: true, batchSize: 1, downExpandLanesMax: 2}
-	sess := &session{
-		id:    "direct-hint-session",
-		queue: make(chan relay.Frame, 1),
-		done:  make(chan struct{}),
-		lanes: make(map[*serverLane]struct{}),
-	}
-	defer sess.close()
-	sess.expandHintPending.Store(true)
-	sess.queue <- relay.Frame{PacketID: 7, Payload: []byte("payload")}
-
-	errCh := make(chan error, 1)
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ws, err := relay.AcceptWebSocket(w, r)
-		if err != nil {
-			errCh <- err
-			return
-		}
-		defer ws.Close()
-		s.writeLaneDownDirectLoop(&serverLane{stream: ws}, sess, sess.id, r.RemoteAddr, r.Context().Done())
-		errCh <- nil
-	}))
-	defer ts.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	ws, err := relay.DialWebSocket(ctx, ts.URL, "", "example-token", time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ws.Close()
-
-	body, err := ws.ReadMessage()
-	if err != nil {
-		t.Fatal(err)
-	}
-	op, payload, err := relay.DecodeControl(body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if op != relay.ControlOpExpandLanesHint || len(payload) != 0 {
-		t.Fatalf("op=%d payload_len=%d, want expand hint empty", op, len(payload))
-	}
-
-	body, err = ws.ReadMessage()
-	if err != nil {
-		t.Fatal(err)
-	}
-	frames, err := relay.DecodeFrames(body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(frames) != 1 || frames[0].PacketID != 7 || string(frames[0].Payload) != "payload" {
-		t.Fatalf("frames=%+v, want packet 7 payload", frames)
-	}
-	if !sess.expandHintInFlight.Load() {
-		t.Fatal("expandHintInFlight=false, want true")
-	}
-	if got := s.stats.expandHintsSent.Load(); got != 1 {
-		t.Fatalf("expandHintsSent=%d, want 1", got)
-	}
-	sess.close()
-	if err := <-errCh; err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestServerWritePendingExpandHintSkippedWhenMaxLaneOne(t *testing.T) {
-	s := &server{metrics: true, downExpandLanesMax: 1}
-	sess := &session{
-		id:     "hint-session",
-		queue:  make(chan relay.Frame, 1),
-		batchQ: make(chan []relay.Frame, 1),
-		done:   make(chan struct{}),
-		lanes:  make(map[*serverLane]struct{}),
-	}
-	defer sess.close()
-	sess.expandHintPending.Store(true)
-
-	if !s.writePendingExpandHint(nil, sess, sess.id, "remote") {
-		t.Fatal("writePendingExpandHint=false, want true")
-	}
-	if !sess.expandHintPending.Load() {
-		t.Fatal("expandHintPending=false, want unchanged")
-	}
-	if got := s.stats.expandHintsSent.Load(); got != 0 {
-		t.Fatalf("expandHintsSent=%d, want 0", got)
 	}
 }
 
@@ -537,30 +235,8 @@ func TestServerWSLaneRetainsEncodeBufferWithinCap(t *testing.T) {
 	}
 }
 
-func TestServerAttachClearsExpandHintInFlight(t *testing.T) {
-	sess := &session{
-		id:     "hint-session",
-		queue:  make(chan relay.Frame, 1),
-		batchQ: make(chan []relay.Frame, 1),
-		done:   make(chan struct{}),
-		lanes:  make(map[*serverLane]struct{}),
-	}
-	sess.expandHintInFlight.Store(true)
-	sess.expandHintInFlightAt.Store(time.Now().UnixNano())
-
-	if _, ok := sess.addLane(nil, "ws"); !ok {
-		t.Fatal("addLane returned false")
-	}
-	if sess.expandHintInFlight.Load() {
-		t.Fatal("expandHintInFlight=true, want false")
-	}
-	if got := sess.expandHintInFlightAt.Load(); got != 0 {
-		t.Fatalf("expandHintInFlightAt=%d, want 0", got)
-	}
-}
-
 func TestBadWebSocketUpgradeDoesNotCreateSession(t *testing.T) {
-	s := &server{token: "example-token", sessions: map[string]*session{}}
+	s := &server{token: "example-token", sessions: map[uint32]*session{}}
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set("X-Relay-Token", "example-token")
 	req.Header.Set("X-Relay-Session", "bad-ws")
@@ -580,7 +256,7 @@ func TestBadWebSocketUpgradeDoesNotCreateSession(t *testing.T) {
 }
 
 func TestWebSocketBadAttachDoesNotCreateSession(t *testing.T) {
-	s := &server{token: "example-token", benchEcho: true, sessions: map[string]*session{}}
+	s := &server{token: "example-token", benchEcho: true, sessions: map[uint32]*session{}}
 	ts := httptest.NewServer(http.HandlerFunc(s.handle))
 	defer ts.Close()
 
@@ -590,7 +266,7 @@ func TestWebSocketBadAttachDoesNotCreateSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bad, err := relay.EncodeControl(relay.ControlOpAttachOK, nil)
+	bad, err := relay.EncodeFrames([]relay.Frame{{Payload: []byte("premature")}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -611,7 +287,7 @@ func TestWebSocketAttachBenchEcho(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &server{token: "example-token", upstream: upstream, benchEcho: true, sessions: map[string]*session{}}
+	s := &server{token: "example-token", upstream: upstream, benchEcho: true, sessions: map[uint32]*session{}}
 	ts := httptest.NewServer(http.HandlerFunc(s.handle))
 	defer ts.Close()
 
@@ -622,17 +298,18 @@ func TestWebSocketAttachBenchEcho(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ws.Close()
-	if err := relay.AttachWebSocketSession(ctx, ws, "attached-session"); err != nil {
+	stream := relay.NewUDPWebSocketClient(ws)
+	if err := stream.Attach(ctx, 6); err != nil {
 		t.Fatal(err)
 	}
-	body, err := relay.EncodeFrames([]relay.Frame{{PacketID: 7, Payload: []byte("payload")}})
+	body, err := relay.EncodeFrames([]relay.Frame{{Payload: []byte("payload")}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ws.WriteMessage(body); err != nil {
+	if err := stream.WriteMessage(body); err != nil {
 		t.Fatal(err)
 	}
-	echo, err := ws.ReadMessage()
+	echo, err := stream.ReadMessage()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -650,7 +327,7 @@ func TestWebSocketPingBeforeAttach(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &server{token: "example-token", upstream: upstream, benchEcho: true, sessions: map[string]*session{}}
+	s := &server{token: "example-token", upstream: upstream, benchEcho: true, sessions: map[uint32]*session{}}
 	ts := httptest.NewServer(http.HandlerFunc(s.handle))
 	defer ts.Close()
 
@@ -661,13 +338,14 @@ func TestWebSocketPingBeforeAttach(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ws.Close()
-	if err := ws.Ping(nil); err != nil {
+	if err := ws.WriteMessage([]byte{0, 0}); err != nil {
 		t.Fatal(err)
 	}
-	if err := relay.AttachWebSocketSession(ctx, ws, "ping-before-attach"); err != nil {
+	stream := relay.NewUDPWebSocketClient(ws)
+	if err := stream.Attach(ctx, 7); err != nil {
 		t.Fatal(err)
 	}
-	if s.findSession("ping-before-attach") == nil {
+	if s.findSession(7) == nil {
 		t.Fatal("session not created after attach")
 	}
 }

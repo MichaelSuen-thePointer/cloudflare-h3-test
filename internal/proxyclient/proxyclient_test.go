@@ -47,7 +47,7 @@ func TestEnsureWebSocketLanesDoesNotAppendAfterClose(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	sess := &session{
-		id:     "test-session",
+		id:     123,
 		ctx:    ctx,
 		cancel: cancel,
 		closed: make(chan struct{}),
@@ -93,7 +93,7 @@ func TestDrainSendBatchWithoutDelay(t *testing.T) {
 	sess.sendQ <- []byte("three")
 	sess.sendQ <- []byte("four")
 
-	batch := sess.drainSendBatch([]relay.Frame{{PacketID: sess.next.Add(1), Payload: []byte("one")}}, 3)
+	batch := sess.drainSendBatch([]relay.Frame{{Payload: []byte("one")}}, 3)
 
 	if len(batch) != 3 {
 		t.Fatalf("batch len=%d, want 3", len(batch))
@@ -118,7 +118,7 @@ func TestInitialWebSocketConnectFailureClosesSession(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	sess := &session{
-		id:     "test-session",
+		id:     123,
 		ctx:    ctx,
 		cancel: cancel,
 		closed: make(chan struct{}),
@@ -168,7 +168,7 @@ func TestInitialIncrementalWebSocketConnectsOneLane(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sess := &session{
-		id:     "test-session",
+		id:     123,
 		ctx:    ctx,
 		cancel: cancel,
 		closed: make(chan struct{}),
@@ -226,7 +226,7 @@ func TestEnsureWebSocketLanesClosesSuccessfulLaneAfterParallelFailure(t *testing
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sess := &session{
-		id:     "test-session",
+		id:     123,
 		ctx:    ctx,
 		cancel: cancel,
 		closed: make(chan struct{}),
@@ -270,7 +270,7 @@ func TestIncrementalWebSocketLaneAddsLaneWhenBatchQueueBacklogged(t *testing.T) 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sess := &session{
-		id:     "test-session",
+		id:     123,
 		ctx:    ctx,
 		cancel: cancel,
 		closed: make(chan struct{}),
@@ -288,8 +288,8 @@ func TestIncrementalWebSocketLaneAddsLaneWhenBatchQueueBacklogged(t *testing.T) 
 	sess.lanes = append(sess.lanes, &streamLane{index: 0})
 	publishTestWSSnapshot(sess)
 	defer sess.close()
-	sess.batchQ <- []relay.Frame{{PacketID: 1, Payload: []byte("backlog-1")}}
-	sess.batchQ <- []relay.Frame{{PacketID: 2, Payload: []byte("backlog-2")}}
+	sess.batchQ <- []relay.Frame{{Payload: []byte("backlog-1")}}
+	sess.batchQ <- []relay.Frame{{Payload: []byte("backlog-2")}}
 	close(sess.ready)
 
 	sess.goRun(func() { sess.incrementalLaneLoop() })
@@ -311,7 +311,7 @@ func TestIncrementalWebSocketLaneDoesNotAddLaneForSingleQueuedBatch(t *testing.T
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sess := &session{
-		id:     "test-session",
+		id:     123,
 		ctx:    ctx,
 		cancel: cancel,
 		closed: make(chan struct{}),
@@ -327,7 +327,7 @@ func TestIncrementalWebSocketLaneDoesNotAddLaneForSingleQueuedBatch(t *testing.T
 	sess.state = c
 	sess.lanes = append(sess.lanes, &streamLane{index: 0})
 	publishTestWSSnapshot(sess)
-	sess.batchQ <- []relay.Frame{{PacketID: 1, Payload: []byte("single")}}
+	sess.batchQ <- []relay.Frame{{Payload: []byte("single")}}
 
 	sess.maybeAcquireIncrementalLane()
 
@@ -354,58 +354,12 @@ func TestIncrementalWebSocketLaneDirectBacklogUsesSendQueue(t *testing.T) {
 	}
 }
 
-func TestWebSocketExpandHintSetsPending(t *testing.T) {
-	if !metricsBuild {
-		t.Skip("metrics counters require -tags metrics")
-	}
-	stats := &clientStats{started: time.Now()}
-	c := &clientState{laneTarget: 2, metrics: true, stats: stats}
-	sess := &session{id: "hint-session", metrics: true, stats: stats}
-	body, err := relay.EncodeControl(relay.ControlOpExpandLanesHint, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if !sess.handleStreamControlMessage(c, 0, body) {
-		t.Fatal("control message was not handled")
-	}
-	if !sess.expandHintPending.Load() {
-		t.Fatal("expandHintPending=false, want true")
-	}
-	if got := stats.expandHintsReceived.Load(); got != 1 {
-		t.Fatalf("expandHintsReceived=%d, want 1", got)
-	}
-}
-
-func TestWebSocketExpandHintIgnoredWhenMaxLaneOne(t *testing.T) {
-	if !metricsBuild {
-		t.Skip("metrics counters require -tags metrics")
-	}
-	stats := &clientStats{started: time.Now()}
-	c := &clientState{laneTarget: 1, metrics: true, stats: stats}
-	sess := &session{id: "hint-session", metrics: true, stats: stats}
-	body, err := relay.EncodeControl(relay.ControlOpExpandLanesHint, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if !sess.handleStreamControlMessage(c, 0, body) {
-		t.Fatal("control message was not handled")
-	}
-	if sess.expandHintPending.Load() {
-		t.Fatal("expandHintPending=true, want false")
-	}
-	if got := stats.expandHintsReceived.Load(); got != 1 {
-		t.Fatalf("expandHintsReceived=%d, want 1", got)
-	}
-}
-
-func TestWebSocketExpandHintDoesNotTriggerWhenIncrementalDisabled(t *testing.T) {
+func TestLocalBacklogDoesNotExpandWhenIncrementalDisabled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	stats := &clientStats{started: time.Now()}
 	sess := &session{
-		id:      "hint-session",
+		id:      123,
 		ctx:     ctx,
 		cancel:  cancel,
 		closed:  make(chan struct{}),
@@ -417,24 +371,22 @@ func TestWebSocketExpandHintDoesNotTriggerWhenIncrementalDisabled(t *testing.T) 
 	defer sess.close()
 	c := &clientState{laneTarget: 2, lanesIncremental: false, stats: stats, metrics: true}
 	sess.state = c
-	sess.expandHintPending.Store(true)
+	sess.batchQ <- []relay.Frame{{Payload: []byte("backlog-1")}}
+	sess.batchQ <- []relay.Frame{{Payload: []byte("backlog-2")}}
 
 	sess.maybeAcquireIncrementalLane()
 
 	if got := sess.lanesPending.Load(); got != 0 {
 		t.Fatalf("lanesPending=%d, want 0", got)
 	}
-	if !sess.expandHintPending.Load() {
-		t.Fatal("expandHintPending was cleared with incremental disabled")
-	}
 }
 
-func TestWebSocketExpandHintShortCircuitsWhenMaxLaneOne(t *testing.T) {
+func TestLocalBacklogShortCircuitsAtMaxLaneOne(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	stats := &clientStats{started: time.Now()}
 	sess := &session{
-		id:      "hint-session",
+		id:      123,
 		ctx:     ctx,
 		cancel:  cancel,
 		closed:  make(chan struct{}),
@@ -448,19 +400,17 @@ func TestWebSocketExpandHintShortCircuitsWhenMaxLaneOne(t *testing.T) {
 	sess.state = c
 	sess.lanes = append(sess.lanes, &streamLane{index: 0})
 	publishTestWSSnapshot(sess)
-	sess.expandHintPending.Store(true)
+	sess.batchQ <- []relay.Frame{{Payload: []byte("backlog-1")}}
+	sess.batchQ <- []relay.Frame{{Payload: []byte("backlog-2")}}
 
 	sess.maybeAcquireIncrementalLane()
 
-	if !sess.expandHintPending.Load() {
-		t.Fatal("expandHintPending=false, want unchanged")
-	}
 	if got := stats.incrementalAcquireSkippedFull.Load(); got != 0 {
 		t.Fatalf("incrementalAcquireSkippedFull=%d, want 0", got)
 	}
 }
 
-func TestWebSocketExpandHintTriggersIncrementalLane(t *testing.T) {
+func TestLocalBacklogTriggersIncrementalLane(t *testing.T) {
 	if !metricsBuild {
 		t.Skip("metrics counters require -tags metrics")
 	}
@@ -475,7 +425,7 @@ func TestWebSocketExpandHintTriggersIncrementalLane(t *testing.T) {
 	defer cancel()
 	stats := &clientStats{started: time.Now()}
 	sess := &session{
-		id:      "test-session",
+		id:      123,
 		ctx:     ctx,
 		cancel:  cancel,
 		closed:  make(chan struct{}),
@@ -497,7 +447,8 @@ func TestWebSocketExpandHintTriggersIncrementalLane(t *testing.T) {
 	sess.lanes = append(sess.lanes, &streamLane{index: 0})
 	publishTestWSSnapshot(sess)
 	defer sess.close()
-	sess.expandHintPending.Store(true)
+	sess.batchQ <- []relay.Frame{{Payload: []byte("backlog-1")}}
+	sess.batchQ <- []relay.Frame{{Payload: []byte("backlog-2")}}
 	close(sess.ready)
 
 	sess.goRun(func() { sess.incrementalLaneLoop() })
@@ -513,12 +464,6 @@ func TestWebSocketExpandHintTriggersIncrementalLane(t *testing.T) {
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
-	if sess.expandHintPending.Load() {
-		t.Fatal("expandHintPending=true, want false")
-	}
-	if got := stats.expandHintsUsed.Load(); got != 1 {
-		t.Fatalf("expandHintsUsed=%d, want 1", got)
-	}
 	if got := stats.incrementalAcquireSucceeded.Load(); got != 1 {
 		t.Fatalf("incrementalAcquireSucceeded=%d, want 1", got)
 	}
@@ -528,7 +473,7 @@ func TestWebSocketSingleLaneSendBatchUsesBatchQueue(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sess := &session{
-		id:     "test-session",
+		id:     123,
 		ctx:    ctx,
 		cancel: cancel,
 		closed: make(chan struct{}),
@@ -546,12 +491,12 @@ func TestWebSocketSingleLaneSendBatchUsesBatchQueue(t *testing.T) {
 	publishTestWSSnapshot(sess)
 	close(sess.ready)
 
-	frames := []relay.Frame{{PacketID: 1, Payload: []byte("payload")}}
+	frames := []relay.Frame{{Payload: []byte("payload")}}
 	sess.sendBatch(frames)
 
 	select {
 	case got := <-sess.batchQ:
-		if len(got) != 1 || got[0].PacketID != 1 || string(got[0].Payload) != "payload" {
+		if len(got) != 1 || string(got[0].Payload) != "payload" {
 			t.Fatalf("batch=%+v, want packet 1 payload", got)
 		}
 	default:
@@ -570,7 +515,7 @@ func TestIncrementalWebSocketLaneAcquireFailureKeepsSession(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sess := &session{
-		id:     "test-session",
+		id:     123,
 		ctx:    ctx,
 		cancel: cancel,
 		closed: make(chan struct{}),
@@ -588,8 +533,8 @@ func TestIncrementalWebSocketLaneAcquireFailureKeepsSession(t *testing.T) {
 	sess.state = c
 	sess.lanes = append(sess.lanes, &streamLane{index: 0})
 	publishTestWSSnapshot(sess)
-	sess.batchQ <- []relay.Frame{{PacketID: 1, Payload: []byte("backlog-1")}}
-	sess.batchQ <- []relay.Frame{{PacketID: 2, Payload: []byte("backlog-2")}}
+	sess.batchQ <- []relay.Frame{{Payload: []byte("backlog-1")}}
+	sess.batchQ <- []relay.Frame{{Payload: []byte("backlog-2")}}
 
 	sess.maybeAcquireIncrementalLane()
 
@@ -616,7 +561,7 @@ func TestIncrementalWebSocketLaneDoesNotReservePastMax(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sess := &session{
-		id:     "test-session",
+		id:     123,
 		ctx:    ctx,
 		cancel: cancel,
 		closed: make(chan struct{}),
@@ -640,7 +585,7 @@ func TestFirstOpenWebSocketLaneUsesSnapshotAndSkipsClosed(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sess := &session{
-		id:           "test-session",
+		id:           123,
 		ctx:          ctx,
 		cancel:       cancel,
 		closed:       make(chan struct{}),
@@ -666,7 +611,7 @@ func TestWebSocketSnapshotReplacePublishesNewLane(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sess := &session{
-		id:           "test-session",
+		id:           123,
 		ctx:          ctx,
 		cancel:       cancel,
 		closed:       make(chan struct{}),
@@ -709,15 +654,15 @@ func TestClientSnapshotReportsSendAndBatchQueueMetricsSeparately(t *testing.T) {
 		sessions:  map[netip.AddrPort]*session{},
 	}
 	sess := &session{
-		id:     "session-1",
+		id:     123,
 		state:  c,
 		sendQ:  make(chan []byte, 4),
 		batchQ: make(chan []relay.Frame, 5),
 	}
 	sess.sendQ <- []byte("raw-1")
 	sess.sendQ <- []byte("raw-2")
-	sess.batchQ <- []relay.Frame{{PacketID: 1}, {PacketID: 2}, {PacketID: 3}}
-	sess.batchQ <- []relay.Frame{{PacketID: 4}}
+	sess.batchQ <- []relay.Frame{{}, {}, {}}
+	sess.batchQ <- []relay.Frame{{}}
 	c.sessions[netip.MustParseAddrPort("127.0.0.1:12345")] = sess
 
 	snap := c.snapshot()
@@ -768,7 +713,7 @@ func TestWebSocketWriteBatchReturnsBatchWhenLaneAlreadyClosed(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sess := &session{
-		id:     "test-session",
+		id:     123,
 		ctx:    ctx,
 		cancel: cancel,
 		closed: make(chan struct{}),
@@ -777,7 +722,7 @@ func TestWebSocketWriteBatchReturnsBatchWhenLaneAlreadyClosed(t *testing.T) {
 	ln := newStreamLane(0, nil)
 	ln.closed.Store(true)
 	ln.closeWorker()
-	frames := []relay.Frame{{PacketID: 1, Payload: []byte("payload")}}
+	frames := []relay.Frame{{Payload: []byte("payload")}}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -791,7 +736,7 @@ func TestWebSocketWriteBatchReturnsBatchWhenLaneAlreadyClosed(t *testing.T) {
 	}
 	select {
 	case got := <-sess.batchQ:
-		if len(got) != 1 || got[0].PacketID != 1 {
+		if len(got) != 1 || string(got[0].Payload) != "payload" {
 			t.Fatalf("returned batch=%v, want packet 1", got)
 		}
 	default:
@@ -850,7 +795,7 @@ func TestWebSocketPoolAcquireAttachesSession(t *testing.T) {
 	defer pool.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	ws, err := pool.Acquire(ctx, "test-session")
+	ws, err := pool.Acquire(ctx, 123)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1033,14 +978,14 @@ func writeWebSocketUpgradeAndAttachAck(conn net.Conn) error {
 	if err != nil {
 		return err
 	}
-	op, payload, err := relay.DecodeControl(body)
+	op, payload, err := testDecodeControl(body)
 	if err != nil {
 		return err
 	}
-	if op != relay.ControlOpAttach || string(payload) != "test-session" {
+	if op != testAttach || len(payload) != 4 {
 		return http.ErrNoCookie
 	}
-	ack, err := relay.EncodeControl(relay.ControlOpAttachOK, nil)
+	ack, err := testEncodeControl(testAttachOK, nil)
 	if err != nil {
 		return err
 	}

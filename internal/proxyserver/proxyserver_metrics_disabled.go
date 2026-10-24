@@ -20,10 +20,6 @@ func (s *server) observeBatchQueueWait(frames []relay.Frame)       {}
 func (s *server) observeLaneWrite(d time.Duration)                 {}
 func (s *server) countQueueDrops(n int)                            {}
 func (s *server) countBatchQueueDrops(n int)                       {}
-func (s *server) countExpandHintSent()                             {}
-func (s *server) countExpandHintWriteFailed()                      {}
-func (s *server) countExpandHintExpired()                          {}
-func (s *server) countExpandHintSkippedMaxLanes()                  {}
 func (s *server) countUDPUp(n int)                                 {}
 func (s *server) countUDPDown(n int)                               {}
 func (s *server) countSessionMade()                                {}

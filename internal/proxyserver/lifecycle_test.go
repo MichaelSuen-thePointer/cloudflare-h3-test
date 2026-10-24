@@ -37,7 +37,7 @@ func TestShutdownDuringHijackDeadlineReset(t *testing.T) {
 	defer conn.Close()
 	defer peer.Close()
 	w := &delayedHijackWriter{conn: conn, entered: make(chan struct{}), release: make(chan struct{}), header: make(http.Header)}
-	s := &server{token: "test", sessions: make(map[string]*session)}
+	s := &server{token: "test", sessions: make(map[uint32]*session)}
 	r := httptest.NewRequest(http.MethodGet, "http://test/", nil)
 	r.Header.Set("X-Relay-Token", "test")
 	r.Header.Set("Upgrade", "websocket")
@@ -73,7 +73,7 @@ func TestShutdownClosesIdleAndAttachedStreams(t *testing.T) {
 			t.Run(name, func(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
-				s := &server{ctx: ctx, token: "test", benchEcho: true, batchSize: 2, batchDelay: time.Hour, downExpandLanesMax: 2, sessions: make(map[string]*session), wsSocketOptions: relay.WebSocketSocketOptions{DisableWriteTimeout: true}}
+				s := &server{ctx: ctx, token: "test", benchEcho: true, batchSize: 2, batchDelay: time.Hour, downExpandLanesMax: 2, sessions: make(map[uint32]*session), wsSocketOptions: relay.WebSocketSocketOptions{DisableWriteTimeout: true}}
 				origin := httptest.NewUnstartedServer(http.HandlerFunc(s.handle))
 				origin.EnableHTTP2 = true
 				if protocol == "h3" {
@@ -111,11 +111,11 @@ func TestShutdownClosesIdleAndAttachedStreams(t *testing.T) {
 					if resp.ProtoMajor != 2 {
 						t.Fatal(resp.Proto)
 					}
-					write = func(b []byte) error { return relay.WriteStreamMessage(w, b) }
-					read = func() ([]byte, error) { return relay.ReadStreamMessage(resp.Body) }
+					write = func(b []byte) error { return writeRawRecords(w, b) }
+					read = func() ([]byte, error) { return readRawRecord(resp.Body) }
 				}
 				if attached {
-					attach, _ := relay.EncodeAttach("test-session")
+					attach := relay.EncodeAttach(11)
 					if err := write(attach); err != nil {
 						t.Fatal(err)
 					}
@@ -134,7 +134,7 @@ func TestShutdownClosesIdleAndAttachedStreams(t *testing.T) {
 				if _, err := read(); err == nil {
 					t.Fatal("stream remained open")
 				}
-				if _, err := s.getSession("late"); err == nil {
+				if _, err := s.getSession(12); err == nil {
 					t.Fatal("late session accepted")
 				}
 				s.mu.Lock()

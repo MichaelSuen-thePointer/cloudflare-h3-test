@@ -5,13 +5,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,7 +26,6 @@ import (
 )
 
 const (
-	maxFramesPerDownlinkMessage   = relay.MaxPayloadFramesPerMessage
 	streamEncodeBufferRetainLimit = 512 << 10
 )
 
@@ -36,25 +35,21 @@ var (
 )
 
 type session struct {
-	qr                   *quality.Recorder
-	q                    quality.Subject
-	id                   string
-	udp                  *net.UDPConn
-	queue                chan relay.Frame
-	batchQ               chan []relay.Frame
-	done                 chan struct{}
-	lastActive           atomic.Int64
-	touchEvery           time.Duration
-	closed               atomic.Bool
-	closeOnce            sync.Once
-	batchOnce            sync.Once
-	expandHintOnce       sync.Once
-	expandHintPending    atomic.Bool
-	expandHintInFlight   atomic.Bool
-	expandHintInFlightAt atomic.Int64
-	lanesMu              sync.Mutex
-	lanes                map[*serverLane]struct{}
-	nextLaneID           atomic.Int64
+	qr         *quality.Recorder
+	q          quality.Subject
+	id         uint32
+	udp        *net.UDPConn
+	queue      chan relay.Frame
+	batchQ     chan []relay.Frame
+	done       chan struct{}
+	lastActive atomic.Int64
+	touchEvery time.Duration
+	closed     atomic.Bool
+	closeOnce  sync.Once
+	batchOnce  sync.Once
+	lanesMu    sync.Mutex
+	lanes      map[*serverLane]struct{}
+	nextLaneID atomic.Int64
 }
 
 type serverLane struct {
@@ -89,7 +84,7 @@ type server struct {
 	downExpandHintTimeout time.Duration
 	metrics               bool
 	mu                    sync.Mutex
-	sessions              map[string]*session
+	sessions              map[uint32]*session
 	stats                 serverStats
 }
 
@@ -156,8 +151,8 @@ func Run(ctx context.Context, args []string) error {
 	fs.DurationVar(&batchDelay, "batch-delay", 125*time.Microsecond, "maximum time to wait for a partially filled downlink batch")
 	fs.IntVar(&wsSocketSendBuffer, "ws-socket-send-buffer", 0, "WebSocket TCP socket send buffer bytes, 0 keeps OS default")
 	fs.IntVar(&wsSocketReceiveBuffer, "ws-socket-recv-buffer", 0, "WebSocket TCP socket receive buffer bytes, 0 keeps OS default")
-	fs.IntVar(&downExpandLanesMax, "down-expand-lanes-max", 1, "maximum attached lanes before suppressing server downlink expand hints")
-	fs.DurationVar(&downExpandHintTimeout, "down-expand-hint-timeout", 15*time.Second, "time to wait for a hinted lane before sending another downlink expand hint")
+	fs.IntVar(&downExpandLanesMax, "down-expand-lanes-max", 1, "deprecated noop; accepted for configuration compatibility")
+	fs.DurationVar(&downExpandHintTimeout, "down-expand-hint-timeout", 15*time.Second, "deprecated noop; accepted for configuration compatibility")
 	qualityConfig.Flags(fs)
 	fs.Parse(args)
 
@@ -225,7 +220,7 @@ func Run(ctx context.Context, args []string) error {
 	defer recorder.Close()
 	// Established WS writes follow the connection lifecycle, without a per-write deadline.
 	wsSocketOptions := relay.WebSocketSocketOptions{SendBuffer: wsSocketSendBuffer, ReceiveBuffer: wsSocketReceiveBuffer, DisableWriteTimeout: true}
-	s := &server{ctx: ctx, quality: recorder, token: token, upstream: addr, benchEcho: benchEcho, idle: idle, udpBuffer: udpBuffer, downQueue: downQueue, batchSize: batchSize, batchDelay: batchDelay, wsSocketOptions: wsSocketOptions, downExpandLanesMax: downExpandLanesMax, downExpandHintTimeout: downExpandHintTimeout, metrics: metrics, sessions: map[string]*session{}}
+	s := &server{ctx: ctx, quality: recorder, token: token, upstream: addr, benchEcho: benchEcho, idle: idle, udpBuffer: udpBuffer, downQueue: downQueue, batchSize: batchSize, batchDelay: batchDelay, wsSocketOptions: wsSocketOptions, downExpandLanesMax: downExpandLanesMax, downExpandHintTimeout: downExpandHintTimeout, metrics: metrics, sessions: map[uint32]*session{}}
 	s.goRun(func() { coarsetime.Run(ctx) })
 	s.goRun(s.cleanupLoop)
 	if metricsBuild && metricsOut != "" {
@@ -289,7 +284,7 @@ func (s *server) handle(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleH3Stream(w http.ResponseWriter, r *http.Request, owned *serverRequest) {
-	stream := &h3ServerStream{requestBody: r.Body, response: w}
+	stream := relay.NewUDPServerStream(&h3ServerStream{requestBody: r.Body, response: w})
 	if !owned.setStream(stream) {
 		return
 	}
@@ -309,7 +304,7 @@ func (s *server) handleH3Stream(w http.ResponseWriter, r *http.Request, owned *s
 		return
 	}
 	op := s.quality.Begin(quality.Subject{}, "h3-attach-read")
-	id, err := readH3AttachSession(stream)
+	id, err := stream.ReadAttach()
 	op.End(err)
 	if err != nil {
 		_ = stream.Close()
@@ -326,12 +321,13 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request, owned *
 		appLog.WarnRate("websocket_accept_failed", 10*time.Second, "websocket-accept-failed", "remote", r.RemoteAddr, "err", err)
 		return
 	}
-	if !owned.setStream(ws) {
+	stream := relay.NewUDPWebSocketServer(ws)
+	if !owned.setStream(stream) {
 		return
 	}
 	s.countUnattachedWS(1)
 	op := s.quality.Begin(quality.Subject{}, "ws-attach-read")
-	id, err := readAttachSession(ws)
+	id, err := stream.ReadAttach()
 	op.End(err)
 	s.countUnattachedWS(-1)
 	if err != nil {
@@ -339,10 +335,10 @@ func (s *server) handleWebSocket(w http.ResponseWriter, r *http.Request, owned *
 		_ = ws.Close()
 		return
 	}
-	s.serveAttachedStream(ws, "ws", id, r.RemoteAddr, r.Context())
+	s.serveAttachedStream(stream, "ws", id, r.RemoteAddr, r.Context())
 }
 
-func (s *server) serveAttachedStream(stream relay.MessageStream, transport, id, remoteAddr string, ctx context.Context) {
+func (s *server) serveAttachedStream(stream *relay.UDPMessageStream, transport string, id uint32, remoteAddr string, ctx context.Context) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	requestDone := ctx.Done()
@@ -359,15 +355,8 @@ func (s *server) serveAttachedStream(stream relay.MessageStream, transport, id, 
 		_ = stream.Close()
 		return
 	}
-	ack, err := relay.EncodeControl(relay.ControlOpAttachOK, nil)
-	if err != nil {
-		lane.qr.Error(lane.q, "attach-encode", err, nil)
-		sess.removeLane(lane)
-		_ = stream.Close()
-		return
-	}
 	attach := s.quality.Begin(lane.q, "attach-ack")
-	err = stream.WriteMessage(ack)
+	err = stream.WriteAttachOK()
 	attach.End(err)
 	if err != nil {
 		sess.removeLane(lane)
@@ -377,7 +366,6 @@ func (s *server) serveAttachedStream(stream relay.MessageStream, transport, id, 
 	lane.qr.Life(lane.q, "lane-lifecycle", "available")
 	defer sess.removeLane(lane)
 	defer stream.Close()
-	sess.startExpandHintLoop(s)
 	if !s.usesDirectLaneWrite() {
 		sess.startDownBatchLoop(s)
 	}
@@ -397,9 +385,6 @@ func (s *server) serveAttachedStream(stream relay.MessageStream, transport, id, 
 			select {
 			case frames := <-sess.batchQ:
 				if sess.isClosed() {
-					return
-				}
-				if !s.writePendingExpandHint(lane, sess, id, remoteAddr) {
 					return
 				}
 				if !s.writeDownBatch(lane, id, remoteAddr, frames, true) {
@@ -452,6 +437,9 @@ func (s *server) serveAttachedStream(stream relay.MessageStream, transport, id, 
 }
 
 func (s *server) handleInboundFrameAfterTouch(sess *session, f relay.Frame) error {
+	if len(f.Payload) == 0 || len(f.Payload) > relay.MaxFramePayloadBytes {
+		return errors.New("invalid UDP payload length")
+	}
 	if sess.isClosed() {
 		return errSessionClosed
 	}
@@ -479,67 +467,6 @@ func (sess *session) startDownBatchLoop(parent *server) {
 	sess.batchOnce.Do(func() {
 		parent.goRun(func() { sess.downBatchLoop(parent) })
 	})
-}
-
-func (sess *session) startExpandHintLoop(parent *server) {
-	if parent.downExpandLanesMax <= 1 {
-		return
-	}
-	sess.expandHintOnce.Do(func() {
-		parent.goRun(func() { sess.expandHintLoop(parent) })
-	})
-}
-
-func (sess *session) expandHintLoop(parent *server) {
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-sess.done:
-			return
-		case <-ticker.C:
-			sess.maybeQueueExpandHint(parent, time.Now())
-		}
-	}
-}
-
-func (sess *session) maybeQueueExpandHint(parent *server, now time.Time) {
-	if sess.isClosed() || sess.downlinkBacklogDepth(parent) <= 1 {
-		return
-	}
-	maxLanes := parent.downExpandLanesMax
-	if maxLanes < 1 {
-		maxLanes = 12
-	}
-	hintTimeout := parent.downExpandHintTimeout
-	if hintTimeout <= 0 {
-		hintTimeout = 15 * time.Second
-	}
-	if sess.laneCount() >= maxLanes {
-		parent.countExpandHintSkippedMaxLanes()
-		return
-	}
-	if sess.expandHintInFlight.Load() {
-		inFlightAt := time.Unix(0, sess.expandHintInFlightAt.Load())
-		if !inFlightAt.IsZero() && now.Sub(inFlightAt) < hintTimeout {
-			return
-		}
-		if sess.expandHintInFlight.CompareAndSwap(true, false) {
-			sess.expandHintInFlightAt.Store(0)
-			parent.countExpandHintExpired()
-		}
-	}
-	sess.expandHintPending.CompareAndSwap(false, true)
-}
-
-func (sess *session) downlinkBacklogDepth(parent *server) int {
-	if parent.usesDirectLaneWrite() {
-		return len(sess.queue)
-	}
-	if sess.batchQ == nil {
-		return 0
-	}
-	return len(sess.batchQ)
 }
 
 func (sess *session) downBatchLoop(parent *server) {
@@ -671,7 +598,7 @@ func (s *server) usesDirectLaneWrite() bool {
 	return s.batchSize == 1
 }
 
-func (s *server) writeLaneDownDirectLoop(lane *serverLane, sess *session, id, remoteAddr string, done <-chan struct{}) {
+func (s *server) writeLaneDownDirectLoop(lane *serverLane, sess *session, id uint32, remoteAddr string, done <-chan struct{}) {
 	for {
 		if sess.isClosed() {
 			return
@@ -682,9 +609,6 @@ func (s *server) writeLaneDownDirectLoop(lane *serverLane, sess *session, id, re
 				return
 			}
 			s.observeQueueWait(f)
-			if !s.writePendingExpandHint(lane, sess, id, remoteAddr) {
-				return
-			}
 			if !s.writeDownBatch(lane, id, remoteAddr, []relay.Frame{f}, false) {
 				return
 			}
@@ -696,32 +620,7 @@ func (s *server) writeLaneDownDirectLoop(lane *serverLane, sess *session, id, re
 	}
 }
 
-func (s *server) writePendingExpandHint(lane *serverLane, sess *session, id, remoteAddr string) bool {
-	if s.downExpandLanesMax <= 1 {
-		return true
-	}
-	if !sess.expandHintPending.CompareAndSwap(true, false) {
-		return true
-	}
-	body, err := relay.EncodeControl(relay.ControlOpExpandLanesHint, nil)
-	if err != nil {
-		lane.qr.Error(lane.q, "stream-expand-hint-encode-failed", err, nil)
-		appLog.Error("stream-expand-hint-encode-failed", "session", id, "err", err, "transport", lane.transport)
-		return false
-	}
-	if err := lane.stream.WriteMessageOwned(body); err != nil {
-		s.countExpandHintWriteFailed()
-		lane.qr.Error(lane.q, "stream-expand-hint-write-failed", err, nil)
-		appLog.WarnRate("server_stream_expand_hint_write_failed", 10*time.Second, "stream-expand-hint-write-failed", "session", id, "remote", remoteAddr, "err", err, "transport", lane.transport)
-		return false
-	}
-	sess.expandHintInFlight.Store(true)
-	sess.expandHintInFlightAt.Store(time.Now().UnixNano())
-	s.countExpandHintSent()
-	return true
-}
-
-func (s *server) writeDownBatch(lane *serverLane, id, remoteAddr string, frames []relay.Frame, observeBatchQueue bool) bool {
+func (s *server) writeDownBatch(lane *serverLane, id uint32, remoteAddr string, frames []relay.Frame, observeBatchQueue bool) bool {
 	if body, ok, err := relay.EncodeFramesWithinLimitInto(lane.encodeBuf, frames, relay.MaxMessageBytes); err != nil {
 		lane.qr.Error(lane.q, "stream-encode-failed", err, nil)
 		appLog.Error("stream-encode-failed", "session", id, "err", err, "transport", lane.transport)
@@ -750,7 +649,7 @@ func (s *server) writeDownBatch(lane *serverLane, id, remoteAddr string, frames 
 	return true
 }
 
-func (s *server) writeDownEncodedChunk(lane *serverLane, id, remoteAddr string, frames []relay.Frame, body []byte, observeBatchQueue bool) bool {
+func (s *server) writeDownEncodedChunk(lane *serverLane, id uint32, remoteAddr string, frames []relay.Frame, body []byte, observeBatchQueue bool) bool {
 	defer lane.retainEncodeBuffer(body)
 	if observeBatchQueue {
 		s.observeBatchQueueWait(frames)
@@ -789,13 +688,16 @@ func (l *serverLane) retainEncodeBuffer(body []byte) {
 	l.encodeBuf = body[:0]
 }
 
-func (s *server) getSession(id string) (*session, error) {
+func (s *server) getSession(id uint32) (*session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.stopping {
 		return nil, errSessionClosed
 	}
 	if sess := s.sessions[id]; sess != nil {
+		if sess.isClosed() {
+			return nil, errSessionClosed
+		}
 		return sess, nil
 	}
 	var udp *net.UDPConn
@@ -820,7 +722,9 @@ func (s *server) getSession(id string) (*session, error) {
 	}
 	sess := &session{id: id, udp: udp, queue: make(chan relay.Frame, queueCap), batchQ: batchQ, done: make(chan struct{}), touchEvery: touchInterval(s.idle), lanes: make(map[*serverLane]struct{})}
 	sess.qr = s.quality
-	sess.q = s.quality.NewSession(id)
+	if s.quality.Enabled() {
+		sess.q = s.quality.NewSession(strconv.FormatUint(uint64(id), 10))
+	}
 	sess.qr.Life(sess.q, "session-lifecycle", "create")
 	sess.touch()
 	s.sessions[id] = sess
@@ -831,13 +735,13 @@ func (s *server) getSession(id string) (*session, error) {
 	return sess, nil
 }
 
-func (s *server) findSession(id string) *session {
+func (s *server) findSession(id uint32) *session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.sessions[id]
 }
 
-func (s *server) closeSession(id string, reasons ...string) {
+func (s *server) closeSession(id uint32, reasons ...string) {
 	s.mu.Lock()
 	sess := s.sessions[id]
 	delete(s.sessions, id)
@@ -858,7 +762,7 @@ func (s *server) cleanupLoop() {
 		case <-t.C:
 		}
 		cutoff := time.Now().Add(-s.idle)
-		var ids []string
+		var ids []uint32
 		s.mu.Lock()
 		for id, sess := range s.sessions {
 			if sess.idleBefore(cutoff) {
@@ -889,36 +793,6 @@ func isWebSocketUpgrade(r *http.Request) bool {
 
 func validWebSocketUpgrade(r *http.Request) bool {
 	return r.Header.Get("Sec-WebSocket-Key") != "" && r.Header.Get("Sec-WebSocket-Version") == "13"
-}
-
-func readAttachSession(ws *relay.WebSocketConn) (string, error) {
-	for {
-		opcode, body, err := ws.ReadWebSocketMessage()
-		if err != nil {
-			return "", err
-		}
-		switch opcode {
-		case 0x2:
-			op, payload, err := relay.DecodeControl(body)
-			if err != nil {
-				return "", err
-			}
-			if op != relay.ControlOpAttach {
-				return "", errors.New("bad attach op")
-			}
-			id := string(payload)
-			if id == "" || len(id) > 128 {
-				return "", errors.New("bad attach session")
-			}
-			return id, nil
-		case 0x8:
-			return "", io.EOF
-		case 0x9, 0xA:
-			continue
-		default:
-			return "", errors.New("bad websocket opcode before attach")
-		}
-	}
 }
 
 func (s *session) touch() { coarsetime.Touch(&s.lastActive, s.touchEvery) }
@@ -974,8 +848,6 @@ func (s *session) addLane(stream relay.MessageStream, transport string) (*server
 	ln.q = s.qr.NewLane(s.q, ln.id, transport)
 	ln.qr.Life(ln.q, "lane-lifecycle", "create")
 	s.lanes[ln] = struct{}{}
-	s.expandHintInFlight.Store(false)
-	s.expandHintInFlightAt.Store(0)
 	return ln, true
 }
 
@@ -1024,10 +896,16 @@ func (s *session) readLoop(parent *server) {
 				return
 			}
 			s.qr.Error(s.q, "udp-read", err, nil)
+			if relay.IsUDPMessageTooLarge(err) {
+				continue
+			}
 			return
 		}
 		if s.isClosed() {
 			return
+		}
+		if n == 0 || n > relay.MaxFramePayloadBytes {
+			continue
 		}
 		s.touch()
 		payload := append([]byte(nil), buf[:n]...)

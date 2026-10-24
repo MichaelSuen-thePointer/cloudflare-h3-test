@@ -50,40 +50,38 @@ func newProviderH3ServerWithProbe(t *testing.T, replyToPing bool, greeting ...bo
 				return
 			}
 			for {
-				control, err := relay.ReadStreamMessage(r.Body)
+				control, err := testReadClientRecord(r.Body)
 				if err != nil {
 					return
 				}
-				op, _, err := relay.DecodeControl(control)
+				op, _, err := testDecodeControl(control)
 				if err != nil {
 					t.Errorf("bad pre-attach control: %v", err)
 					return
 				}
-				if op == relay.ControlOpAttach {
+				if op == testAttach {
 					break
 				}
-				if op != relay.ControlOpPing {
+				if op != testPing {
 					t.Errorf("bad pre-attach op=%d", op)
 					return
 				}
 				if !replyToPing {
 					continue
 				}
-				pong, _ := relay.EncodeControl(relay.ControlOpPong, nil)
-				if err := relay.WriteStreamMessage(w, pong); err != nil {
+				pong, _ := testEncodeControl(testPing, nil)
+				if err := testWriteRecord(w, pong); err != nil {
 					return
 				}
 				if err := http.NewResponseController(w).Flush(); err != nil {
 					return
 				}
 			}
-			ack, _ := relay.EncodeControl(relay.ControlOpAttachOK, nil)
+			ack, _ := testEncodeControl(testAttachOK, nil)
 			var frames bytes.Buffer
-			_ = relay.WriteStreamMessage(&frames, ack)
+			_ = testWriteRecord(&frames, ack)
 			if len(greeting) > 0 && greeting[0] {
-				hint, _ := relay.EncodeControl(relay.ControlOpExpandLanesHint, nil)
-				_ = relay.WriteStreamMessage(&frames, hint)
-				_ = relay.WriteStreamMessage(&frames, []byte("immediate-business"))
+				_ = testWriteRecord(&frames, testDATA("immediate-business"))
 			}
 			if _, err := w.Write(frames.Bytes()); err != nil {
 				return
@@ -92,19 +90,19 @@ func newProviderH3ServerWithProbe(t *testing.T, replyToPing bool, greeting ...bo
 				return
 			}
 			for {
-				body, err := relay.ReadStreamMessage(r.Body)
+				body, err := testReadClientRecord(r.Body)
 				if err != nil {
 					return
 				}
-				if relay.IsControlMessage(body) {
-					op, payload, err := relay.DecodeControl(body)
-					if err != nil || op != relay.ControlOpPing || len(payload) != 0 {
+				if testIsControl(body) {
+					op, payload, err := testDecodeControl(body)
+					if err != nil || op != testPing || len(payload) != 0 {
 						t.Errorf("bad attached control: op=%v payload=%x err=%v", op, payload, err)
 						return
 					}
-					body, _ = relay.EncodeControl(relay.ControlOpPong, nil)
+					body, _ = testEncodeControl(testPing, nil)
 				}
-				if err := relay.WriteStreamMessage(w, body); err != nil {
+				if err := testWriteRecord(w, body); err != nil {
 					return
 				}
 				if err := http.NewResponseController(w).Flush(); err != nil {
@@ -133,12 +131,12 @@ func TestH3ProviderSharesAndRetiresTransports(t *testing.T) {
 	defer p.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	first, err := p.Acquire(ctx, "one")
+	first, err := p.Acquire(ctx, 123)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer first.Close()
-	second, err := p.Acquire(ctx, "two")
+	second, err := p.Acquire(ctx, 123)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +144,7 @@ func TestH3ProviderSharesAndRetiresTransports(t *testing.T) {
 	if got := p.stats(); got.TransportCount != 1 || got.ActiveStreams != 2 {
 		t.Fatalf("after two streams: %+v", got)
 	}
-	third, err := p.Acquire(ctx, "three")
+	third, err := p.Acquire(ctx, 123)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,10 +158,10 @@ func TestH3ProviderSharesAndRetiresTransports(t *testing.T) {
 	if got := p.stats(); got.TransportCount != 2 || got.ActiveStreams != 2 {
 		t.Fatalf("after first close: %+v", got)
 	}
-	if err := second.WriteMessage([]byte("remaining")); err != nil {
+	if err := second.WriteMessage(testDATA("remaining")); err != nil {
 		t.Fatal(err)
 	}
-	if body, err := second.ReadMessage(); err != nil || string(body) != "remaining" {
+	if body, err := second.ReadMessage(); err != nil || string(body[2:]) != "remaining" {
 		t.Fatalf("remaining body=%q err=%v", body, err)
 	}
 	if err := second.Close(); err != nil {
@@ -199,7 +197,7 @@ func TestH3ProviderConcurrentAcquisitionAndShutdown(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			stream, acquireErr := p.Acquire(ctx, "concurrent")
+			stream, acquireErr := p.Acquire(ctx, 123)
 			streams[i] = stream
 			errCh <- acquireErr
 		}(i)
@@ -220,7 +218,7 @@ func TestH3ProviderConcurrentAcquisitionAndShutdown(t *testing.T) {
 	if got := p.stats(); got.TransportCount != 3 || got.ActiveStreams != count {
 		t.Fatalf("shutdown closed active transports: %+v", got)
 	}
-	if _, err := p.Acquire(ctx, "closed"); err == nil {
+	if _, err := p.Acquire(ctx, 123); err == nil {
 		t.Fatal("closed provider accepted stream")
 	}
 	for _, stream := range streams {
@@ -276,7 +274,7 @@ func TestH3ProviderFixedAndIncrementalSessions(t *testing.T) {
 			defer provider.Close()
 			ctx, cancel := context.WithCancel(context.Background())
 			sess := &session{
-				id: "h3-session", ctx: ctx, cancel: cancel, closed: make(chan struct{}),
+				id: 123, ctx: ctx, cancel: cancel, closed: make(chan struct{}),
 				ready: make(chan struct{}), sendQ: make(chan []byte, 2), batchQ: make(chan []relay.Frame, 2),
 				lanesChanged: make(chan struct{}, 1),
 			}
@@ -284,6 +282,13 @@ func TestH3ProviderFixedAndIncrementalSessions(t *testing.T) {
 			c := &clientState{transport: "h3", provider: provider, laneTarget: 2,
 				lanesIncremental: incremental, timeout: time.Second, sessions: map[netip.AddrPort]*session{}}
 			sess.state = c
+			udp, udpErr := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if udpErr != nil {
+				t.Fatal(udpErr)
+			}
+			defer udp.Close()
+			c.udp = udp
+			sess.peer = udp.LocalAddr().(*net.UDPAddr)
 			c.connectInitialLanes(sess, netip.AddrPort{}, "peer")
 			wantInitial := 2
 			if incremental {
@@ -293,7 +298,8 @@ func TestH3ProviderFixedAndIncrementalSessions(t *testing.T) {
 				t.Fatalf("initial lanes=%d want %d", got, wantInitial)
 			}
 			if incremental {
-				sess.expandHintPending.Store(true)
+				sess.batchQ <- []relay.Frame{{Payload: []byte("backlog-1")}}
+				sess.batchQ <- []relay.Frame{{Payload: []byte("backlog-2")}}
 				sess.maybeAcquireIncrementalLane()
 				deadline := time.After(2 * time.Second)
 				for sess.laneCount() != 2 {
@@ -324,7 +330,7 @@ func TestH3ProviderCanceledSetupRetiresSlot(t *testing.T) {
 	defer p.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
 	defer cancel()
-	if _, err := p.Acquire(ctx, "blocked"); err != context.DeadlineExceeded {
+	if _, err := p.Acquire(ctx, 123); err != context.DeadlineExceeded {
 		t.Fatalf("canceled acquisition error=%v", err)
 	}
 	if got := p.stats(); got.TransportCount != 0 || got.ActiveStreams != 0 {
@@ -340,7 +346,7 @@ func TestH3ProviderSingleStreamWithoutMetrics(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	stream, err := p.Acquire(ctx, "direct")
+	stream, err := p.Acquire(ctx, 123)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,10 +362,10 @@ func TestH3ProviderSingleStreamWithoutMetrics(t *testing.T) {
 	if err := p.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := stream.WriteMessage([]byte("owned")); err != nil {
+	if err := stream.WriteMessage(testDATA("owned")); err != nil {
 		t.Fatal(err)
 	}
-	if body, err := stream.ReadMessage(); err != nil || string(body) != "owned" {
+	if body, err := stream.ReadMessage(); err != nil || string(body[2:]) != "owned" {
 		t.Fatalf("body=%q err=%v", body, err)
 	}
 	if err := stream.Close(); err != nil {
@@ -395,7 +401,7 @@ func TestH3ProviderStandbyProbeAttachAndShutdown(t *testing.T) {
 	waitH3PoolIdle(t, p, 2)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	stream, err := p.Acquire(ctx, "standby")
+	stream, err := p.Acquire(ctx, 123)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,10 +416,10 @@ func TestH3ProviderStandbyProbeAttachAndShutdown(t *testing.T) {
 	if got := p.stats(); got.TransportCount != 1 || got.ActiveStreams != 1 || got.H3Idle != 0 {
 		t.Fatalf("shutdown closed attached stream or retained idle streams: %+v", got)
 	}
-	if err := stream.WriteMessage([]byte("still-active")); err != nil {
+	if err := stream.WriteMessage(testDATA("still-active")); err != nil {
 		t.Fatal(err)
 	}
-	if body, err := stream.ReadMessage(); err != nil || string(body) != "still-active" {
+	if body, err := stream.ReadMessage(); err != nil || string(body[2:]) != "still-active" {
 		t.Fatalf("body=%q err=%v", body, err)
 	}
 	if err := stream.Close(); err != nil {
@@ -443,7 +449,7 @@ func TestH3ProviderStandbySingleStreamDirectFallback(t *testing.T) {
 	defer p.pool.evict(heldEntry, context.Canceled)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	stream, err := p.Acquire(ctx, "fallback")
+	stream, err := p.Acquire(ctx, 123)
 	if err != nil {
 		_ = held.Close()
 		t.Fatal(err)
@@ -454,10 +460,10 @@ func TestH3ProviderStandbySingleStreamDirectFallback(t *testing.T) {
 	}
 	_ = held.Close()
 	waitH3PoolIdle(t, p, 1)
-	if err := stream.WriteMessage([]byte("fallback-active")); err != nil {
+	if err := stream.WriteMessage(testDATA("fallback-active")); err != nil {
 		t.Fatal(err)
 	}
-	if body, err := stream.ReadMessage(); err != nil || string(body) != "fallback-active" {
+	if body, err := stream.ReadMessage(); err != nil || string(body[2:]) != "fallback-active" {
 		t.Fatalf("body=%q err=%v", body, err)
 	}
 	if err := p.Close(); err != nil {
@@ -606,7 +612,7 @@ func TestH3StandbyMissingPongCoalescedHandoff(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	got, err := p.Acquire(ctx, "session")
+	got, err := p.Acquire(ctx, 123)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -618,21 +624,16 @@ func TestH3StandbyMissingPongCoalescedHandoff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	op, _, err := relay.DecodeControl(body)
-	if err != nil || op != relay.ControlOpExpandLanesHint {
-		t.Fatalf("hint=%x err=%v", body, err)
-	}
-	body, err = got.ReadMessage()
-	if err != nil || string(body) != "immediate-business" {
+	if err != nil || string(body[2:]) != "immediate-business" {
 		t.Fatalf("body=%q err=%v", body, err)
 	}
 	if err := p.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := got.WriteMessage([]byte("active")); err != nil {
+	if err := got.WriteMessage(testDATA("active")); err != nil {
 		t.Fatal(err)
 	}
-	if body, err := got.ReadMessage(); err != nil || string(body) != "active" {
+	if body, err := got.ReadMessage(); err != nil || string(body[2:]) != "active" {
 		t.Fatalf("body=%q err=%v", body, err)
 	}
 }
@@ -655,25 +656,30 @@ func TestWSStandbyTLSHandoff(t *testing.T) {
 			return
 		}
 		defer ws.Close()
-		// Native peer Ping is handled by the unique standby reader.
-		if err := ws.Ping(nil); err != nil {
+		// An unsolicited business Pong is consumed by the unique standby reader.
+		if err := ws.WriteMessage([]byte{0, 0}); err != nil {
 			return
 		}
 		body, err := ws.ReadMessage()
+		for err == nil && testIsControl(body) && len(body) == 2 && body[0] == 0 {
+			if ws.WriteMessage([]byte{0, 0}) != nil {
+				return
+			}
+			body, err = ws.ReadMessage()
+		}
 		if err != nil {
 			return
 		}
-		op, _, err := relay.DecodeControl(body)
-		if err != nil || op != relay.ControlOpAttach {
+		op, _, err := testDecodeControl(body)
+		if err != nil || op != testAttach {
 			t.Errorf("attach=%x err=%v", body, err)
 			return
 		}
-		ack, _ := relay.EncodeControl(relay.ControlOpAttachOK, nil)
+		ack, _ := testEncodeControl(testAttachOK, nil)
 		if err := ws.WriteMessage(ack); err != nil {
 			return
 		}
-		hint, _ := relay.EncodeControl(relay.ControlOpExpandLanesHint, nil)
-		for _, frame := range [][]byte{hint, []byte("immediate-business")} {
+		for _, frame := range [][]byte{testDATA("immediate-business")} {
 			if err := ws.WriteMessage(frame); err != nil {
 				return
 			}
@@ -698,7 +704,7 @@ func TestWSStandbyTLSHandoff(t *testing.T) {
 			p := newWSPool("wss"+strings.TrimPrefix(server.URL, "https"), "", "token", target, time.Second, relay.WebSocketSocketOptions{})
 			defer p.Close()
 			deadline := time.Now().Add(3 * time.Second)
-			var original *relay.WebSocketConn
+			var original *relay.UDPMessageStream
 			for target > 0 && time.Now().Before(deadline) {
 				p.mu.Lock()
 				if len(p.ready) > 0 {
@@ -719,7 +725,7 @@ func TestWSStandbyTLSHandoff(t *testing.T) {
 				}
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			got, err := p.Acquire(ctx, "session")
+			got, err := p.Acquire(ctx, 123)
 			if err != nil {
 				cancel()
 				t.Fatal(err)
@@ -733,23 +739,15 @@ func TestWSStandbyTLSHandoff(t *testing.T) {
 			if target == 0 && len(p.entries) != 0 {
 				t.Fatal("no-pool WS allocated standby state")
 			}
-			hint, err := got.ReadMessage()
-			if err != nil {
-				t.Fatal(err)
-			}
-			op, _, err := relay.DecodeControl(hint)
-			if err != nil || op != relay.ControlOpExpandLanesHint {
-				t.Fatalf("hint=%x err=%v", hint, err)
-			}
 			body, err := got.ReadMessage()
-			if err != nil || string(body) != "immediate-business" {
+			if err != nil || string(body[2:]) != "immediate-business" {
 				t.Fatalf("body=%q err=%v", body, err)
 			}
-			if err := got.WriteMessage([]byte("still-active")); err != nil {
+			if err := got.WriteMessage(testDATA("still-active")); err != nil {
 				t.Fatal(err)
 			}
 			body, err = got.ReadMessage()
-			if err != nil || string(body) != "still-active" {
+			if err != nil || string(body[2:]) != "still-active" {
 				t.Fatalf("body=%q err=%v", body, err)
 			}
 		})
@@ -768,7 +766,7 @@ func TestH3StandbyFailurePreservesAttachedSibling(t *testing.T) {
 			waitH3PoolIdle(t, p, 1)
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			stream, err := p.Acquire(ctx, "session")
+			stream, err := p.Acquire(ctx, 123)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -795,10 +793,10 @@ func TestH3StandbyFailurePreservesAttachedSibling(t *testing.T) {
 				}
 				time.Sleep(time.Millisecond)
 			}
-			if err := stream.WriteMessage([]byte("surviving-lane")); err != nil {
+			if err := stream.WriteMessage(testDATA("surviving-lane")); err != nil {
 				t.Fatal(err)
 			}
-			if body, err := stream.ReadMessage(); err != nil || string(body) != "surviving-lane" {
+			if body, err := stream.ReadMessage(); err != nil || string(body[2:]) != "surviving-lane" {
 				t.Fatalf("body=%q err=%v", body, err)
 			}
 			p.Close()

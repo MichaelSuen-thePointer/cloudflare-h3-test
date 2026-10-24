@@ -30,18 +30,6 @@ func (c *clientState) countReconnect() {
 	}
 }
 
-func (c *clientState) countExpandHintReceived() {
-	if c.metrics {
-		c.stats.expandHintsReceived.Add(1)
-	}
-}
-
-func (c *clientState) countExpandHintUsed() {
-	if c.metrics {
-		c.stats.expandHintsUsed.Add(1)
-	}
-}
-
 func (c *clientState) countIncrementalAcquireStarted() {
 	if c.metrics {
 		c.stats.incrementalAcquireStarted.Add(1)

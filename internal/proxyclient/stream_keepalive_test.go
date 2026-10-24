@@ -33,7 +33,7 @@ func (s *keepaliveTestStream) WriteMessage(body []byte) error {
 }
 func (s *keepaliveTestStream) WriteMessageOwned(body []byte) error { return s.WriteMessage(body) }
 func (s *keepaliveTestStream) SendPing() error {
-	body, _ := relay.EncodeControl(relay.ControlOpPing, nil)
+	body, _ := testEncodeControl(testPing, nil)
 	return s.WriteMessage(body)
 }
 func (s *keepaliveTestStream) ReadMessage() ([]byte, error) {
@@ -66,12 +66,12 @@ func takeKeepaliveWrite(t *testing.T, stream *keepaliveTestStream, ping bool) []
 	t.Helper()
 	select {
 	case body := <-stream.writes:
-		if relay.IsControlMessage(body) != ping {
-			t.Fatalf("control=%v, want ping=%v", relay.IsControlMessage(body), ping)
+		if testIsControl(body) != ping {
+			t.Fatalf("control=%v, want ping=%v", testIsControl(body), ping)
 		}
 		if ping {
-			op, payload, err := relay.DecodeControl(body)
-			if err != nil || op != relay.ControlOpPing || len(payload) != 0 {
+			op, payload, err := testDecodeControl(body)
+			if err != nil || op != testPing || len(payload) != 0 {
 				t.Fatalf("invalid Ping: op=%v payload=%x err=%v", op, payload, err)
 			}
 		}
@@ -106,7 +106,7 @@ func TestStreamLaneKeepaliveIdleAndBusinessReset(t *testing.T) {
 						time.Sleep(streamKeepaliveInterval)
 						synctest.Wait()
 						takeKeepaliveWrite(t, stream, true)
-						if s.lastActive.Load() != initialActive || s.next.Load() != 0 ||
+						if s.lastActive.Load() != initialActive ||
 							s.stats.udpInPackets.Load() != 0 || ln.posts.Load() != 0 {
 							t.Fatal("Ping changed business activity, packet IDs, or UDP metrics")
 						}
@@ -114,7 +114,7 @@ func TestStreamLaneKeepaliveIdleAndBusinessReset(t *testing.T) {
 						if batchSize == 1 {
 							s.sendQ <- []byte("business")
 						} else {
-							s.batchQ <- []relay.Frame{{PacketID: 42, Payload: []byte("business")}}
+							s.batchQ <- []relay.Frame{{Payload: []byte("business")}}
 						}
 						synctest.Wait()
 						body := takeKeepaliveWrite(t, stream, false)
@@ -163,7 +163,7 @@ func TestStreamLaneKeepaliveRechecksExpiredTimerAfterBusinessWrite(t *testing.T)
 					if batchSize == 1 {
 						s.sendQ <- []byte("business")
 					} else {
-						s.batchQ <- []relay.Frame{{PacketID: 42, Payload: []byte("business")}}
+						s.batchQ <- []relay.Frame{{Payload: []byte("business")}}
 					}
 					synctest.Wait()
 					// The timer becomes ready while the business write is blocked.
@@ -279,7 +279,7 @@ type keepaliveSlowProvider struct {
 	err      error
 }
 
-func (p *keepaliveSlowProvider) Acquire(context.Context, string) (relay.KeepaliveMessageStream, error) {
+func (p *keepaliveSlowProvider) Acquire(context.Context, uint32) (relay.KeepaliveMessageStream, error) {
 	index := p.acquires.Add(1) - 1
 	if index == 1 {
 		time.Sleep(2 * streamKeepaliveInterval)
@@ -388,7 +388,7 @@ func TestStreamInitialReadinessGatesBusiness(t *testing.T) {
 							s.sendQ <- []byte("queued-before-ready")
 						} else {
 							s.goRun(func() {
-								s.sendBatch([]relay.Frame{{PacketID: 1, Payload: []byte("queued-before-ready")}})
+								s.sendBatch([]relay.Frame{{Payload: []byte("queued-before-ready")}})
 							})
 						}
 						synctest.Wait()
@@ -426,7 +426,7 @@ func TestStreamInitialReadinessGatesBusiness(t *testing.T) {
 	}
 }
 
-func (p *keepaliveReplacementProvider) Acquire(context.Context, string) (relay.KeepaliveMessageStream, error) {
+func (p *keepaliveReplacementProvider) Acquire(context.Context, uint32) (relay.KeepaliveMessageStream, error) {
 	p.acquires.Add(1)
 	return p.stream, nil
 }
@@ -493,7 +493,7 @@ func TestH3LaneKeepalivePongAndBusinessOnSharedTransport(t *testing.T) {
 			defer s.close()
 			s.state.provider = p
 			for i := range 2 {
-				stream, err := p.Acquire(ctx, "keepalive-test")
+				stream, err := p.Acquire(ctx, 123)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -570,7 +570,7 @@ func TestStreamLaneKeepaliveCloudflare(t *testing.T) {
 			defer s.close()
 			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 			defer cancel()
-			id := fmt.Sprintf("keepalive-phase7-%d", time.Now().UnixNano())
+			id := uint32(time.Now().UnixNano())
 			var streams []*keepaliveObservedStream
 			for i := range 2 {
 				stream, err := p.Acquire(ctx, id)
@@ -618,7 +618,7 @@ func TestStreamLaneKeepaliveCloudflare(t *testing.T) {
 					if len(streams[0].ping) != 0 || len(streams[1].ping) < 6 {
 						t.Fatalf("busy/silent Ping counts=%d/%d", len(streams[0].ping), len(streams[1].ping))
 					}
-					if s.lastActive.Load() != initialActivity || s.stats.udpInPackets.Load() != 0 || s.next.Load() != 0 {
+					if s.lastActive.Load() != initialActivity || s.stats.udpInPackets.Load() != 0 {
 						t.Fatal("keepalive or empty batches changed UDP business activity")
 					}
 					t.Logf("transport=%s edge=%s duration=%v busy/silent Ping counts=%d/%d; both original lanes survived", transport, edge, time.Since(start), len(streams[0].ping), len(streams[1].ping))

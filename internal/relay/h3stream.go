@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
-	"sync/atomic"
 
 	"github.com/quic-go/quic-go/http3"
 )
@@ -16,15 +15,14 @@ import (
 // H3MessageStream carries messages in both bodies of one long-lived POST.
 // Its transport is either owned by the stream or borrowed from its caller.
 type H3MessageStream struct {
+	*UDPMessageStream
 	requestWriter  *io.PipeWriter
 	responseBody   io.ReadCloser
 	cancel         context.CancelFunc
 	closeTransport func() error
 	closed         chan struct{}
-	writeMu        sync.Mutex
 	closeOnce      sync.Once
 	closeErr       error
-	attached       atomic.Bool
 }
 
 var _ AttachableMessageStream = (*H3MessageStream)(nil)
@@ -104,138 +102,8 @@ func openDuplexMessageStream(ctx context.Context, transport http.RoundTripper, c
 		_ = stream.Close()
 		return nil, fmt.Errorf("duplex status=%d", response.StatusCode)
 	}
+	stream.UDPMessageStream = NewUDPClientStream(&h3BodyCarrier{stream})
 	return stream, nil
-}
-
-func (s *H3MessageStream) WriteMessage(payload []byte) error {
-	return s.writeMessage(payload)
-}
-
-func (s *H3MessageStream) WriteMessageOwned(payload []byte) error {
-	return s.writeMessage(payload)
-}
-
-func (s *H3MessageStream) SendPing() error {
-	body, _ := EncodeControl(ControlOpPing, nil)
-	return s.writeMessage(body)
-}
-
-func (s *H3MessageStream) writeMessage(payload []byte) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	select {
-	case <-s.closed:
-		return io.ErrClosedPipe
-	default:
-	}
-	return WriteStreamMessage(s.requestWriter, payload)
-}
-
-func (s *H3MessageStream) ReadMessage() ([]byte, error) {
-	for {
-		body, err := ReadStreamMessage(s.responseBody)
-		if err != nil {
-			return nil, err
-		}
-		if !IsControlMessage(body) {
-			return body, nil
-		}
-		op, payload, err := DecodeControl(body)
-		if err != nil {
-			return nil, err
-		}
-		switch op {
-		case ControlOpPong:
-			if len(payload) != 0 {
-				return nil, errors.New("bad pong payload")
-			}
-			continue
-		case ControlOpAttachOK:
-			if !s.attached.Load() {
-				return body, nil
-			}
-		case ControlOpExpandLanesHint:
-			if s.attached.Load() {
-				return body, nil
-			}
-		}
-		return nil, fmt.Errorf("unexpected H3 control op=%d", op)
-	}
-}
-
-func (s *H3MessageStream) ReadMessageView() ([]byte, error) { return s.ReadMessage() }
-
-func (s *H3MessageStream) Probe(ctx context.Context) error {
-	return s.runSetup(ctx, func() error {
-		if err := s.SendPing(); err != nil {
-			return err
-		}
-		response, err := ReadStreamMessage(s.responseBody)
-		if err != nil {
-			return err
-		}
-		op, payload, err := DecodeControl(response)
-		if err != nil {
-			return err
-		}
-		if op != ControlOpPong || len(payload) != 0 {
-			return errors.New("bad probe pong")
-		}
-		return nil
-	})
-}
-
-func (s *H3MessageStream) Attach(ctx context.Context, sessionID string) error {
-	return s.runSetup(ctx, func() error {
-		if err := s.SendAttach(sessionID); err != nil {
-			return err
-		}
-		return s.ReadAttachAck()
-	})
-}
-
-func (s *H3MessageStream) SendAttach(sessionID string) error {
-	body, err := EncodeAttach(sessionID)
-	if err != nil {
-		return err
-	}
-	return s.WriteMessage(body)
-}
-
-func (s *H3MessageStream) ReadAttachAck() error {
-	ack, err := s.ReadMessage()
-	if err != nil {
-		return err
-	}
-	op, payload, err := DecodeControl(ack)
-	if err != nil {
-		return err
-	}
-	if op != ControlOpAttachOK || len(payload) != 0 {
-		return errors.New("bad attach ack")
-	}
-	s.attached.Store(true)
-	return nil
-}
-
-func (s *H3MessageStream) runSetup(ctx context.Context, operation func() error) (err error) {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	cancelDone := make(chan struct{})
-	stop := context.AfterFunc(ctx, func() {
-		defer close(cancelDone)
-		_ = s.Close()
-	})
-	defer func() {
-		if !stop() {
-			<-cancelDone
-		}
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			err = ctxErr
-		}
-	}()
-	return operation()
 }
 
 func (s *H3MessageStream) Close() error {
@@ -252,3 +120,11 @@ func (s *H3MessageStream) Close() error {
 	})
 	return s.closeErr
 }
+
+// The body carrier owns request cancellation and response closure, while the
+// shared protocol wrapper supplies all record state and write serialization.
+type h3BodyCarrier struct{ stream *H3MessageStream }
+
+func (c *h3BodyCarrier) Read(p []byte) (int, error)  { return c.stream.responseBody.Read(p) }
+func (c *h3BodyCarrier) Write(p []byte) (int, error) { return c.stream.requestWriter.Write(p) }
+func (c *h3BodyCarrier) Close() error                { return c.stream.Close() }

@@ -51,7 +51,7 @@ func TestQualityStandbyReaderErrors(t *testing.T) {
 				e := p.registerLocked(s, state)
 				p.mu.Unlock()
 				if mode == "attach-error" {
-					if err := p.attach(context.Background(), e, "session"); !errors.Is(err, readErr) {
+					if err := p.attach(context.Background(), e, 123); !errors.Is(err, readErr) {
 						t.Fatalf("attach error=%v", err)
 					}
 				} else if mode == "local-close" {
@@ -118,7 +118,7 @@ type qualityTestProvider struct {
 	err    error
 }
 
-func (p *qualityTestProvider) Acquire(context.Context, string) (relay.KeepaliveMessageStream, error) {
+func (p *qualityTestProvider) Acquire(context.Context, uint32) (relay.KeepaliveMessageStream, error) {
 	return p.stream, p.err
 }
 func (*qualityTestProvider) Close() error                 { return nil }
@@ -148,7 +148,7 @@ func TestQualityConcurrentPublicationClose(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())
 				stream := &qualityBlockingStream{closed: make(chan struct{})}
 				c := &clientState{quality: r, transport: "ws", provider: &qualityTestProvider{stream: stream}, timeout: time.Second, batchSize: 1, laneTarget: 2, lanesIncremental: true}
-				sess := &session{qr: r, q: r.NewSession("local-session"), state: c, id: "local-session", ctx: ctx, cancel: cancel, closed: make(chan struct{}), ready: make(chan struct{}), sendQ: make(chan []byte, 4), lanesChanged: make(chan struct{}, 1)}
+				sess := &session{qr: r, q: r.NewSession("local-session"), state: c, id: 123, ctx: ctx, cancel: cancel, closed: make(chan struct{}), ready: make(chan struct{}), sendQ: make(chan []byte, 4), lanesChanged: make(chan struct{}, 1)}
 				close(sess.ready)
 				var old *streamLane
 				if mode != "initial" {
@@ -162,7 +162,8 @@ func TestQualityConcurrentPublicationClose(t *testing.T) {
 				case "initial":
 					go func() { defer close(workDone); _ = c.ensureLanes(sess, 1) }()
 				case "incremental":
-					sess.expandHintPending.Store(true)
+					sess.sendQ <- []byte("backlog-1")
+					sess.sendQ <- []byte("backlog-2")
 					sess.maybeAcquireIncrementalLane()
 					close(workDone)
 				case "reconnect":
@@ -268,23 +269,18 @@ func TestQualityClientReadClasses(t *testing.T) {
 	defer peer.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &clientState{quality: r, transport: "ws", udp: udp, laneTarget: 1}
-	sess := &session{qr: r, q: r.NewSession("read-classes"), state: c, id: "read-classes", ctx: ctx, cancel: cancel, closed: make(chan struct{}), peer: peer.LocalAddr().(*net.UDPAddr), lanesChanged: make(chan struct{}, 1)}
+	sess := &session{qr: r, q: r.NewSession("read-classes"), state: c, id: 123, ctx: ctx, cancel: cancel, closed: make(chan struct{}), peer: peer.LocalAddr().(*net.UDPAddr), lanesChanged: make(chan struct{}, 1)}
 	stream := &qualityMessageStream{qualityBlockingStream: &qualityBlockingStream{closed: make(chan struct{})}, messages: make(chan []byte, 4), entered: make(chan struct{}, 5)}
 	lane := sess.newObservedLane(0, stream)
 	sess.lanes = []*streamLane{lane}
 	sess.publishLaneSnapshotLocked()
-	control, _ := relay.EncodeControl(relay.ControlOpExpandLanesHint, nil)
-	badControl := append([]byte(nil), control...)
-	badControl[4] = 255
 	business, _ := relay.EncodeFrames([]relay.Frame{{Payload: []byte("hello")}})
-	stream.messages <- control
-	stream.messages <- badControl
 	stream.messages <- []byte("bad")
 	stream.messages <- business
 	sess.goRun(func() { sess.laneReadLoop(c, lane) })
-	// The fifth read is blocked in the wrapper: all four returned bodies were
+	// The third read is blocked in the wrapper: both returned bodies were
 	// processed; session close must not record the resulting read error.
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 3; i++ {
 		select {
 		case <-stream.entered:
 		case <-time.After(2 * time.Second):
@@ -306,11 +302,11 @@ func TestQualityClientReadClasses(t *testing.T) {
 	defer db.Close()
 	for q, want := range map[string]int{
 		"SELECT count(*) FROM observation WHERE event_name='transfer' AND direction='read'":                                       1,
-		"SELECT count(*) FROM observation WHERE event_name='control-read' AND encoded_bytes=8":                                    2,
+		"SELECT count(*) FROM observation WHERE event_name='control-read' AND encoded_bytes=2":                                    0,
 		"SELECT count(*) FROM observation WHERE event_name='read-unknown' AND outcome='ok' AND encoded_bytes=3":                   1,
 		"SELECT count(*) FROM observation WHERE event_name='read-unknown' AND outcome='error' AND encoded_bytes IS NULL":          0,
 		"SELECT count(*) FROM observation WHERE event_name='error' AND action='decode' AND encoded_bytes=3":                       1,
-		"SELECT count(*) FROM observation WHERE event_name='error' AND action='stream-control-decode-failed' AND encoded_bytes=8": 1,
+		"SELECT count(*) FROM observation WHERE event_name='error' AND action='stream-control-decode-failed' AND encoded_bytes=2": 0,
 	} {
 		var got int
 		if err = db.QueryRow(q).Scan(&got); err != nil || got != want {
@@ -382,7 +378,7 @@ func TestQualitySessionCloseReasons(t *testing.T) {
 	}
 	for _, mode := range []string{"idle", "unknown", "initial-connect-failed"} {
 		ctx, cancel := context.WithCancel(context.Background())
-		sess := &session{qr: r, q: r.NewSession(mode), id: mode, ctx: ctx, cancel: cancel, closed: make(chan struct{}), ready: make(chan struct{}), lanesChanged: make(chan struct{}, 1)}
+		sess := &session{qr: r, q: r.NewSession(mode), id: 123, ctx: ctx, cancel: cancel, closed: make(chan struct{}), ready: make(chan struct{}), lanesChanged: make(chan struct{}, 1)}
 		key := netip.MustParseAddrPort("127.0.0.1:12345")
 		c := &clientState{quality: r, transport: "ws", provider: &qualityTestProvider{err: context.DeadlineExceeded}, timeout: time.Second, laneTarget: 1, sessions: map[netip.AddrPort]*session{key: sess}}
 		sess.state = c

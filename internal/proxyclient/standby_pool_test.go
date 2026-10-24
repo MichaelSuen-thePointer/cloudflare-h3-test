@@ -40,7 +40,7 @@ func (s *standbyFake) SendPing() error {
 	}
 	return nil
 }
-func (s *standbyFake) SendAttach(string) error {
+func (s *standbyFake) SendAttach(uint32) error {
 	if s.onAttach != nil {
 		return s.onAttach()
 	}
@@ -79,7 +79,7 @@ func TestStandbyMissingPongRemainsClaimable(t *testing.T) {
 			t.Fatal("Ping removed ready capacity")
 		}
 		ctx, cancel := context.WithCancel(context.Background())
-		stream, err := p.acquire(ctx, "session")
+		stream, err := p.acquire(ctx, 123)
 		if err != nil || stream != s {
 			t.Fatalf("stream=%p err=%v", stream, err)
 		}
@@ -115,7 +115,7 @@ func TestStandbyAckWriteFailureWins(t *testing.T) {
 		e.state = standbyAttaching
 		close(e.claimed)
 		p.mu.Unlock()
-		if err := p.attach(context.Background(), e, "session"); !errors.Is(err, writeErr) {
+		if err := p.attach(context.Background(), e, 123); !errors.Is(err, writeErr) {
 			t.Fatalf("err=%v", err)
 		}
 		select {
@@ -141,7 +141,7 @@ func TestStandbyAckThenBlockedPingCancellation(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		done := make(chan error, 1)
-		go func() { _, err := p.acquire(ctx, "session"); done <- err }()
+		go func() { _, err := p.acquire(ctx, 123); done <- err }()
 		synctest.Wait() // ACK consumed, handoff is waiting for the old Ping.
 		time.Sleep(3 * time.Second)
 		synctest.Wait()
@@ -161,7 +161,7 @@ func TestStandbyCloseDuringAttach(t *testing.T) {
 		s.onAttach = func() error { close(sent); return nil }
 		p := fakeStandbyPool(t, s)
 		done := make(chan error, 1)
-		go func() { _, err := p.acquire(context.Background(), "session"); done <- err }()
+		go func() { _, err := p.acquire(context.Background(), 123); done <- err }()
 		<-sent
 		synctest.Wait()
 		p.close()
@@ -182,7 +182,7 @@ func TestStandbyConcurrentClaimAndClose(t *testing.T) {
 		var successes atomic.Int32
 		for range 2 {
 			wg.Go(func() {
-				stream, err := p.acquire(context.Background(), "session")
+				stream, err := p.acquire(context.Background(), 123)
 				if err == nil {
 					successes.Add(1)
 					_ = stream.Close()
@@ -209,7 +209,7 @@ func TestStandbyPingFailureAfterAck(t *testing.T) {
 		time.Sleep(time.Second)
 		synctest.Wait()
 		done := make(chan error, 1)
-		go func() { _, err := p.acquire(context.Background(), "session"); done <- err }()
+		go func() { _, err := p.acquire(context.Background(), 123); done <- err }()
 		synctest.Wait()
 		close(release)
 		synctest.Wait()
@@ -238,7 +238,7 @@ func TestStandbyCapacityIndependentOfPong(t *testing.T) {
 				if idle, opening := p.stats(); idle != target || opening != 0 || int(opened.Load()) != target {
 					t.Fatalf("idle=%d opening=%d opened=%d", idle, opening, opened.Load())
 				}
-				got, err := p.acquire(context.Background(), "session")
+				got, err := p.acquire(context.Background(), 123)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -280,7 +280,7 @@ func TestWSNoPoolCloseDuringAttach(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { _, err := p.Acquire(ctx, "session"); done <- err }()
+	go func() { _, err := p.Acquire(ctx, 123); done <- err }()
 	select {
 	case <-attached:
 	case <-ctx.Done():

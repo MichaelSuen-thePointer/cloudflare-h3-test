@@ -51,11 +51,11 @@ func testQualityClientBusiness(t *testing.T, transport string) {
 			if err != nil {
 				return
 			}
-			op, _, err := relay.DecodeControl(attach)
-			if err != nil || op != relay.ControlOpAttach {
+			op, _, err := testDecodeControl(attach)
+			if err != nil || op != testAttach {
 				return
 			}
-			ack, _ := relay.EncodeControl(relay.ControlOpAttachOK, nil)
+			ack, _ := testEncodeControl(testAttachOK, nil)
 			if ws.WriteMessage(ack) != nil {
 				return
 			}
@@ -87,7 +87,7 @@ func testQualityClientBusiness(t *testing.T, transport string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	state := &clientState{quality: r, transport: transport, provider: p, udp: udp, timeout: time.Second}
-	sess := &session{qr: r, q: r.NewSession("business-session"), id: "business-session", peer: peer.LocalAddr().(*net.UDPAddr), state: state, ctx: ctx, cancel: cancel, closed: make(chan struct{}), lanesChanged: make(chan struct{}, 1)}
+	sess := &session{qr: r, q: r.NewSession("business-session"), id: 123, peer: peer.LocalAddr().(*net.UDPAddr), state: state, ctx: ctx, cancel: cancel, closed: make(chan struct{}), lanesChanged: make(chan struct{}, 1)}
 	r.Life(sess.q, "session-lifecycle", "create")
 	stream, err := state.acquireMessageStream(ctx, sess.id, sess.q)
 	if err != nil {
@@ -98,7 +98,7 @@ func testQualityClientBusiness(t *testing.T, transport string) {
 	sess.publishLaneSnapshotLocked()
 	r.Life(lane.q, "lane-lifecycle", "available")
 	sess.goRun(func() { sess.laneReadLoop(state, lane) })
-	frames := []relay.Frame{{PacketID: 1, Payload: []byte("hello")}}
+	frames := []relay.Frame{{Payload: []byte("hello")}, {Payload: []byte("world")}}
 	body, err := relay.EncodeFrames(frames)
 	if err != nil {
 		t.Fatal(err)
@@ -108,9 +108,11 @@ func testQualityClientBusiness(t *testing.T, transport string) {
 	}
 	peer.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buf := make([]byte, 100)
-	n, _, err := peer.ReadFromUDP(buf)
-	if err != nil || string(buf[:n]) != "hello" {
-		t.Fatalf("UDP delivery %q %v", buf[:n], err)
+	for _, want := range []string{"hello", "world"} {
+		n, _, err := peer.ReadFromUDP(buf)
+		if err != nil || string(buf[:n]) != want {
+			t.Fatalf("UDP delivery %q want %q %v", buf[:n], want, err)
+		}
 	}
 	sess.close()
 	p.Close()
@@ -121,11 +123,12 @@ func testQualityClientBusiness(t *testing.T, transport string) {
 	}
 	defer db.Close()
 	for q, want := range map[string]int{
-		"SELECT count(*) FROM lane WHERE lane_index=0 AND transport='" + transport + "' AND connection_no IS NULL":                                                           1,
-		"SELECT count(*) FROM observation WHERE event_name='transfer' AND outcome='ok' AND frame_count=1 AND payload_bytes=5 AND lane_no IS NOT NULL AND session_no IS NULL": 2,
-		"SELECT count(*) FROM observation WHERE event_name='lane-lifecycle' AND action='terminate'":                                                                          1,
-		"SELECT count(*) FROM operation WHERE operation_kind='" + transport + "-acquire' AND session_no IS NOT NULL":                                                         1,
-		"SELECT count(*) FROM operation WHERE operation_kind='" + transport + "-attach' AND session_no IS NULL AND lane_no IS NULL":                                          1,
+		"SELECT count(*) FROM observation WHERE event_name='transfer' AND direction='write' AND outcome='ok' AND frame_count=2 AND payload_bytes=10 AND encoded_bytes=14":                                             1,
+		"SELECT count(*) FROM lane WHERE lane_index=0 AND transport='" + transport + "' AND connection_no IS NULL":                                                                                                    1,
+		"SELECT count(*) FROM observation WHERE event_name='transfer' AND direction='read' AND outcome='ok' AND frame_count=1 AND payload_bytes=5 AND encoded_bytes=7 AND lane_no IS NOT NULL AND session_no IS NULL": 2,
+		"SELECT count(*) FROM observation WHERE event_name='lane-lifecycle' AND action='terminate'":                                                                                                                   1,
+		"SELECT count(*) FROM operation WHERE operation_kind='" + transport + "-acquire' AND session_no IS NOT NULL":                                                                                                  1,
+		"SELECT count(*) FROM operation WHERE operation_kind='" + transport + "-attach' AND session_no IS NULL AND lane_no IS NULL":                                                                                   1,
 	} {
 		var got int
 		if err = db.QueryRow(q).Scan(&got); err != nil || got != want {

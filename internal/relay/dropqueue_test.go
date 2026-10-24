@@ -31,7 +31,7 @@ func TestSplitFramesByEncodedLimit(t *testing.T) {
 		{Payload: []byte("bbb")},
 		{Payload: []byte("ccc")},
 	}
-	chunks, err := SplitFramesByEncodedLimit(frames, encodedHeaderBytes+2*(encodedFrameHeaderBytes+3))
+	chunks, err := SplitFramesByEncodedLimit(frames, 2*(encodedFrameHeaderBytes+3))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,57 +63,5 @@ func TestMaxPayloadFramesPerMessageFitsLimit(t *testing.T) {
 	}
 	if n <= MaxMessageBytes {
 		t.Fatalf("encoded len=%d fits limit=%d after extra max frame", n, MaxMessageBytes)
-	}
-}
-
-func TestEncodeDecodeControl(t *testing.T) {
-	body, err := EncodeAttach("session-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	op, payload, err := DecodeControl(body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if op != ControlOpAttach || string(payload) != "session-1" {
-		t.Fatalf("op=%d payload=%q, want attach session-1", op, payload)
-	}
-}
-
-func TestDecodeControlRejectsShortHeader(t *testing.T) {
-	_, _, err := DecodeControl([]byte{'H', '3', 'U', 'C', Version, ControlOpAttach, 0})
-	if err == nil {
-		t.Fatal("DecodeControl succeeded for 7-byte header, want error")
-	}
-}
-
-func TestDecodeControlAcceptsEmptyPayload(t *testing.T) {
-	body := []byte{'H', '3', 'U', 'C', Version, ControlOpAttachOK, 0, 0}
-	op, payload, err := DecodeControl(body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if op != ControlOpAttachOK || len(payload) != 0 {
-		t.Fatalf("op=%d payload_len=%d, want attach-ok empty", op, len(payload))
-	}
-}
-
-func TestEncodeDecodeExpandLanesHint(t *testing.T) {
-	body, err := EncodeControl(ControlOpExpandLanesHint, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !IsControlMessage(body) {
-		t.Fatal("IsControlMessage returned false for expand hint")
-	}
-	op, payload, err := DecodeControl(body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if op != ControlOpExpandLanesHint || len(payload) != 0 {
-		t.Fatalf("op=%d payload_len=%d, want expand hint empty", op, len(payload))
-	}
-	if IsControlMessage([]byte{'H', '3', 'U', 'R', Version}) {
-		t.Fatal("IsControlMessage returned true for data frame magic")
 	}
 }

@@ -2,6 +2,9 @@ package relay
 
 import "context"
 
+// MessageStream carries pre-encoded DATA records for UDP streams. Writes are
+// whole-record batches bounded by MaxMessageBytes; reads yield one complete
+// record. WebSocketConn also implements this interface as a raw message carrier.
 type MessageStream interface {
 	// WriteMessage leaves the caller's payload unchanged.
 	WriteMessage(payload []byte) error
@@ -21,15 +24,14 @@ type KeepaliveMessageStream interface {
 // StandbyMessageStream splits setup writes from the unique response reader.
 type StandbyMessageStream interface {
 	KeepaliveMessageStream
-	SendAttach(string) error
+	SendAttach(uint32) error
 	ReadAttachAck() error
 }
 
 // AttachableMessageStream is a ready stream before it joins a UDP session.
 type AttachableMessageStream interface {
 	StandbyMessageStream
-	Attach(context.Context, string) error
-	Probe(context.Context) error
+	Attach(context.Context, uint32) error
 }
 
 type MessageViewReader interface {

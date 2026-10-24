@@ -31,8 +31,8 @@ func (c *clientState) goRun(fn func()) bool {
 func (c *clientState) shutdown() {
 	c.mu.Lock()
 	c.stopping = true
-	sessions := make([]*session, 0, len(c.sessions))
-	for _, s := range c.sessions {
+	sessions := make([]*session, 0, len(c.occupied))
+	for _, s := range c.occupied {
 		sessions = append(sessions, s)
 	}
 	c.mu.Unlock()
@@ -48,6 +48,7 @@ func (c *clientState) shutdown() {
 	}
 	for _, s := range sessions {
 		s.wait()
+		c.releaseID(s)
 	}
 	c.workers.Wait()
 }

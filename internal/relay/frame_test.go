@@ -2,200 +2,98 @@ package relay
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"io"
-	"strings"
 	"testing"
 )
 
-func TestEncodeDecodeFramesRoundTripCopiesPayload(t *testing.T) {
-	body, err := EncodeFrames([]Frame{
-		{PacketID: 11, Payload: []byte("alpha")},
-		{PacketID: 12, Payload: []byte("beta")},
-	})
+func testData(payload string) []byte {
+	b, err := EncodeFrames([]Frame{{Payload: []byte(payload)}})
 	if err != nil {
-		t.Fatal(err)
+		panic(err)
 	}
-	frames, err := DecodeFrames(body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(frames) != 2 || frames[0].PacketID != 11 || string(frames[0].Payload) != "alpha" || frames[1].PacketID != 12 || string(frames[1].Payload) != "beta" {
-		t.Fatalf("frames=%+v, want round trip", frames)
-	}
-	frames[0].Payload[0] = 'A'
-	view, err := DecodeFramesView(body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(view[0].Payload) != "alpha" {
-		t.Fatalf("DecodeFrames payload aliases encoded body: got %q", view[0].Payload)
-	}
+	return b
 }
-
-func TestDecodeFramesViewSharesPayload(t *testing.T) {
-	body, err := EncodeFrames([]Frame{{PacketID: 7, Payload: []byte("payload")}})
+func TestLinearDataGoldenAndBounds(t *testing.T) {
+	b, err := EncodeFrames([]Frame{{Payload: []byte{0xaa, 0xbb, 0xcc}}, {Payload: []byte{0xdd, 0xee}}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	frames, err := DecodeFramesView(body)
-	if err != nil {
-		t.Fatal(err)
+	if !bytes.Equal(b, []byte{3, 0, 0xaa, 0xbb, 0xcc, 2, 0, 0xdd, 0xee}) {
+		t.Fatalf("wire=%x", b)
 	}
-	if len(frames) != 1 || string(frames[0].Payload) != "payload" {
-		t.Fatalf("frames=%+v, want payload", frames)
-	}
-	frames[0].Payload[0] = 'P'
-	if !bytes.Contains(body, []byte("Payload")) {
-		t.Fatalf("view payload did not mutate encoded body")
-	}
-}
-
-func TestDecodeFramesRejectsMalformed(t *testing.T) {
-	body, err := EncodeFrames([]Frame{{PacketID: 1, Payload: []byte("x")}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	cases := []struct {
-		name string
-		body []byte
-		want string
-	}{
-		{name: "short", body: body[:encodedHeaderBytes-1], want: "unexpected EOF"},
-		{name: "bad magic", body: append([]byte("BAD!"), body[4:]...), want: "bad frame magic"},
-		{name: "bad version", body: append(append([]byte(nil), body[:4]...), append([]byte{Version + 1}, body[5:]...)...), want: "bad frame version"},
-		{name: "trailing", body: append(append([]byte(nil), body...), 0), want: "trailing frame bytes"},
-		{name: "short payload", body: body[:len(body)-1], want: "unexpected EOF"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := DecodeFramesView(tc.body)
-			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("err=%v, want %q", err, tc.want)
-			}
-		})
-	}
-}
-
-func TestEncodeFramesRejectsPayloadTooLarge(t *testing.T) {
-	_, err := EncodeFrames([]Frame{{Payload: make([]byte, MaxFramePayloadBytes+1)}})
-	if err == nil || !strings.Contains(err.Error(), "payload too large") {
-		t.Fatalf("err=%v, want payload too large", err)
-	}
-}
-
-func TestEncodeFramesWithinLimit(t *testing.T) {
-	frames := []Frame{
-		{PacketID: 1, Payload: []byte("one")},
-		{PacketID: 2, Payload: []byte("two")},
-	}
-	want, err := EncodeFrames(frames)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, ok, err := EncodeFramesWithinLimit(frames, len(want))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("EncodeFramesWithinLimit ok=false, want true")
-	}
-	if !bytes.Equal(got, want) {
-		t.Fatal("EncodeFramesWithinLimit body differs from EncodeFrames")
-	}
-	if got, ok, err := EncodeFramesWithinLimit(frames, len(want)-1); err != nil || ok || got != nil {
-		t.Fatalf("under limit got len=%d ok=%v err=%v, want nil/false/nil", len(got), ok, err)
-	}
-}
-
-func TestEncodeFramesIntoReusesBuffer(t *testing.T) {
-	frames := []Frame{
-		{PacketID: 1, Payload: []byte("one")},
-		{PacketID: 2, Payload: []byte("two")},
-	}
-	want, err := EncodeFrames(frames)
-	if err != nil {
-		t.Fatal(err)
-	}
-	dst := make([]byte, 0, len(want)+16)
-	got, err := EncodeFramesInto(dst, frames)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, want) {
-		t.Fatal("EncodeFramesInto body differs from EncodeFrames")
-	}
-	if cap(got) != cap(dst) {
-		t.Fatalf("cap=%d, want reuse cap %d", cap(got), cap(dst))
-	}
-}
-
-func TestEncodeFramesWithinLimitIntoReusesBuffer(t *testing.T) {
-	frames := []Frame{{PacketID: 1, Payload: []byte("payload")}}
-	want, err := EncodeFrames(frames)
-	if err != nil {
-		t.Fatal(err)
-	}
-	dst := make([]byte, 0, len(want)+8)
-	got, ok, err := EncodeFramesWithinLimitInto(dst, frames, len(want))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("EncodeFramesWithinLimitInto ok=false, want true")
-	}
-	if !bytes.Equal(got, want) {
-		t.Fatal("EncodeFramesWithinLimitInto body differs from EncodeFrames")
-	}
-	if cap(got) != cap(dst) {
-		t.Fatalf("cap=%d, want reuse cap %d", cap(got), cap(dst))
-	}
-	if got, ok, err := EncodeFramesWithinLimitInto(dst, frames, len(want)-1); err != nil || ok || got != nil {
-		t.Fatalf("under limit got len=%d ok=%v err=%v, want nil/false/nil", len(got), ok, err)
-	}
-}
-
-func TestStreamMessageRoundTrip(t *testing.T) {
-	var buf bytes.Buffer
-	in := [][]byte{[]byte("one"), []byte("two")}
-	for _, payload := range in {
-		if err := WriteStreamMessage(&buf, payload); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for i, want := range in {
-		got, err := ReadStreamMessage(&buf)
+	for _, n := range []int{1, 65534} {
+		b, err := EncodeFrames([]Frame{{Payload: make([]byte, n)}})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if string(got) != string(want) {
-			t.Fatalf("message %d=%q, want %q", i, got, want)
+		if int(binary.LittleEndian.Uint16(b)) != n || len(b) != n+2 {
+			t.Fatalf("n=%d wire=%x", n, b[:2])
+		}
+		f, err := DecodeFrames(b)
+		if err != nil || len(f) != 1 || len(f[0].Payload) != n {
+			t.Fatalf("n=%d frames=%v err=%v", n, f, err)
 		}
 	}
-	if _, err := ReadStreamMessage(&buf); !errors.Is(err, io.EOF) {
-		t.Fatalf("err=%v, want EOF", err)
+	for _, n := range []int{0, 65535} {
+		dst := bytes.Repeat([]byte{7}, 70000)
+		before := append([]byte(nil), dst...)
+		if _, err := EncodeFramesInto(dst, []Frame{{Payload: make([]byte, n)}}); err == nil {
+			t.Fatalf("accepted %d", n)
+		}
+		if !bytes.Equal(dst, before) {
+			t.Fatal("invalid encoding changed destination")
+		}
 	}
 }
-
-func TestStreamMessageRejectsMalformed(t *testing.T) {
-	var buf bytes.Buffer
-	if err := WriteStreamMessage(&buf, []byte("x")); err != nil {
+func TestAttachGolden(t *testing.T) {
+	for _, tc := range []struct {
+		id   uint32
+		wire []byte
+	}{{0, []byte{255, 255, 0, 0, 0, 0}}, {0x12345678, []byte{255, 255, 0x78, 0x56, 0x34, 0x12}}, {0xffffffff, []byte{255, 255, 255, 255, 255, 255}}} {
+		b := EncodeAttach(tc.id)
+		if !bytes.Equal(b, tc.wire) {
+			t.Fatalf("id=%d wire=%x", tc.id, b)
+		}
+	}
+}
+func TestLinearDataCopyAndView(t *testing.T) {
+	b := testData("payload")
+	copied, err := DecodeFrames(b)
+	if err != nil {
 		t.Fatal(err)
 	}
-	body := buf.Bytes()
-	badMagic := append([]byte(nil), body...)
-	badMagic[0] = 'X'
-	if _, err := ReadStreamMessage(bytes.NewReader(badMagic)); err == nil || !strings.Contains(err.Error(), "bad stream message magic") {
-		t.Fatalf("err=%v, want bad magic", err)
+	view, err := DecodeFramesView(b)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := ReadStreamMessage(bytes.NewReader(body[:len(body)-1])); !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Fatalf("err=%v, want EOF", err)
+	b[2] = 'X'
+	if string(copied[0].Payload) != "payload" || string(view[0].Payload) != "Xayload" {
+		t.Fatal("wrong ownership")
 	}
 }
-
-func TestWriteStreamMessageRejectsPayloadTooLarge(t *testing.T) {
-	err := WriteStreamMessage(io.Discard, make([]byte, MaxMessageBytes+1))
-	if err == nil || !strings.Contains(err.Error(), "stream message too large") {
-		t.Fatalf("err=%v, want stream message too large", err)
+func TestLinearDataMalformed(t *testing.T) {
+	for _, b := range [][]byte{{1}, {1, 0}, {0, 0}, {255, 255}, {3, 0, 1, 2}} {
+		if _, err := DecodeFrames(b); err == nil {
+			t.Fatalf("accepted %x", b)
+		}
+	}
+	if _, err := DecodeFrames([]byte{3, 0, 1}); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatal(err)
+	}
+}
+func TestEncodeIntoAndBudget(t *testing.T) {
+	frames := []Frame{{Payload: []byte("one")}, {Payload: []byte("two")}}
+	dst := make([]byte, 0, 20)
+	b, err := EncodeFramesInto(dst, frames)
+	if err != nil || &b[0] != &dst[:cap(dst)][0] {
+		t.Fatal("not reused", err)
+	}
+	if _, ok, err := EncodeFramesWithinLimitInto(dst, frames, 9); err != nil || ok {
+		t.Fatal(ok, err)
+	}
+	if b, ok, err := EncodeFramesWithinLimit(frames, 10); err != nil || !ok || len(b) != 10 {
+		t.Fatal(b, ok, err)
 	}
 }

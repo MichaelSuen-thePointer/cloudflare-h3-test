@@ -3,7 +3,7 @@ package proxyclient
 import (
 	"context"
 	"crypto/rand"
-	"encoding/hex"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
@@ -64,31 +64,29 @@ func (ln *streamLane) closeWorker() {
 }
 
 type session struct {
-	qr                *quality.Recorder
-	q                 quality.Subject
-	id                string
-	peer              *net.UDPAddr
-	state             *clientState
-	lanes             []*streamLane
-	ready             chan struct{}
-	lanesMu           sync.Mutex
-	lanesSnapshot     atomic.Pointer[streamLaneSnapshot]
-	lanesChanged      chan struct{}
-	lanesPending      atomic.Int64
-	expandHintPending atomic.Bool
-	next              atomic.Uint64
-	ctx               context.Context
-	cancel            context.CancelFunc
-	closed            chan struct{}
-	lastActive        atomic.Int64
-	touchEvery        time.Duration
-	closeOnce         sync.Once
-	wgMu              sync.Mutex
-	wg                sync.WaitGroup
-	stats             *clientStats
-	metrics           bool
-	sendQ             chan []byte
-	batchQ            chan []relay.Frame
+	qr            *quality.Recorder
+	q             quality.Subject
+	id            uint32
+	peer          *net.UDPAddr
+	state         *clientState
+	lanes         []*streamLane
+	ready         chan struct{}
+	lanesMu       sync.Mutex
+	lanesSnapshot atomic.Pointer[streamLaneSnapshot]
+	lanesChanged  chan struct{}
+	lanesPending  atomic.Int64
+	ctx           context.Context
+	cancel        context.CancelFunc
+	closed        chan struct{}
+	lastActive    atomic.Int64
+	touchEvery    time.Duration
+	closeOnce     sync.Once
+	wgMu          sync.Mutex
+	wg            sync.WaitGroup
+	stats         *clientStats
+	metrics       bool
+	sendQ         chan []byte
+	batchQ        chan []relay.Frame
 }
 
 var (
@@ -138,7 +136,7 @@ func Run(ctx context.Context, args []string) error {
 	fs.Uint64Var(&quicWindows.MaxConnection, "quic-max-conn-window", 24<<20, "HTTP/3 QUIC maximum connection receive window bytes; 0 keeps quic-go default")
 	fs.IntVar(&wsSocketSendBuffer, "ws-socket-send-buffer", 0, "WebSocket TCP socket send buffer bytes, 0 keeps OS default")
 	fs.IntVar(&wsSocketReceiveBuffer, "ws-socket-recv-buffer", 0, "WebSocket TCP socket receive buffer bytes, 0 keeps OS default")
-	fs.IntVar(&batchSize, "batch-size", 1, "maximum UDP packets per stream message")
+	fs.IntVar(&batchSize, "batch-size", 1, "maximum UDP packets per local write batch")
 	fs.DurationVar(&batchDelay, "batch-delay", 0, "maximum time to wait for a partially filled batch")
 	fs.IntVar(&sendQueue, "send-queue", 1024, "per-session UDP packet queue before batching")
 	fs.DurationVar(&timeout, "http-timeout", 15*time.Second, "stream acquisition and attach timeout")
@@ -265,7 +263,11 @@ func Run(ctx context.Context, args []string) error {
 	defer recorder.Close()
 	// Acquisition/Attach retain their context budget; established writes have no deadline.
 	wsSocketOptions := relay.WebSocketSocketOptions{SendBuffer: wsSocketSendBuffer, ReceiveBuffer: wsSocketReceiveBuffer, DisableWriteTimeout: true}
-	state := &clientState{ctx: ctx, quality: recorder, transport: transport, laneTarget: lanesN, lanesIncremental: lanesIncremental, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, idle: idle, udp: udp, sessions: map[netip.AddrPort]*session{}, stats: stats, metrics: metrics}
+	var seed [4]byte
+	if _, err := rand.Read(seed[:]); err != nil {
+		return fmt.Errorf("session ID seed: %w", err)
+	}
+	state := &clientState{nextID: binary.LittleEndian.Uint32(seed[:]), ctx: ctx, quality: recorder, transport: transport, laneTarget: lanesN, lanesIncremental: lanesIncremental, batchSize: batchSize, batchDelay: batchDelay, sendQueue: sendQueue, timeout: timeout, idle: idle, udp: udp, sessions: map[netip.AddrPort]*session{}, stats: stats, metrics: metrics}
 	if transport == "ws" {
 		state.provider = newWSProvider(remote, connectIP, token, poolSize, timeout, wsSocketOptions, metrics, recorder)
 	} else {
@@ -305,8 +307,14 @@ func Run(ctx context.Context, args []string) error {
 			if ctx.Err() != nil {
 				return nil
 			}
+			if relay.IsUDPMessageTooLarge(err) {
+				continue
+			}
 			recorder.Error(quality.Subject{}, "udp-read", err, nil)
 			return err
+		}
+		if !validUDPPayload(n) {
+			continue
 		}
 		key, ok := udpPeerKeyFromAddr(peer)
 		if !ok {
@@ -336,6 +344,8 @@ type clientState struct {
 	idle             time.Duration
 	udp              *net.UDPConn
 	mu               sync.Mutex
+	nextID           uint32              // protected by mu; next candidate, including zero
+	occupied         map[uint32]*session // includes closing sessions until workers join
 	sessions         map[netip.AddrPort]*session
 	provider         streamProvider
 	stats            *clientStats
@@ -381,7 +391,14 @@ func (c *clientState) getSession(key netip.AddrPort, peer *net.UDPAddr) *session
 		return sess
 	}
 	peerLabel := key.String()
-	id := randomID()
+	id := c.nextID
+	c.nextID++
+	if c.occupied[id] != nil {
+		return nil
+	}
+	if c.occupied == nil {
+		c.occupied = make(map[uint32]*session)
+	}
 	parent := c.ctx
 	if parent == nil {
 		parent = context.Background()
@@ -393,10 +410,13 @@ func (c *clientState) getSession(key netip.AddrPort, peer *net.UDPAddr) *session
 	}
 	sess := &session{id: id, peer: peer, state: c, ctx: ctx, cancel: cancel, closed: make(chan struct{}), ready: make(chan struct{}), lanesChanged: make(chan struct{}, 1), lastActive: atomic.Int64{}, touchEvery: touchInterval(c.idle), stats: c.stats, metrics: c.metrics, sendQ: make(chan []byte, c.sendQueue), batchQ: batchQ}
 	sess.qr = c.quality
-	sess.q = c.quality.NewSession(id)
+	if c.quality.Enabled() {
+		sess.q = c.quality.NewSession(strconv.FormatUint(uint64(id), 10))
+	}
 	sess.qr.Life(sess.q, "session-lifecycle", "create")
 	sess.touch()
 	c.sessions[key] = sess
+	c.occupied[id] = sess
 	c.countSession()
 	if !c.usesDirectLaneWrite() {
 		sess.goRun(func() { sess.sendLoop(c.batchSize, c.batchDelay) })
@@ -448,9 +468,18 @@ func (c *clientState) closeSession(key netip.AddrPort, sess *session, reasons ..
 	delete(c.sessions, key)
 	c.mu.Unlock()
 	sess.close(reasons...)
+	c.releaseID(sess)
 }
 
-func (c *clientState) acquireMessageStream(ctx context.Context, sessionID string, subjects ...quality.Subject) (relay.KeepaliveMessageStream, error) {
+func (c *clientState) releaseID(sess *session) {
+	c.mu.Lock()
+	if c.occupied[sess.id] == sess {
+		delete(c.occupied, sess.id)
+	}
+	c.mu.Unlock()
+}
+
+func (c *clientState) acquireMessageStream(ctx context.Context, sessionID uint32, subjects ...quality.Subject) (relay.KeepaliveMessageStream, error) {
 	var subject quality.Subject
 	if len(subjects) > 0 {
 		subject = subjects[0]
@@ -587,23 +616,14 @@ func (s *session) maybeAcquireIncrementalLane() {
 		return
 	}
 	localBacklog := s.laneBacklogDepth() > 1
-	serverHint := s.expandHintPending.Load()
-	if !localBacklog && !serverHint {
+	if !localBacklog {
 		return
 	}
 	if s.lanesTotalPlanned() >= s.state.laneTarget {
-		if serverHint {
-			s.expandHintPending.Store(false)
-			s.state.countIncrementalAcquireSkippedFull()
-		}
 		return
 	}
 	if !s.reservePendingLane(s.state.laneTarget) {
 		return
-	}
-	if serverHint {
-		s.expandHintPending.Store(false)
-		s.state.countExpandHintUsed()
 	}
 	if !s.goRun(func() {
 		defer s.lanesPending.Add(-1)
@@ -700,7 +720,7 @@ func (s *session) notifyLanesChanged() {
 }
 
 func (s *session) enqueue(payload []byte) {
-	if s.isClosed() {
+	if s.isClosed() || !validUDPPayload(len(payload)) {
 		return
 	}
 	sample := s.qr.Queue()
@@ -722,7 +742,7 @@ func (s *session) sendLoop(batchSize int, batchDelay time.Duration) {
 		case first := <-s.sendQ:
 			currentBatchSize := batchSize
 			batch := make([]relay.Frame, 0, currentBatchSize)
-			batch = append(batch, relay.Frame{PacketID: s.next.Add(1), Payload: first})
+			batch = append(batch, relay.Frame{Payload: first})
 			if batchDelay <= 0 {
 				batch = s.drainSendBatch(batch, currentBatchSize)
 				s.sendBatch(batch)
@@ -737,7 +757,7 @@ func (s *session) sendLoop(batchSize int, batchDelay time.Duration) {
 				case <-s.closed:
 					return
 				case payload := <-s.sendQ:
-					batch = append(batch, relay.Frame{PacketID: s.next.Add(1), Payload: payload})
+					batch = append(batch, relay.Frame{Payload: payload})
 				case <-timer.C:
 					batch = s.drainSendBatch(batch, currentBatchSize)
 					break collect
@@ -758,7 +778,7 @@ func (s *session) drainSendBatch(batch []relay.Frame, batchSize int) []relay.Fra
 	for len(batch) < batchSize {
 		select {
 		case payload := <-s.sendQ:
-			batch = append(batch, relay.Frame{PacketID: s.next.Add(1), Payload: payload})
+			batch = append(batch, relay.Frame{Payload: payload})
 		default:
 			return batch
 		}
@@ -983,7 +1003,7 @@ func (s *session) directLaneWriteLoop(c *clientState, ln *streamLane, keepalive 
 			if ln.closed.Load() {
 				return
 			}
-			frame := relay.Frame{PacketID: s.next.Add(1), Payload: payload}
+			frame := relay.Frame{Payload: payload}
 			s.writeBatchOnLane(c, ln, []relay.Frame{frame})
 			if ln.closed.Load() {
 				return
@@ -1165,10 +1185,6 @@ func (s *session) laneReadLoop(c *clientState, ln *streamLane) {
 			appLog.WarnRate("stream_read_failed", 10*time.Second, "stream-read-failed", "session", s.id, "lane", ln.index, "err", err, "transport", c.transport)
 			return
 		}
-		if s.handleStreamControlMessage(c, ln.index, body) {
-			sample.ReadDone(ln.q, "control", nil, quality.KnownSize(len(body)), nil)
-			continue
-		}
 		frames, err := relay.DecodeFramesView(body)
 		if err != nil {
 			sample.ReadDone(ln.q, "unknown", nil, quality.KnownSize(len(body)), nil)
@@ -1186,34 +1202,6 @@ func (s *session) laneReadLoop(c *clientState, ln *streamLane) {
 			}
 		}
 	}
-}
-
-func (s *session) handleStreamControlMessage(c *clientState, laneIndex int, body []byte) bool {
-	if !relay.IsControlMessage(body) {
-		return false
-	}
-	op, payload, err := relay.DecodeControl(body)
-	if err != nil {
-		s.qr.Error(s.q, "stream-control-decode-failed", err, quality.Int(len(body)))
-		appLog.WarnRate("stream_control_decode_failed", 10*time.Second, "stream-control-decode-failed", "session", s.id, "lane", laneIndex, "err", err, "transport", c.transport)
-		return true
-	}
-	switch op {
-	case relay.ControlOpExpandLanesHint:
-		if len(payload) != 0 {
-			appLog.WarnRate("stream_expand_hint_payload", 10*time.Second, "stream-expand-hint-payload", "session", s.id, "lane", laneIndex, "payload_bytes", len(payload), "transport", c.transport)
-		}
-		if c != nil {
-			c.countExpandHintReceived()
-			if c.laneTarget <= 1 {
-				return true
-			}
-		}
-		s.expandHintPending.Store(true)
-	default:
-		appLog.WarnRate("stream_unknown_control", 10*time.Second, "stream-unknown-control", "session", s.id, "lane", laneIndex, "op", op, "transport", c.transport)
-	}
-	return true
 }
 
 func (s *session) reconnectLane(c *clientState, old *streamLane) {
@@ -1557,14 +1545,6 @@ func configureLogger(tag, logLevel string, useSyslog bool) error {
 	}
 	appLog.UseStderr()
 	return nil
-}
-
-func randomID() string {
-	var b [12]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic(err)
-	}
-	return hex.EncodeToString(b[:])
 }
 
 func (s *session) newObservedLane(index int, stream relay.KeepaliveMessageStream) *streamLane {

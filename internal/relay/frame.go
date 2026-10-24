@@ -1,47 +1,27 @@
 package relay
 
 import (
-	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"time"
 )
 
-var Magic = [4]byte{'H', '3', 'U', 'R'}
-var StreamMessageMagic = [4]byte{'H', '3', 'U', 'M'}
-var ControlMagic = [4]byte{'H', '3', 'U', 'C'}
-
-const Version byte = 1
-const ControlOpAttach byte = 1
-const ControlOpAttachOK byte = 2
-const ControlOpExpandLanesHint byte = 3
-const ControlOpPing byte = 4
-const ControlOpPong byte = 5
+// MaxMessageBytes bounds a local write batch; it is not a wire message size.
 const MaxMessageBytes = 2 << 20
-const MaxFramePayloadBytes = 65535
-const MaxPayloadFramesPerMessage = (MaxMessageBytes - encodedHeaderBytes) / (encodedFrameHeaderBytes + MaxFramePayloadBytes)
-
-const encodedHeaderBytes = 7
-const encodedFrameHeaderBytes = 10
-const encodedStreamMessageHeaderBytes = 9
-const encodedControlHeaderBytes = 8
+const MaxFramePayloadBytes = 65534
+const MaxPayloadFramesPerMessage = MaxMessageBytes / (2 + MaxFramePayloadBytes)
+const encodedFrameHeaderBytes = 2
 
 type Frame struct {
-	PacketID uint64
 	Payload  []byte
 	QueuedAt time.Time
 }
 
-func EncodeFrames(frames []Frame) ([]byte, error) {
-	return EncodeFramesInto(nil, frames)
-}
-
+func EncodeFrames(frames []Frame) ([]byte, error) { return EncodeFramesInto(nil, frames) }
 func EncodeFramesWithinLimit(frames []Frame, limit int) ([]byte, bool, error) {
 	return EncodeFramesWithinLimitInto(nil, frames, limit)
 }
-
 func EncodeFramesInto(dst []byte, frames []Frame) ([]byte, error) {
 	n, err := EncodedFramesLen(frames)
 	if err != nil {
@@ -49,7 +29,6 @@ func EncodeFramesInto(dst []byte, frames []Frame) ([]byte, error) {
 	}
 	return encodeFramesWithLen(dst, frames, n), nil
 }
-
 func EncodeFramesWithinLimitInto(dst []byte, frames []Frame, limit int) ([]byte, bool, error) {
 	n, err := EncodedFramesLen(frames)
 	if err != nil {
@@ -60,215 +39,85 @@ func EncodeFramesWithinLimitInto(dst []byte, frames []Frame, limit int) ([]byte,
 	}
 	return encodeFramesWithLen(dst, frames, n), true, nil
 }
-
 func encodeFramesWithLen(dst []byte, frames []Frame, n int) []byte {
 	if cap(dst) < n {
 		dst = make([]byte, n)
 	} else {
 		dst = dst[:n]
 	}
-	b := dst
-	copy(b, Magic[:])
-	b[4] = Version
-	binary.BigEndian.PutUint16(b[5:7], uint16(len(frames)))
-	pos := encodedHeaderBytes
+	pos := 0
 	for _, f := range frames {
-		binary.BigEndian.PutUint64(b[pos:pos+8], f.PacketID)
-		binary.BigEndian.PutUint16(b[pos+8:pos+10], uint16(len(f.Payload)))
-		pos += encodedFrameHeaderBytes
-		copy(b[pos:pos+len(f.Payload)], f.Payload)
+		binary.LittleEndian.PutUint16(dst[pos:pos+2], uint16(len(f.Payload)))
+		pos += 2
+		copy(dst[pos:], f.Payload)
 		pos += len(f.Payload)
 	}
-	return b
+	return dst
 }
-
 func EncodedFramesLen(frames []Frame) (int, error) {
-	if len(frames) > 65535 {
-		return 0, fmt.Errorf("too many frames: %d", len(frames))
-	}
-	n := encodedHeaderBytes
+	n := 0
 	for _, f := range frames {
-		if len(f.Payload) > MaxFramePayloadBytes {
-			return 0, fmt.Errorf("payload too large: %d", len(f.Payload))
+		if len(f.Payload) < 1 || len(f.Payload) > MaxFramePayloadBytes {
+			return 0, fmt.Errorf("invalid UDP payload length: %d", len(f.Payload))
 		}
-		n += encodedFrameHeaderBytes + len(f.Payload)
+		n += 2 + len(f.Payload)
 	}
 	return n, nil
 }
-
 func SplitFramesByEncodedLimit(frames []Frame, limit int) ([][]Frame, error) {
-	if limit < encodedHeaderBytes+encodedFrameHeaderBytes {
+	if limit < 3 {
 		return nil, fmt.Errorf("encoded limit too small: %d", limit)
 	}
-	chunks := make([][]Frame, 0, 1)
-	var chunk []Frame
-	chunkBytes := encodedHeaderBytes
-	for _, f := range frames {
-		frameBytes := encodedFrameHeaderBytes + len(f.Payload)
-		if len(f.Payload) > MaxFramePayloadBytes {
-			return nil, fmt.Errorf("payload too large: %d", len(f.Payload))
-		}
-		if encodedHeaderBytes+frameBytes > limit {
-			return nil, fmt.Errorf("frame exceeds encoded limit: %d > %d", encodedHeaderBytes+frameBytes, limit)
-		}
-		if len(chunk) > 0 && chunkBytes+frameBytes > limit {
-			chunks = append(chunks, chunk)
-			chunk = nil
-			chunkBytes = encodedHeaderBytes
-		}
-		chunk = append(chunk, f)
-		chunkBytes += frameBytes
+	if _, err := EncodedFramesLen(frames); err != nil {
+		return nil, err
 	}
-	if len(chunk) > 0 {
-		chunks = append(chunks, chunk)
+	var chunks [][]Frame
+	start, n := 0, 0
+	for i, f := range frames {
+		size := 2 + len(f.Payload)
+		if size > limit {
+			return nil, fmt.Errorf("frame exceeds encoded limit: %d > %d", size, limit)
+		}
+		if n+size > limit {
+			chunks = append(chunks, frames[start:i])
+			start = i
+			n = 0
+		}
+		n += size
+	}
+	if start < len(frames) {
+		chunks = append(chunks, frames[start:])
 	}
 	return chunks, nil
 }
-
-func DecodeFrames(data []byte) ([]Frame, error) {
-	return decodeFrames(data, true)
-}
-
-func DecodeFramesView(data []byte) ([]Frame, error) {
-	return decodeFrames(data, false)
-}
-
-func WriteStreamMessage(w io.Writer, payload []byte) error {
-	if len(payload) > MaxMessageBytes {
-		return fmt.Errorf("stream message too large: %d > %d", len(payload), MaxMessageBytes)
-	}
-	var hdr [encodedStreamMessageHeaderBytes]byte
-	copy(hdr[:4], StreamMessageMagic[:])
-	hdr[4] = Version
-	binary.BigEndian.PutUint32(hdr[5:9], uint32(len(payload)))
-	if _, err := w.Write(hdr[:]); err != nil {
-		return err
-	}
-	_, err := w.Write(payload)
-	return err
-}
-
-func ReadStreamMessage(r io.Reader) ([]byte, error) {
-	var hdr [encodedStreamMessageHeaderBytes]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return nil, err
-	}
-	var magic [4]byte
-	copy(magic[:], hdr[:4])
-	if magic != StreamMessageMagic {
-		return nil, errors.New("bad stream message magic")
-	}
-	if hdr[4] != Version {
-		return nil, fmt.Errorf("bad stream message version: %d", hdr[4])
-	}
-	n := int(binary.BigEndian.Uint32(hdr[5:9]))
-	if n > MaxMessageBytes {
-		return nil, fmt.Errorf("stream message too large: %d > %d", n, MaxMessageBytes)
-	}
-	payload := make([]byte, n)
-	if _, err := io.ReadFull(r, payload); err != nil {
-		return nil, err
-	}
-	return payload, nil
-}
-
-func decodeFrames(data []byte, copyPayload bool) ([]Frame, error) {
-	if len(data) < encodedHeaderBytes {
-		return nil, io.ErrUnexpectedEOF
-	}
-	var magic [4]byte
-	copy(magic[:], data[:4])
-	if magic != Magic {
-		return nil, errors.New("bad frame magic")
-	}
-	if data[4] != Version {
-		return nil, fmt.Errorf("bad frame version: %d", data[4])
-	}
-	count := binary.BigEndian.Uint16(data[5:7])
-	pos := encodedHeaderBytes
-	frames := make([]Frame, 0, count)
-	for i := 0; i < int(count); i++ {
-		if len(data)-pos < encodedFrameHeaderBytes {
+func DecodeFrames(data []byte) ([]Frame, error)     { return decodeFrames(data, true) }
+func DecodeFramesView(data []byte) ([]Frame, error) { return decodeFrames(data, false) }
+func decodeFrames(data []byte, owned bool) ([]Frame, error) {
+	var frames []Frame
+	for len(data) > 0 {
+		if len(data) < 2 {
 			return nil, io.ErrUnexpectedEOF
 		}
-		id := binary.BigEndian.Uint64(data[pos : pos+8])
-		n := int(binary.BigEndian.Uint16(data[pos+8 : pos+10]))
-		pos += encodedFrameHeaderBytes
-		if len(data)-pos < n {
+		n := int(binary.LittleEndian.Uint16(data))
+		data = data[2:]
+		if n == 0 || n == 65535 {
+			return nil, fmt.Errorf("control header in DATA batch: %d", n)
+		}
+		if len(data) < n {
 			return nil, io.ErrUnexpectedEOF
 		}
-		payload := data[pos : pos+n]
-		if copyPayload {
+		payload := data[:n]
+		if owned {
 			payload = append([]byte(nil), payload...)
 		}
-		frames = append(frames, Frame{PacketID: id, Payload: payload})
-		pos += n
-	}
-	if pos != len(data) {
-		return nil, errors.New("trailing frame bytes")
+		frames = append(frames, Frame{Payload: payload})
+		data = data[n:]
 	}
 	return frames, nil
 }
-
-func EncodeControl(op byte, payload []byte) ([]byte, error) {
-	if len(payload) > 65535 {
-		return nil, fmt.Errorf("control payload too large: %d", len(payload))
-	}
-	var b bytes.Buffer
-	b.Write(ControlMagic[:])
-	b.WriteByte(Version)
-	b.WriteByte(op)
-	_ = binary.Write(&b, binary.BigEndian, uint16(len(payload)))
-	b.Write(payload)
-	return b.Bytes(), nil
-}
-
-func DecodeControl(data []byte) (byte, []byte, error) {
-	if len(data) < encodedControlHeaderBytes {
-		return 0, nil, io.ErrUnexpectedEOF
-	}
-	r := bytes.NewReader(data)
-	var magic [4]byte
-	if _, err := io.ReadFull(r, magic[:]); err != nil {
-		return 0, nil, err
-	}
-	if magic != ControlMagic {
-		return 0, nil, errors.New("bad control magic")
-	}
-	version, err := r.ReadByte()
-	if err != nil {
-		return 0, nil, err
-	}
-	if version != Version {
-		return 0, nil, fmt.Errorf("bad control version: %d", version)
-	}
-	op, err := r.ReadByte()
-	if err != nil {
-		return 0, nil, err
-	}
-	var n uint16
-	if err := binary.Read(r, binary.BigEndian, &n); err != nil {
-		return 0, nil, err
-	}
-	payload := make([]byte, int(n))
-	if _, err := io.ReadFull(r, payload); err != nil {
-		return 0, nil, err
-	}
-	if r.Len() != 0 {
-		return 0, nil, errors.New("trailing control bytes")
-	}
-	return op, payload, nil
-}
-
-func IsControlMessage(data []byte) bool {
-	if len(data) < len(ControlMagic) {
-		return false
-	}
-	var magic [4]byte
-	copy(magic[:], data[:4])
-	return magic == ControlMagic
-}
-
-func EncodeAttach(sessionID string) ([]byte, error) {
-	return EncodeControl(ControlOpAttach, []byte(sessionID))
+func EncodeAttach(id uint32) []byte {
+	b := make([]byte, 6)
+	binary.LittleEndian.PutUint16(b, 65535)
+	binary.LittleEndian.PutUint32(b[2:], id)
+	return b
 }

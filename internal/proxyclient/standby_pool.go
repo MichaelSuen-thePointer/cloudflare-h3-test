@@ -246,7 +246,7 @@ func (p *standbyPool[S]) openForAcquire(ctx context.Context) (S, error) {
 	return p.open(openCtx)
 }
 
-func (p *standbyPool[S]) acquire(ctx context.Context, id string) (S, error) {
+func (p *standbyPool[S]) acquire(ctx context.Context, id uint32) (S, error) {
 	var zero S
 	for {
 		if err := ctx.Err(); err != nil {
@@ -300,7 +300,7 @@ func (p *standbyPool[S]) acquire(ctx context.Context, id string) (S, error) {
 		}
 	}
 }
-func (p *standbyPool[S]) attach(ctx context.Context, e *standbyEntry[S], id string) (err error) {
+func (p *standbyPool[S]) attach(ctx context.Context, e *standbyEntry[S], id uint32) (err error) {
 	var op quality.Operation
 	if p.quality.Enabled() {
 		op = p.quality.Begin(quality.Subject{}, p.prefix+"-attach")

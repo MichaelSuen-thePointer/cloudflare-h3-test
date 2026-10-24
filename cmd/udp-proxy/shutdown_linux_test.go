@@ -68,21 +68,16 @@ func TestUDPProcessSignals(t *testing.T) {
 							defer ws.Close()
 							defer func() { peerClosed <- struct{}{} }()
 							accepted <- struct{}{}
-							first, err := ws.ReadMessage()
-							if err != nil {
+							stream := relay.NewUDPWebSocketServer(ws)
+							if _, err := stream.ReadAttach(); err != nil {
 								return
 							}
-							op, _, err := relay.DecodeControl(first)
-							if err != nil || op != relay.ControlOpAttach {
-								return
-							}
-							ack, _ := relay.EncodeControl(relay.ControlOpAttachOK, nil)
-							if ws.WriteMessage(ack) != nil {
+							if stream.WriteAttachOK() != nil {
 								return
 							}
 							attached <- struct{}{}
 							for {
-								if _, err := ws.ReadMessage(); err != nil {
+								if _, err := stream.ReadMessage(); err != nil {
 									return
 								}
 							}
@@ -173,7 +168,7 @@ func TestUDPProcessSignals(t *testing.T) {
 							}
 							remember(ws)
 							if i == 0 {
-								if err := ws.Attach(budget, "active"); err != nil {
+								if err := relay.NewUDPWebSocketClient(ws).Attach(budget, 1); err != nil {
 									t.Fatal(err)
 								}
 							}

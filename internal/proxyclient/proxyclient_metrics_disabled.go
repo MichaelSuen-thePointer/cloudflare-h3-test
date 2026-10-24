@@ -13,8 +13,6 @@ const metricsBuild = false
 func (c *clientState) countSession()                                    {}
 func (c *clientState) countTransport()                                  {}
 func (c *clientState) countReconnect()                                  {}
-func (c *clientState) countExpandHintReceived()                         {}
-func (c *clientState) countExpandHintUsed()                             {}
 func (c *clientState) countIncrementalAcquireStarted()                  {}
 func (c *clientState) countIncrementalAcquireSucceeded()                {}
 func (c *clientState) countIncrementalAcquireFailed()                   {}

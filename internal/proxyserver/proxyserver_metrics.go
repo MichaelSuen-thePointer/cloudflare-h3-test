@@ -75,12 +75,6 @@ func (s *server) snapshot() map[string]any {
 			}
 			batchQPacketDepth += len(sess.batchQ) * batchSize
 		}
-		if sess.expandHintPending.Load() {
-			expandHintsPendingSessions++
-		}
-		if sess.expandHintInFlight.Load() {
-			expandHintsInflightSessions++
-		}
 		wsLanes = append(wsLanes, sess.laneSnapshots()...)
 	}
 	s.mu.Unlock()
@@ -173,30 +167,6 @@ func (s *server) countQueueDrops(n int) {
 func (s *server) countBatchQueueDrops(n int) {
 	if s.metrics && n > 0 {
 		s.stats.batchQDrops.Add(int64(n))
-	}
-}
-
-func (s *server) countExpandHintSent() {
-	if s.metrics {
-		s.stats.expandHintsSent.Add(1)
-	}
-}
-
-func (s *server) countExpandHintWriteFailed() {
-	if s.metrics {
-		s.stats.expandHintsWriteFailed.Add(1)
-	}
-}
-
-func (s *server) countExpandHintExpired() {
-	if s.metrics {
-		s.stats.expandHintsExpired.Add(1)
-	}
-}
-
-func (s *server) countExpandHintSkippedMaxLanes() {
-	if s.metrics {
-		s.stats.expandHintsSkippedMaxLanes.Add(1)
 	}
 }
 

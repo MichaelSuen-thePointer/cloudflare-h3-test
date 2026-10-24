@@ -39,8 +39,6 @@ type WebSocketConn struct {
 }
 
 var _ MessageStream = (*WebSocketConn)(nil)
-var _ AttachableMessageStream = (*WebSocketConn)(nil)
-var _ StandbyMessageStream = (*WebSocketConn)(nil)
 var _ MessageViewReader = (*WebSocketConn)(nil)
 
 type WebSocketSocketOptions struct {
@@ -153,61 +151,6 @@ func DialWebSocketWithOptions(ctx context.Context, rawURL, connectIP, token stri
 		return nil, fmt.Errorf("bad websocket accept")
 	}
 	return &WebSocketConn{conn: conn, reader: br, mask: true, writeTimeout: socketOptions.writeTimeout(timeout)}, nil
-}
-
-func AttachWebSocketSession(ctx context.Context, ws *WebSocketConn, sessionID string) (err error) {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	cancelDone := make(chan struct{})
-	stopCancelClose := context.AfterFunc(ctx, func() {
-		defer close(cancelDone)
-		_ = ws.Close()
-	})
-	defer func() {
-		if !stopCancelClose() {
-			<-cancelDone
-		}
-		_ = ws.SetDeadline(time.Time{})
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			_ = ws.Close()
-			err = ctxErr
-		}
-	}()
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = ws.SetDeadline(deadline)
-	}
-	if err := ws.SendAttach(sessionID); err != nil {
-		return err
-	}
-	return ws.ReadAttachAck()
-}
-
-func (c *WebSocketConn) SendAttach(sessionID string) error {
-	body, err := EncodeAttach(sessionID)
-	if err != nil {
-		return err
-	}
-	return c.WriteMessage(body)
-}
-
-func (c *WebSocketConn) ReadAttachAck() error {
-	ack, err := c.ReadMessage()
-	if err != nil {
-		return err
-	}
-	op, payload, err := DecodeControl(ack)
-	if err != nil {
-		return err
-	}
-	if op != ControlOpAttachOK || len(payload) != 0 {
-		return fmt.Errorf("bad attach ack")
-	}
-	return nil
-}
-
-func (c *WebSocketConn) Attach(ctx context.Context, sessionID string) error {
-	return AttachWebSocketSession(ctx, c, sessionID)
 }
 
 func (c *WebSocketConn) Probe(ctx context.Context) (err error) {
@@ -362,17 +305,15 @@ func (c *WebSocketConn) writeBinary(payload []byte, owned bool) error {
 		for i := range out {
 			out[i] ^= key[i%4]
 		}
-		if _, err := c.conn.Write(hdr[:pos]); err != nil {
+		if err := c.writeFrameBytes(hdr[:pos]); err != nil {
 			return err
 		}
-		_, err := c.conn.Write(out)
+		return c.writeFrameBytes(out)
+	}
+	if err := c.writeFrameBytes(hdr[:pos]); err != nil {
 		return err
 	}
-	if _, err := c.conn.Write(hdr[:pos]); err != nil {
-		return err
-	}
-	_, err := c.conn.Write(payload)
-	return err
+	return c.writeFrameBytes(payload)
 }
 
 func (c *WebSocketConn) Ping(payload []byte) error {
@@ -580,4 +521,15 @@ func headerHasToken(v, token string) bool {
 		}
 	}
 	return false
+}
+
+func (c *WebSocketConn) writeFrameBytes(p []byte) error {
+	n, err := c.conn.Write(p)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		_ = c.Close()
+	}
+	return err
 }

@@ -94,17 +94,6 @@ func TestWebSocketWriteTimeoutOption(t *testing.T) {
 	}
 }
 
-func TestWebSocketAttachCancellationUnblocksWrite(t *testing.T) {
-	clientConn, serverConn := net.Pipe()
-	defer serverConn.Close()
-	ws := &WebSocketConn{conn: clientConn, reader: bufio.NewReader(clientConn), mask: true, writeTimeout: time.Second}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	if err := ws.Attach(ctx, "session"); err != context.DeadlineExceeded {
-		t.Fatalf("attach error=%v, want context deadline", err)
-	}
-}
-
 func TestWebSocketProbeSuccessDetachesCancellation(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
@@ -133,48 +122,6 @@ func TestWebSocketProbeSuccessDetachesCancellation(t *testing.T) {
 		t.Fatalf("canceled completed probe affected connection: %v", err)
 	}
 	if err := <-readDone; err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestWebSocketAttachSuccessDetachesCancellation(t *testing.T) {
-	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
-	defer serverConn.Close()
-	client := &WebSocketConn{conn: clientConn, reader: bufio.NewReader(clientConn), mask: true}
-	server := &WebSocketConn{conn: serverConn, reader: bufio.NewReader(serverConn)}
-	serverDone := make(chan error, 1)
-	go func() {
-		body, err := server.ReadMessage()
-		if err != nil {
-			serverDone <- err
-			return
-		}
-		op, payload, err := DecodeControl(body)
-		if err != nil || op != ControlOpAttach || string(payload) != "session" {
-			serverDone <- errors.New("bad attach message")
-			return
-		}
-		ack, _ := EncodeControl(ControlOpAttachOK, nil)
-		if err := server.WriteMessage(ack); err != nil {
-			serverDone <- err
-			return
-		}
-		body, err = server.ReadMessage()
-		if err == nil && string(body) != "next" {
-			err = errors.New("bad post-attach message")
-		}
-		serverDone <- err
-	}()
-	ctx, cancel := context.WithCancel(context.Background())
-	if err := client.Attach(ctx, "session"); err != nil {
-		t.Fatal(err)
-	}
-	cancel()
-	if err := client.WriteMessage([]byte("next")); err != nil {
-		t.Fatalf("canceled completed attach affected connection: %v", err)
-	}
-	if err := <-serverDone; err != nil {
 		t.Fatal(err)
 	}
 }
@@ -657,52 +604,4 @@ func readTestWebSocketFrame(t *testing.T, conn net.Conn, wantMasked bool) (bool,
 		}
 	}
 	return masked, payload
-}
-
-// A single network write can fill the WS buffered reader past AttachOK.
-// ReadAttachAck must leave those bytes there for the ordinary lane reader.
-func TestWebSocketSplitAttachCoalescedHandoff(t *testing.T) {
-	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
-	defer serverConn.Close()
-	client := &WebSocketConn{conn: clientConn, reader: bufio.NewReader(clientConn), mask: true}
-	server := &WebSocketConn{conn: serverConn, reader: bufio.NewReader(serverConn)}
-	_ = client.SetDeadline(time.Now().Add(3 * time.Second))
-	done := make(chan error, 1)
-	go func() {
-		if _, err := server.ReadMessage(); err != nil {
-			done <- err
-			return
-		}
-		ack, _ := EncodeControl(ControlOpAttachOK, nil)
-		hint, _ := EncodeControl(ControlOpExpandLanesHint, nil)
-		frames := []byte{0x8a, 0} // an unsolicited legal Pong is ignored
-		for _, body := range [][]byte{ack, hint, []byte("business")} {
-			frames = append(frames, 0x82, byte(len(body)))
-			frames = append(frames, body...)
-		}
-		_, err := serverConn.Write(frames)
-		done <- err
-	}()
-	if err := client.SendAttach("session"); err != nil {
-		t.Fatal(err)
-	}
-	if err := client.ReadAttachAck(); err != nil {
-		t.Fatal(err)
-	}
-	hint, err := client.ReadMessage()
-	if err != nil {
-		t.Fatal(err)
-	}
-	op, _, err := DecodeControl(hint)
-	if err != nil || op != ControlOpExpandLanesHint {
-		t.Fatalf("hint=%x err=%v", hint, err)
-	}
-	body, err := client.ReadMessage()
-	if err != nil || string(body) != "business" {
-		t.Fatalf("body=%q err=%v", body, err)
-	}
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
 }

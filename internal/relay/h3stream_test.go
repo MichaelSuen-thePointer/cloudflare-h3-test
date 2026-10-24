@@ -68,34 +68,7 @@ func TestDuplexMessageStreamOverHTTP2(t *testing.T) {
 			t.Errorf("flush headers: %v", err)
 			return
 		}
-		for {
-			body, err := ReadStreamMessage(r.Body)
-			if err != nil {
-				return
-			}
-			if IsControlMessage(body) {
-				op, _, err := DecodeControl(body)
-				if err != nil {
-					t.Errorf("decode control: %v", err)
-					return
-				}
-				switch op {
-				case ControlOpPing:
-					body, _ = EncodeControl(ControlOpPong, nil)
-				case ControlOpAttach:
-					body, _ = EncodeControl(ControlOpAttachOK, nil)
-				default:
-					t.Errorf("unexpected control %d", op)
-					return
-				}
-			}
-			if err := WriteStreamMessage(w, body); err != nil {
-				return
-			}
-			if err := http.NewResponseController(w).Flush(); err != nil {
-				return
-			}
-		}
+		echoUDPBody(w, r)
 	}))
 	origin.EnableHTTP2 = true
 	origin.StartTLS()
@@ -118,10 +91,10 @@ func TestDuplexMessageStreamOverHTTP2(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if err := stream.Probe(ctx); err != nil {
+	if err := stream.SendPing(); err != nil {
 		t.Fatal(err)
 	}
-	if err := stream.Attach(ctx, "session"); err != nil {
+	if err := stream.Attach(ctx, 1); err != nil {
 		t.Fatal(err)
 	}
 	cancel() // successful setup must detach its cancellation callback
@@ -131,11 +104,11 @@ func TestDuplexMessageStreamOverHTTP2(t *testing.T) {
 	default:
 	}
 	for _, data := range []string{"up-1", "up-2"} {
-		if err := stream.WriteMessage([]byte(data)); err != nil {
+		if err := stream.WriteMessage(testData(data)); err != nil {
 			t.Fatal(err)
 		}
 		got, err := ReadMessageView(stream)
-		if err != nil || string(got) != data {
+		if err != nil || !bytes.Equal(got, testData(data)) {
 			t.Fatalf("message=%q err=%v, want %q", got, err, data)
 		}
 	}
@@ -174,14 +147,14 @@ func TestH3MessageStreamOverQUIC(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stream.Close()
-	if err := stream.Attach(ctx, "session"); err != nil {
+	if err := stream.Attach(ctx, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := stream.WriteMessage([]byte("uplink")); err != nil {
+	if err := stream.WriteMessage(testData("uplink")); err != nil {
 		t.Fatal(err)
 	}
 	got, err := stream.ReadMessage()
-	if err != nil || string(got) != "uplink" {
+	if err != nil || !bytes.Equal(got, testData("uplink")) {
 		t.Fatalf("downlink=%q err=%v", got, err)
 	}
 }
@@ -216,30 +189,7 @@ func newH3EchoServer(t *testing.T) (string, *x509.CertPool) {
 				t.Errorf("flush: %v", err)
 				return
 			}
-			body, err := ReadStreamMessage(r.Body)
-			if err != nil {
-				return
-			}
-			op, _, err := DecodeControl(body)
-			if err != nil || op != ControlOpAttach {
-				t.Errorf("attach op=%d err=%v", op, err)
-				return
-			}
-			ack, _ := EncodeControl(ControlOpAttachOK, nil)
-			if err := WriteStreamMessage(w, ack); err != nil {
-				return
-			}
-			_ = http.NewResponseController(w).Flush()
-			for {
-				body, err = ReadStreamMessage(r.Body)
-				if err != nil {
-					return
-				}
-				if err := WriteStreamMessage(w, body); err != nil {
-					return
-				}
-				_ = http.NewResponseController(w).Flush()
-			}
+			echoUDPBody(w, r)
 		}),
 	}
 	t.Cleanup(func() {
@@ -279,10 +229,10 @@ func TestH3BorrowedTransportSurvivesStreamCloseAndSetupFailures(t *testing.T) {
 	defer second.Close()
 	attachCtx, attachCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer attachCancel()
-	if err := first.Attach(attachCtx, "first"); err != nil {
+	if err := first.Attach(attachCtx, 2); err != nil {
 		t.Fatal(err)
 	}
-	if err := second.Attach(attachCtx, "second"); err != nil {
+	if err := second.Attach(attachCtx, 3); err != nil {
 		t.Fatal(err)
 	}
 	readDone := make(chan error, 1)
@@ -301,11 +251,11 @@ func TestH3BorrowedTransportSurvivesStreamCloseAndSetupFailures(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("borrowed stream close did not unblock read")
 	}
-	if err := second.WriteMessage([]byte("still-open")); err != nil {
+	if err := second.WriteMessage(testData("still-open")); err != nil {
 		t.Fatal(err)
 	}
 	got, err := second.ReadMessage()
-	if err != nil || string(got) != "still-open" {
+	if err != nil || !bytes.Equal(got, testData("still-open")) {
 		t.Fatalf("remaining stream message=%q err=%v", got, err)
 	}
 	if _, err := NewH3MessageStreamOnTransport(attachCtx, transport, serverURL+"/status", "token"); err == nil {
@@ -322,110 +272,15 @@ func TestH3BorrowedTransportSurvivesStreamCloseAndSetupFailures(t *testing.T) {
 		t.Fatalf("transport unusable after borrowed setup failures: %v", err)
 	}
 	defer third.Close()
-	if err := third.Attach(attachCtx, "third"); err != nil {
+	if err := third.Attach(attachCtx, 4); err != nil {
 		t.Fatal(err)
 	}
-	if err := third.WriteMessage([]byte("reused")); err != nil {
+	if err := third.WriteMessage(testData("reused")); err != nil {
 		t.Fatal(err)
 	}
 	got, err = third.ReadMessage()
-	if err != nil || string(got) != "reused" {
+	if err != nil || !bytes.Equal(got, testData("reused")) {
 		t.Fatalf("reused stream message=%q err=%v", got, err)
-	}
-}
-
-func TestH3MessageStreamControlFiltering(t *testing.T) {
-	var wire bytes.Buffer
-	pong, _ := EncodeControl(ControlOpPong, nil)
-	if err := WriteStreamMessage(&wire, pong); err != nil {
-		t.Fatal(err)
-	}
-	if err := WriteStreamMessage(&wire, []byte("frame")); err != nil {
-		t.Fatal(err)
-	}
-	ping, _ := EncodeControl(ControlOpPing, nil)
-	if err := WriteStreamMessage(&wire, ping); err != nil {
-		t.Fatal(err)
-	}
-	stream := &H3MessageStream{responseBody: io.NopCloser(&wire)}
-	got, err := ReadMessageView(stream)
-	if err != nil || string(got) != "frame" {
-		t.Fatalf("filtered message=%q err=%v", got, err)
-	}
-	if _, err := stream.ReadMessage(); err == nil {
-		t.Fatal("unexpected client-side Ping was accepted")
-	}
-}
-
-func TestH3MessageStreamProbeValidatesPong(t *testing.T) {
-	requestReader, requestWriter := io.Pipe()
-	defer requestReader.Close()
-	go func() { _, _ = io.Copy(io.Discard, requestReader) }()
-	var wire bytes.Buffer
-	wrong, _ := EncodeControl(ControlOpAttachOK, nil)
-	if err := WriteStreamMessage(&wire, wrong); err != nil {
-		t.Fatal(err)
-	}
-	stream := &H3MessageStream{
-		requestWriter: requestWriter,
-		responseBody:  io.NopCloser(&wire),
-		cancel:        func() {},
-		closed:        make(chan struct{}),
-	}
-	defer stream.Close()
-	if err := stream.Probe(context.Background()); err == nil {
-		t.Fatal("probe accepted a response other than Pong")
-	}
-}
-
-func TestH3MessageStreamProbeTimeoutClosesStream(t *testing.T) {
-	requestReader, requestWriter := io.Pipe()
-	defer requestReader.Close()
-	go func() { _, _ = io.Copy(io.Discard, requestReader) }()
-	responseReader, responseWriter := io.Pipe()
-	defer responseWriter.Close()
-	stream := &H3MessageStream{
-		requestWriter: requestWriter,
-		responseBody:  responseReader,
-		cancel:        func() {},
-		closed:        make(chan struct{}),
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	if err := stream.Probe(ctx); err != context.DeadlineExceeded {
-		t.Fatalf("probe error=%v, want deadline exceeded", err)
-	}
-	select {
-	case <-stream.closed:
-	default:
-		t.Fatal("timed-out probe left stream open")
-	}
-}
-
-func TestH3MessageStreamCloseUnblocksWrite(t *testing.T) {
-	reader, writer := io.Pipe()
-	defer reader.Close()
-	stream := &H3MessageStream{
-		requestWriter: writer,
-		responseBody:  io.NopCloser(bytes.NewReader(nil)),
-		cancel:        func() {},
-		closed:        make(chan struct{}),
-	}
-	done := make(chan error, 1)
-	go func() { done <- stream.WriteMessage([]byte("blocked")) }()
-	if err := stream.Close(); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("write succeeded after close")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("close did not unblock write")
-	}
-	if err := stream.Close(); err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -486,46 +341,80 @@ func TestDuplexMessageStreamReadinessCancellation(t *testing.T) {
 	}
 }
 
-func TestH3MessageStreamResponseEOFAndTruncatedMessage(t *testing.T) {
-	stream := &H3MessageStream{responseBody: io.NopCloser(bytes.NewReader(nil))}
-	if _, err := stream.ReadMessage(); err != io.EOF {
-		t.Fatalf("empty response error=%v, want EOF", err)
+// Flush each complete record and control directly into the HTTP body.
+type testHTTPBodyCarrier struct {
+	w http.ResponseWriter
+	r io.ReadCloser
+}
+
+func (c *testHTTPBodyCarrier) Read(p []byte) (int, error) { return c.r.Read(p) }
+func (c *testHTTPBodyCarrier) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	if err == nil {
+		err = http.NewResponseController(c.w).Flush()
 	}
-	stream.responseBody = io.NopCloser(bytes.NewReader([]byte{'H', '3', 'U', 'M', Version}))
-	if _, err := stream.ReadMessage(); err != io.ErrUnexpectedEOF {
-		t.Fatalf("truncated response error=%v, want unexpected EOF", err)
+	return n, err
+}
+func (c *testHTTPBodyCarrier) Close() error { return c.r.Close() }
+func echoUDPBody(w http.ResponseWriter, r *http.Request) {
+	stream := NewUDPServerStream(&testHTTPBodyCarrier{w: w, r: r.Body})
+	if _, err := stream.ReadAttach(); err != nil {
+		return
+	}
+	if err := stream.WriteAttachOK(); err != nil {
+		return
+	}
+	for {
+		b, err := stream.ReadMessageView()
+		if err != nil {
+			return
+		}
+		if err := stream.WriteMessage(b); err != nil {
+			return
+		}
 	}
 }
 
-func TestH3MessageStreamAttachCancellationUnblocksRead(t *testing.T) {
+func TestH3AttachCancellationClosesBodies(t *testing.T) {
 	requestReader, requestWriter := io.Pipe()
-	defer requestReader.Close()
-	readDone := make(chan struct{})
-	go func() {
-		_, _ = io.Copy(io.Discard, requestReader)
-		close(readDone)
-	}()
 	responseReader, responseWriter := io.Pipe()
+	defer requestReader.Close()
 	defer responseWriter.Close()
-	stream := &H3MessageStream{
-		requestWriter: requestWriter,
-		responseBody:  responseReader,
-		cancel:        func() {},
-		closed:        make(chan struct{}),
-	}
+	requestDone := make(chan struct{})
+	go func() { _, _ = io.Copy(io.Discard, requestReader); close(requestDone) }()
+	stream := &H3MessageStream{requestWriter: requestWriter, responseBody: responseReader, cancel: func() {}, closed: make(chan struct{})}
+	stream.UDPMessageStream = NewUDPClientStream(&h3BodyCarrier{stream})
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if err := stream.Attach(ctx, "session"); err != context.DeadlineExceeded {
-		t.Fatalf("attach error=%v, want context deadline", err)
+	if err := stream.Attach(ctx, 1); err != context.DeadlineExceeded {
+		t.Fatal(err)
 	}
 	select {
 	case <-stream.closed:
 	default:
-		t.Fatal("canceled attach left stream open")
+		t.Fatal("Attach cancellation left H3 stream open")
 	}
 	select {
-	case <-readDone:
+	case <-requestDone:
 	case <-time.After(time.Second):
-		t.Fatal("canceled attach left request reader blocked")
+		t.Fatal("request writer survived cancellation")
+	}
+}
+func TestH3CloseUnblocksRecordWrite(t *testing.T) {
+	requestReader, requestWriter := io.Pipe()
+	defer requestReader.Close()
+	stream := &H3MessageStream{requestWriter: requestWriter, responseBody: io.NopCloser(bytes.NewReader(nil)), cancel: func() {}, closed: make(chan struct{})}
+	stream.UDPMessageStream = NewUDPClientStream(&h3BodyCarrier{stream})
+	stream.UDPMessageStream.state.Store(2)
+	done := make(chan error, 1)
+	go func() { done <- stream.WriteMessage(testData("blocked")) }()
+	_ = stream.Close()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("write survived Close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("H3 record write stayed blocked")
 	}
 }

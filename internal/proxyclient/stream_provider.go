@@ -13,7 +13,7 @@ import (
 )
 
 type streamProvider interface {
-	Acquire(context.Context, string) (relay.KeepaliveMessageStream, error)
+	Acquire(context.Context, uint32) (relay.KeepaliveMessageStream, error)
 	Close() error
 	stats() providerStatsSnapshot
 }
@@ -59,7 +59,7 @@ func newWSProvider(remote, connectIP, token string, target int, timeout time.Dur
 	return &wsProvider{pool: newWSPool(remote, connectIP, token, target, timeout, socketOptions, recorders...), counters: providerStats{enabled: metrics}}
 }
 
-func (p *wsProvider) Acquire(ctx context.Context, sessionID string) (relay.KeepaliveMessageStream, error) {
+func (p *wsProvider) Acquire(ctx context.Context, sessionID uint32) (relay.KeepaliveMessageStream, error) {
 	var start time.Time
 	if p.counters.enabled {
 		start = time.Now()
@@ -174,7 +174,7 @@ func (p *h3Provider) release(slot *h3TransportSlot) {
 	}
 }
 
-func (p *h3Provider) Acquire(ctx context.Context, sessionID string) (relay.KeepaliveMessageStream, error) {
+func (p *h3Provider) Acquire(ctx context.Context, sessionID uint32) (relay.KeepaliveMessageStream, error) {
 	var start time.Time
 	if p.counters.enabled {
 		start = time.Now()
@@ -222,7 +222,7 @@ func (p *h3Provider) Acquire(ctx context.Context, sessionID string) (relay.Keepa
 	return stream, nil
 }
 
-func (p *h3Provider) acquirePrivate(ctx context.Context, sessionID string) (relay.KeepaliveMessageStream, error) {
+func (p *h3Provider) acquirePrivate(ctx context.Context, sessionID uint32) (relay.KeepaliveMessageStream, error) {
 	if p.closed.Load() {
 		p.countAcquireFailed()
 		return nil, http3.ErrTransportClosed
@@ -359,7 +359,7 @@ var _ streamProvider = (*h3Provider)(nil)
 var _ relay.MessageViewReader = (*h3ProviderStream)(nil)
 var _ relay.KeepaliveMessageStream = (*h3ProviderStream)(nil)
 
-func (s *h3ProviderStream) SendAttach(id string) error { return s.stream.SendAttach(id) }
+func (s *h3ProviderStream) SendAttach(id uint32) error { return s.stream.SendAttach(id) }
 func (s *h3ProviderStream) ReadAttachAck() error       { return s.stream.ReadAttachAck() }
 
 var _ relay.StandbyMessageStream = (*h3ProviderStream)(nil)

@@ -44,13 +44,18 @@ Returned controls use `control-read`; undecodable bodies and failed reads use
 `read-unknown`. One read has one sample, with the original sampling decision.
 Failed reads have encoded_bytes=NULL for both selected samples and independent
 errors; known zero remains zero. Successful reads and decode errors retain the
-known returned body length. encoded_bytes means application message body length,
-not actual TLS/QUIC/network traffic. It excludes WS frames, outer H3 stream-message
-framing, HTTP/TLS/QUIC/TCP/IP headers, retransmission and controls consumed inside
-a wrapper without being returned.
+known returned record length. With the phase-9 UDP linear protocol, encoded_bytes
+is 2 + payload length for a DATA read, or the sum for a bounded DATA write batch.
+It excludes WS frames, HTTP/TLS/QUIC/TCP/IP headers, retransmission and controls
+consumed inside a wrapper without being returned. There is no outer H3UM framing.
+One read returns one UDP record, while one write may submit several records;
+read/write observation counts are not expected to match. A failed write's known
+encoded size describes the submitted batch, not confirmed delivered bytes.
 
 Transfer timestamps describe the actual read/write call. Read time includes
-waiting and the wrapper's control-frame processing. Frame decoding is a separate
+waiting for a complete DATA record and the wrapper's control-frame processing.
+Record parsing failures are stream read errors; interpreting a returned DATA
+record as queue frames is a separate
 call: failed decoding is an independent raw error with known encoded size; it does
 not turn an already successful stream read into a failed read. Queue snapshots
 are taken at enqueue opportunities, and batch enqueue records describe only the
@@ -69,7 +74,10 @@ Foundation exclusions remain: no connection statistics/registration, cross-queue
 residence times, RTT pairing, protocol IDs or changes, and no protocol changes. UDP process shutdown is implemented separately
 from this recorder. Connection and snapshot-field tables stay empty. Deeper Attach/pool
 operations have no subject when only the business session string is available;
-parent_operation_no remains NULL, with no fabricated nesting. No disk retention,
+parent_operation_no remains NULL, with no fabricated nesting. The phase-9 uint32
+wire session ID is formatted as decimal in the existing text column; it is not a
+new observation key. Session lifetimes still use local session_no, so ID reuse
+does not merge their database identities. No disk retention,
 rotation, backup API or offline analysis tool is added in this foundation.
 
 Validation on Windows/amd64 covers real SQLite writes/FKs, constraints, append,
@@ -81,8 +89,8 @@ arm64, armv7 and Android arm64; this is build evidence, not target-device runtim
 or throughput evidence. The selected driver does not list MIPS support. Independent Linux Go 1.26.3 with GCC passed both `go test -race ./...` and
 `go test -race -tags metrics ./...`. Race execution is unavailable on this
 Windows host (CGO disabled, no C compiler or usable WSL).
-Full go vet still reports the pre-existing mutex copy in
-stream_keepalive_test.go; the new module and server/entrypoint vet checks pass.
+The historical mutex-copy fixture in stream_keepalive_test.go was subsequently
+fixed during the UDP shutdown work.
 
 ## Local benchmark evidence
 
